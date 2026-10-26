@@ -1,0 +1,617 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>GIS data platform — fetch elevation data</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/vendor/leaflet/dist/leaflet.css" />
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; font: 13px/1.5 system-ui, sans-serif; color: #1a1a1a; }
+    #wrap { display: flex; height: 100%; }
+    #mapwrap { flex: 1; position: relative; background: #dfe3e8; }
+    #map { position: absolute; inset: 0; }
+    #busy { position: absolute; inset: 0; display: none; z-index: 1200;
+            background: rgba(255,255,255,.72); backdrop-filter: blur(1px);
+            flex-direction: column; align-items: center; justify-content: center;
+            gap: 12px; font-size: 13px; color: #374151; }
+    #busy.on { display: flex; }
+    .spinner { width: 30px; height: 30px; border-radius: 50%;
+               border: 3px solid #c7d2fe; border-top-color: #2563eb;
+               animation: spin 0.9s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .selection { margin-top: 8px; padding: 8px 10px; background: #eff6ff;
+                 border: 1px solid #bfdbfe; border-radius: 8px;
+                 font-size: 12px; color: #1e3a8a; }
+    .selection.bad { background: #fef2f2; border-color: #fecaca; color: #991b1b; }
+    .linkbtn { margin-top: 6px; padding: 5px 10px; font: inherit; font-size: 12px;
+               color: #2563eb; background: #fff; border: 1px solid #bfdbfe;
+               border-radius: 6px; cursor: pointer; }
+    .linkbtn:hover { background: #eff6ff; }
+    .linkbtn.danger { color: #b91c1c; border-color: #fecaca; }
+    #phase { margin-top: 8px; font-size: 12px; color: #6b7280; min-height: 16px; }
+    #banner { margin-top: 10px; padding: 10px 12px; border-radius: 8px;
+              font-size: 13px; display: none; }
+    #banner.ok { display: block; background: #dcfce7; color: #166534; }
+    #banner.err { display: block; background: #fee2e2; color: #991b1b; }
+    #panel {
+      width: 380px; overflow-y: auto; padding: 18px 20px;
+      background: #fff; border-left: 1px solid #d5d9de;
+    }
+    h1 { font-size: 16px; margin: 0 0 4px; }
+    h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+         color: #6b7280; margin: 18px 0 6px; }
+    .sub { color: #6b7280; margin: 0 0 12px; }
+    label.radio { display: block; padding: 8px 10px; border: 1px solid #d5d9de;
+                  border-radius: 8px; margin-bottom: 6px; cursor: pointer; }
+    label.radio.sel { border-color: #2563eb; background: #eff6ff; }
+    label.radio.off { opacity: .6; cursor: default; }
+    label.radio b { display: block; }
+    label.radio small { color: #6b7280; }
+    label.radio small.warn { color: #b45309; display: block; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .grid input { width: 100%; padding: 6px 8px; border: 1px solid #d5d9de;
+                  border-radius: 6px; font: inherit; }
+    button#go {
+      width: 100%; margin-top: 14px; padding: 11px; font-size: 14px; font-weight: 600;
+      color: #fff; background: #2563eb; border: 0; border-radius: 8px; cursor: pointer;
+    }
+    button#go:disabled { background: #93a4bd; cursor: default; }
+    #est { margin-top: 10px; padding: 10px; background: #f6f8fa; border-radius: 8px; }
+    #state { margin-top: 12px; font-weight: 600; }
+    #log {
+      margin-top: 8px; max-height: 220px; overflow-y: auto; padding: 8px;
+      background: #101418; color: #b7f5c8; border-radius: 8px;
+      font: 11px/1.5 ui-monospace, Consolas, monospace; white-space: pre-wrap;
+    }
+    a.button { display: inline-block; margin-top: 12px; padding: 9px 12px;
+               background: #111827; color: #fff; text-decoration: none; border-radius: 8px; }
+    .note { font-size: 11px; color: #92400e; background: #fef3c7; padding: 6px 8px;
+            border-radius: 6px; margin-top: 6px; }
+    .maprow { display: flex; align-items: center; gap: 10px; margin: 2px 0 4px; }
+    .maprow select { flex: 1; padding: 6px 8px; border: 1px solid #d5d9de;
+                     border-radius: 6px; font: inherit; background: #fff; }
+    .maprow .cb { font-size: 11px; color: #6b7280; white-space: nowrap; }
+    #areas { width: 100%; padding: 6px 8px; border: 1px solid #d5d9de;
+             border-radius: 6px; font: inherit; background: #fff; }
+    .btnrow { display: flex; gap: 8px; }
+    .modes { display: flex; gap: 6px; margin: 0 0 12px; }
+    .modes button { flex: 1; padding: 7px 8px; font: inherit; font-weight: 600; cursor: pointer;
+                    border: 1px solid #d5d9de; border-radius: 8px; background: #fff; color: #374151; }
+    .modes button.on { border-color: #2563eb; background: #eff6ff; color: #1d4ed8; }
+    .modes button:disabled { opacity: .6; cursor: default; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <div id="mapwrap">
+      <div id="map"></div>
+      <div id="busy">
+        <div class="spinner"></div>
+        <div id="busytext">working…</div>
+      </div>
+    </div>
+    <div id="panel">
+      <div class="modes" role="tablist" aria-label="data type">
+        <button id="mode-elevation" class="on" type="button" data-mode="elevation">Elevation (DEM)</button>
+        <button id="mode-imagery" type="button" data-mode="imagery">Imagery</button>
+      </div>
+      <h1 id="title">Fetch elevation data</h1>
+      <p class="sub" id="subtitle">Drag on the map to select the area. The platform downloads source DEM
+        tiles and builds the local terrain pyramids.</p>
+
+      <div class="maprow">
+        <select id="basemap" title="basemap provider">
+          <option value="esri_img">Esri World Imagery (satellite)</option>
+          <option value="esri_topo">Esri Topographic</option>
+          <option value="osm">OpenStreetMap</option>
+          <option value="opentopo">OpenTopoMap</option>
+          <option value="hillshade">Local hillshade (offline)</option>
+        </select>
+        <label class="cb"><input type="checkbox" id="hsoverlay" checked> hillshade overlay</label>
+      </div>
+
+      <h2>0 · Saved areas</h2>
+      <select id="areas"><option value="">— saved areas —</option></select>
+      <div class="btnrow">
+        <button id="savearea" class="linkbtn" type="button">save current area</button>
+        <button id="delarea" class="linkbtn danger" type="button">delete selected</button>
+      </div>
+      <div class="note">Every fetch saves its area + dataset metadata in the platform
+        catalog; pick one here to reload its bbox and settings.</div>
+
+      <h2>1 · Area (drag on map)</h2>
+      <div class="grid">
+        <div><small>min longitude °E (− = °W)</small><input id="minlon" type="number" step="0.01"></div>
+        <div><small>min latitude °N (− = °S)</small><input id="minlat" type="number" step="0.01"></div>
+        <div><small>max longitude °E</small><input id="maxlon" type="number" step="0.01"></div>
+        <div><small>max latitude °N</small><input id="maxlat" type="number" step="0.01"></div>
+      </div>
+      <div id="selection" class="selection">no area selected yet — drag on the map</div>
+      <div class="btnrow">
+        <button id="zoomsel" class="linkbtn" type="button">zoom map to selection</button>
+        <button id="world" class="linkbtn" type="button" title="−180…180°, ±85.05° (Web-Mercator limit)">whole world</button>
+      </div>
+
+      <h2>2 · Provider</h2>
+      <div id="providers"></div>
+      <div class="note" id="providernote">FABDEM is <b>non-commercial</b> (CC BY-NC-SA). Use Copernicus for
+        commercial products.</div>
+
+      <h2>3 · Detail</h2>
+      <div class="grid">
+        <div><small>min zoom</small><input id="minzoom" type="number" value="0" min="0" max="13"></div>
+        <div><small>max zoom</small><input id="maxzoom" type="number" value="13" min="6" max="16"></div>
+        <div style="grid-column: 1 / -1"><small id="namehint">dataset name (kept as its own service; picked up by the 3D viewer)</small>
+          <input id="name" type="text" placeholder="local30m"></div>
+      </div>
+
+      <div id="est"></div>
+      <button id="go">Fetch &amp; build</button>
+      <div id="state"></div>
+      <div id="phase"></div>
+      <div id="banner"></div>
+      <pre id="log"></pre>
+      <a class="button" id="service" href="#" style="display:none">Open dataset service →</a>
+      <a class="button" id="tilejson" href="/tiles/terrain.json">Terrain tilejson</a>
+      <a class="button" id="imagerylist" href="/api/imagery">Imagery sets</a>
+    </div>
+  </div>
+
+  <script src="/vendor/leaflet/dist/leaflet.js"></script>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const map = L.map("map", { zoomControl: true }).setView([45.8, 6.9], 8);
+    let nameDirty = false, lastName = null, currentJobId = null;
+    let areasCache = [], providers = [], demProviders = [], imageryProviders = [];
+    let mode = "elevation";
+    let imageryUnavailable = "";   // set when the running server has no imagery API
+    const MODE_TEXT = {
+      elevation: {
+        title: "Fetch elevation data",
+        sub: "Drag on the map to select the area. The platform downloads source DEM tiles and builds the local terrain pyramids.",
+        note: "FABDEM is <b>non-commercial</b> (CC BY-NC-SA). Use Copernicus for commercial products.",
+        namehint: "dataset name (kept as its own service; picked up by the 3D viewer)",
+        go: "Fetch & build", zooms: [0, 13], maxzoomMin: 6, maxzoomMax: 16,
+      },
+      imagery: {
+        title: "Fetch imagery",
+        sub: "Drag on the map (or use “whole world”) to select the area. The platform downloads open XYZ imagery tiles into a local tile set served to all three viewers.",
+        note: "Sentinel-2 cloudless 2016 is CC BY 4.0; NASA Blue Marble is public domain. Tiles are stored as delivered (JPEG), no re-encoding.",
+        namehint: "imagery set name (served at /tiles/imagery-sets/&lt;name&gt;; picked up by the viewers)",
+        go: "Fetch imagery", zooms: [0, 1], maxzoomMin: 0, maxzoomMax: 15,
+      },
+    };
+    function setMode(next, keepFields) {
+      mode = next;
+      const t = MODE_TEXT[mode];
+      document.querySelectorAll(".modes button").forEach((b) => b.classList.toggle("on", b.dataset.mode === mode));
+      $("title").textContent = t.title;
+      $("subtitle").textContent = t.sub;
+      $("providernote").innerHTML = t.note;
+      $("namehint").innerHTML = t.namehint;
+      $("go").textContent = t.go;
+      $("maxzoom").min = t.maxzoomMin; $("maxzoom").max = t.maxzoomMax;
+      if (!keepFields) { $("minzoom").value = t.zooms[0]; $("maxzoom").value = t.zooms[1]; nameDirty = false; }
+      providers = mode === "imagery" ? imageryProviders : demProviders;
+      renderProviders();
+      updateEst();
+      const blocked = mode === "imagery" && imageryUnavailable;
+      $("go").disabled = Boolean(blocked);
+      $("banner").className = blocked ? "err" : "";
+      $("banner").textContent = blocked ? imageryUnavailable : "";
+    }
+    document.querySelectorAll(".modes button").forEach((b) =>
+      b.addEventListener("click", () => { if (b.dataset.mode !== mode) setMode(b.dataset.mode); }));
+
+    // ---- basemaps: online providers need internet; hillshade works offline ----
+    const BASEMAPS = {
+      esri_img: {
+        label: "Esri World Imagery (satellite)",
+        attribution: "Esri, Maxar, Earthstar Geographics",
+        url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        maxZoom: 19,
+      },
+      esri_topo: {
+        label: "Esri Topographic",
+        attribution: "Esri, HERE, Garmin, FAO, NOAA, USGS",
+        url: "https://services.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
+        maxZoom: 19,
+      },
+      osm: {
+        label: "OpenStreetMap",
+        attribution: "&copy; OpenStreetMap contributors",
+        url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        maxZoom: 19,
+      },
+      opentopo: {
+        label: "OpenTopoMap",
+        attribution: "&copy; OpenStreetMap contributors, SRTM | &copy; OpenTopoMap (CC-BY-SA)",
+        url: "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+        maxZoom: 17,
+      },
+      hillshade: {
+        label: "Local hillshade (offline)",
+        attribution: "local DEM",
+        url: "/tiles/imagery/{z}/{x}/{y}.png",
+        maxZoom: 13,
+      },
+    };
+    let baseLayer = null, hsLayer = null;
+
+    function addHsOverlay(on) {
+      if (hsLayer) { map.removeLayer(hsLayer); hsLayer = null; }
+      if (on) {
+        hsLayer = L.tileLayer("/tiles/imagery/{z}/{x}/{y}.png",
+          { maxZoom: 13, opacity: 0.5, attribution: "local DEM" });
+        hsLayer.addTo(map);
+      }
+    }
+    function setBase(id) {
+      if (baseLayer) map.removeLayer(baseLayer);
+      const b = BASEMAPS[id];
+      baseLayer = L.tileLayer(b.url, { maxZoom: b.maxZoom, attribution: b.attribution });
+      baseLayer.addTo(map);
+      const cb = document.getElementById("hsoverlay");
+      if (id === "hillshade") {           // don't stack hillshade on hillshade
+        cb.checked = false;
+        addHsOverlay(false);
+      } else {
+        addHsOverlay(cb.checked);         // re-add so the overlay stays on top
+      }
+    }
+    document.getElementById("basemap").addEventListener("change", (e) => setBase(e.target.value));
+    document.getElementById("hsoverlay").addEventListener("change", (e) => addHsOverlay(e.target.checked));
+    setBase("esri_img");
+
+    // ---- rectangle selection ----
+    let rect = null, dragging = false, startLL = null;
+    function setBBox(b) {
+      ["minlon", "minlat", "maxlon", "maxlat"].forEach((k, i) => ($(k).value = b[i].toFixed(4)));
+      updateEst();
+    }
+    function getBBox() {
+      return [+$("minlon").value, +$("minlat").value, +$("maxlon").value, +$("maxlat").value];
+    }
+    function drawRect(b) {
+      const bounds = [[b[1], b[0]], [b[3], b[2]]];
+      if (rect) rect.setBounds(bounds);
+      else rect = L.rectangle(bounds, { color: "#2563eb", weight: 2, fillOpacity: 0.12 }).addTo(map);
+    }
+    map.on("mousedown", (e) => {
+      dragging = true; startLL = e.latlng; map.dragging.disable();
+      setBBox([startLL.lng, startLL.lat, startLL.lng, startLL.lat]);
+    });
+    map.on("mousemove", (e) => {
+      if (!dragging) return;
+      const b = [Math.min(startLL.lng, e.latlng.lng), Math.min(startLL.lat, e.latlng.lat),
+                 Math.max(startLL.lng, e.latlng.lng), Math.max(startLL.lat, e.latlng.lat)];
+      setBBox(b); drawRect(b);
+    });
+    map.on("mouseup", (e) => {
+      dragging = false; map.dragging.enable();
+      const b = getBBox();
+      if (b[2] - b[0] < 0.01 || b[3] - b[1] < 0.01)
+        setBBox([e.latlng.lng - 0.1, e.latlng.lat - 0.1, e.latlng.lng + 0.1, e.latlng.lat + 0.1]);
+      drawRect(getBBox()); updateEst();
+    });
+    ["minlon", "minlat", "maxlon", "maxlat"].forEach((id) =>
+      $(id).addEventListener("change", () => { drawRect(getBBox()); updateEst(); }));
+
+    // ---- providers (FABDEM is only offered when the engine can serve it) ----
+    function renderProviders(selected) {
+      const firstAvailable = (providers.find((p) => p.available) || {}).id;
+      const sel = (selected && providers.some((p) => p.id === selected)) ? selected
+        : (firstAvailable || (mode === "imagery" ? "s2cloudless" : "copernicus"));
+      $("providers").innerHTML = providers.map((p) => `
+        <label class="radio ${p.id === sel ? "sel" : ""} ${p.available ? "" : "off"}">
+          <input type="radio" name="provider" value="${p.id}" ${p.id === sel ? "checked" : ""} ${p.available ? "" : "disabled"}>
+          <b>${p.label}</b><small>${p.license}${p.maxzoom != null ? ` · up to z${p.maxzoom}` : ""}</small>
+          ${p.available ? "" : `<small class="warn">unavailable — ${p.reason || "not installed"}</small>`}
+        </label>`).join("");
+      document.querySelectorAll("input[name=provider]").forEach((r) =>
+        r.addEventListener("change", () => { renderProviders(r.value); updateEst(); }));
+    }
+    function selectedProvider() {
+      const el = document.querySelector("input[name=provider]:checked");
+      return el ? el.value : (mode === "imagery" ? "s2cloudless" : "copernicus");
+    }
+
+    // ---- estimates ----
+    function tileCount(b, zmin, zmax) {
+      // Clamp to the valid tile index range (lon 180 / lat ±85.05 would land
+      // one past the last tile and over-count).
+      const clampT = (v, z) => Math.min(2 ** z - 1, Math.max(0, v));
+      const ll2x = (lon, z) => clampT(Math.floor((lon + 180) / 360 * 2 ** z), z);
+      const ll2y = (lat, z) => {
+        const r = Math.max(-85.0511, Math.min(85.0511, lat)) * Math.PI / 180;
+        return clampT(Math.floor((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2 * 2 ** z), z);
+      };
+      let n = 0;
+      for (let z = zmin; z <= zmax; z++) {
+        n += (ll2x(b[2], z) - ll2x(b[0], z) + 1) * (ll2y(b[1], z) - ll2y(b[3], z) + 1);
+      }
+      return n;
+    }
+    function kmSpan(b) {
+      const midLat = (b[1] + b[3]) / 2;
+      return [
+        (b[2] - b[0]) * 111.32 * Math.cos(midLat * Math.PI / 180),
+        (b[3] - b[1]) * 110.57,
+      ];
+    }
+    function updateSelection(b) {
+      const el = $("selection");
+      const valid = b.every(isFinite) && b[2] > b[0] && b[3] > b[1]
+        && b[0] >= -180 && b[2] <= 180 && b[1] >= -90 && b[3] <= 90;
+      if (!valid) {
+        el.className = "selection bad";
+        el.textContent = b.every(isFinite)
+          ? "invalid area — check that min < max and lon is −180…180 / lat is −90…90"
+          : "no area selected yet — drag on the map or type coordinates";
+        return false;
+      }
+      const [kmx, kmy] = kmSpan(b);
+      el.className = "selection";
+      el.textContent = `selected: ${b[0].toFixed(4)}–${b[2].toFixed(4)}°E, `
+        + `${b[1].toFixed(4)}–${b[3].toFixed(4)}°N  ·  `
+        + `size ≈ ${kmx.toFixed(1)} km × ${kmy.toFixed(1)} km  ·  `
+        + `center ${((b[0]+b[2])/2).toFixed(3)}°E, ${((b[1]+b[3])/2).toFixed(3)}°N`;
+      return true;
+    }
+    function updateEst() {
+      const b = getBBox();
+      if (!updateSelection(b)) { $("est").textContent = ""; return; }
+      if (!nameDirty) $("name").value = autoName(b);
+      const zmin = +$("minzoom").value, zmax = +$("maxzoom").value;
+      const deg = (Math.floor(b[2]) - Math.floor(b[0]) + 1) * (Math.floor(b[3]) - Math.floor(b[1]) + 1);
+      const tiles = tileCount(b, zmin, zmax);
+      if (mode === "imagery") {
+        const prov = providers.find((p) => p.id === selectedProvider());
+        const over = prov && zmax > prov.maxzoom ? `<br><span style="color:#b91c1c">max zoom exceeds provider limit z${prov.maxzoom}</span>` : "";
+        $("est").innerHTML = `<b>estimate</b><br>imagery tiles to download: ${tiles} (z${zmin}–${zmax})<br>`
+          + `download size: ~${Math.max(0.1, tiles * 0.02).toFixed(1)} MB (≈20 KB/tile JPEG)`
+          + (tiles > 50000 ? `<br><span style="color:#b91c1c">over the 50,000 tiles/job limit</span>` : "") + over;
+        return;
+      }
+      $("est").innerHTML =
+        `<b>estimate</b><br>source tiles to download: ${deg} (1°×1°)<br>` +
+        `map tiles to build: ${tiles} ×2 pyramids ≈ ${((tiles * 0.22) ).toFixed(0)} MB<br>` +
+        `download size: ~${deg * 35} MB (Copernicus) / ~${deg * 30} MB (FABDEM)`;
+    }
+    $("minzoom").addEventListener("change", updateEst);
+    $("maxzoom").addEventListener("change", updateEst);
+
+    // ---- dataset name: auto-derived from bbox until the user edits it ----
+    function autoName(b) {
+      const s = (v) => String(v.toFixed(2)).replace("-", "m").replace(".", "p");
+      if (mode === "imagery") {
+        const world = b[0] <= -179.99 && b[2] >= 179.99 && b[1] <= -85 && b[3] >= 85;
+        return world ? `world_${selectedProvider()}` : `img_${s(b[0])}_${s(b[1])}`;
+      }
+      return `area_${s(b[0])}_${s(b[1])}`;
+    }
+    $("name").addEventListener("input", () => { nameDirty = true; });
+
+    // ---- zoom map to the selection ----
+    $("zoomsel").addEventListener("click", () => {
+      const b = getBBox();
+      if (updateSelection(b)) map.fitBounds([[b[1], b[0]], [b[3], b[2]]], { padding: [30, 30] });
+    });
+
+    $("world").addEventListener("click", () => {
+      const b = [-180, -85.0511, 180, 85.0511];
+      setBBox(b); drawRect(b);
+      map.fitWorld();
+    });
+
+    // ---- saved areas (persisted in the platform catalog) ----
+    async function loadAreas(selectId) {
+      try {
+        const data = await api("/api/areas");
+        areasCache = data.areas || [];
+        $("areas").innerHTML = `<option value="">— saved areas —</option>` + areasCache.map((a) =>
+          `<option value="${a.id}">${a.kind === "imagery" ? "🛰 " : "⛰ "}${a.name} · ${a.bbox.map((v) => v.toFixed(2)).join(", ")}</option>`).join("");
+        if (selectId) $("areas").value = selectId;
+      } catch (e) { /* non-fatal */ }
+    }
+    $("areas").addEventListener("change", () => {
+      const area = areasCache.find((a) => a.id === $("areas").value);
+      if (!area) return;
+      const areaMode = area.kind === "imagery" ? "imagery" : "elevation";
+      if (areaMode !== mode) setMode(areaMode, true);
+      nameDirty = true;
+      $("name").value = area.name;
+      $("minzoom").value = area.minzoom;
+      $("maxzoom").value = area.maxzoom;
+      const radio = document.querySelector(`input[name=provider][value="${area.provider}"]`);
+      if (radio && !radio.disabled) renderProviders(area.provider);
+      setBBox(area.bbox); drawRect(area.bbox);
+      map.fitBounds([[area.bbox[1], area.bbox[0]], [area.bbox[3], area.bbox[2]]], { padding: [30, 30] });
+    });
+    $("savearea").addEventListener("click", async () => {
+      const b = getBBox();
+      if (!updateSelection(b)) return;
+      try {
+        const area = await api("/api/areas", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: sanitizeName($("name").value), bbox: b,
+            provider: selectedProvider(),
+            minzoom: +$("minzoom").value, maxzoom: +$("maxzoom").value,
+          }),
+        });
+        await loadAreas(area.id);
+        $("banner").className = "ok";
+        $("banner").textContent = `✓ saved area “${area.name}” in the catalog`;
+      } catch (e) {
+        $("banner").className = "err";
+        $("banner").textContent = `✗ could not save: ${e.message}`;
+      }
+    });
+    $("delarea").addEventListener("click", async () => {
+      const id = $("areas").value;
+      if (!id) return;
+      try {
+        await api(`/api/areas/${id}`, { method: "DELETE" });
+        await loadAreas();
+        $("banner").className = "ok";
+        $("banner").textContent = "✓ area deleted";
+      } catch (e) {
+        $("banner").className = "err";
+        $("banner").textContent = `✗ could not delete: ${e.message}`;
+      }
+    });
+
+    // ---- job control ----
+    function setBusy(on, text) {
+      $("busy").classList.toggle("on", on);
+      if (text) $("busytext").textContent = text;
+      ["minlon", "minlat", "maxlon", "maxlat", "minzoom", "maxzoom",
+       "name", "basemap", "mode-elevation", "mode-imagery", "world"].forEach((id) => { const el = $(id); if (el) el.disabled = on; });
+      document.querySelectorAll("input[name=provider]").forEach((el) => { el.disabled = on; });
+    }
+
+    function sanitizeName(s) {
+      const n = (s || "").trim().replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "");
+      return n || "local30m";
+    }
+    async function api(path, opts) {
+      const r = await fetch(path, opts);
+      if (!r.ok) {
+        let detail = `${path}: ${r.status}`;
+        try { const j = await r.json(); if (j.detail) detail = `${path}: ${j.detail}`; } catch (e) {}
+        throw new Error(detail);
+      }
+      return r.json();
+    }
+    function renderJob(job) {
+      const label = { running: "working…", done: "done ✓", error: "failed ✗" }[job.state] || job.state;
+      $("state").textContent = label;
+      const last = (job.log || [])[job.log.length - 1] || "";
+      $("phase").textContent = job.state === "running"
+        ? `step: ${job.step || ""}` + (last ? ` · ${last}` : "") + ` · ${Math.round(job.elapsed || 0)}s`
+        : (job.state === "done"
+            ? `steps: ${(job.steps || []).map((s) => s.name).join(" → ")} · ${Math.round(job.elapsed || 0)}s`
+            : "");
+      $("log").textContent = (job.log || []).slice(-30).join("\n");
+      $("log").scrollTop = $("log").scrollHeight;
+      $("go").disabled = job.state === "running";
+      const isImagery = job.kind === "imagery";
+      setBusy(job.state === "running", `${isImagery ? "Fetching imagery" : "Fetching & building"} ${lastName ? "“" + lastName + "”" : ""}…`);
+      if (job.state === "done" && isImagery) {
+        const r = job.result || {};
+        $("banner").className = "ok";
+        $("banner").textContent = `✓ done — ${r.tiles} imagery tiles (${((r.bytes || 0) / 1e6).toFixed(2)} MB; `
+          + `${r.downloaded} downloaded, ${r.skipped} kept) · set “${job.name}” is ready in the viewers`;
+        $("service").textContent = "Open imagery TileJSON →";
+        $("service").href = `/tiles/imagery-sets/${encodeURIComponent(job.name)}.json`;
+        $("service").style.display = "inline-block";
+      } else if (job.state === "done") {
+        const r = job.result || {};
+        const b = $("banner");
+        $("service").textContent = "Open dataset service →";
+        b.className = "ok";
+        b.textContent = `✓ done — ${r.tilesBuilt != null ? r.tilesBuilt + " tiles built" : "build finished"}`
+          + `${r.verified ? " · verified" : ""} · dataset “${job.name}” is ready`;
+        $("service").href = `/arcgis/rest/services/${encodeURIComponent(job.name)}/ImageServer`;
+        $("service").style.display = "inline-block";
+      }
+      if (job.state === "error") {
+        const b = $("banner");
+        b.className = "err";
+        b.textContent = `✗ failed — ${job.error || "see log below"}`;
+        $("service").style.display = "none";
+      }
+    }
+    async function pollJob(jobId) {
+      try {
+        const job = await api(`/api/jobs/${jobId}`);
+        renderJob(job);
+        if (job.state === "running") {
+          setTimeout(() => pollJob(jobId), 1500);
+        } else {
+          setBusy(false);
+          $("go").disabled = false;
+          if (job.areaId) loadAreas(job.areaId);
+        }
+      } catch (e) {
+        $("state").textContent = "server unreachable";
+        setBusy(false);
+      }
+    }
+    $("go").addEventListener("click", async () => {
+      const b = getBBox();
+      if (!updateSelection(b)) return;
+      if (mode === "imagery" && imageryUnavailable) {
+        $("banner").className = "err";
+        $("banner").textContent = imageryUnavailable;
+        return;
+      }
+      const body = {
+        provider: selectedProvider(),
+        bbox: b,
+        minzoom: +$("minzoom").value,
+        maxzoom: +$("maxzoom").value,
+        name: sanitizeName($("name").value),
+        saveArea: true,
+      };
+      lastName = body.name;
+      $("name").value = body.name;
+      $("banner").className = "";
+      $("service").style.display = "none";
+      $("go").disabled = true;
+      $("state").textContent = "starting…";
+      try {
+        const job = await api(mode === "imagery" ? "/api/imagery/jobs" : "/api/jobs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        currentJobId = job.id;
+        if (job.areaId) loadAreas(job.areaId);
+        pollJob(job.id);
+      } catch (e) {
+        $("banner").className = "err";
+        $("banner").textContent = `✗ could not start: ${e.message}`;
+        $("state").textContent = "error: " + e.message;
+        $("go").disabled = false;
+        setBusy(false);
+      }
+    });
+
+    // ---- init ----
+    (async () => {
+      try {
+        const info = await api("/api/fetch/providers");
+        demProviders = info.providers || [];
+      } catch (e) { /* rendered as empty list */ }
+      try {
+        const info = await api("/api/imagery/providers");
+        imageryProviders = info.providers || [];
+      } catch (e) {
+        // The page is read from disk per request, but API routes load at
+        // server start: a server started before imagery support serves this
+        // page without the imagery endpoints.
+        imageryUnavailable = `✗ imagery is unavailable on this server (${location.host}): `
+          + `it was started before imagery support was added. Stop it and start `
+          + `gis-data-platform/Run.bat again, then reload this page.`;
+      }
+      providers = demProviders;
+      renderProviders();
+      await loadAreas();
+      setBBox([6.6, 45.6, 7.2, 46.0]); drawRect(getBBox());
+      try {
+        const st = await api("/api/status");
+        if (st.jobId) {
+          lastName = st.name;
+          if (st.kind === "imagery") setMode("imagery");
+          currentJobId = st.jobId;
+          pollJob(st.jobId);          // resumes a running job, or shows the last result
+        }
+      } catch (e) { /* server unreachable — page stays usable */ }
+    })();
+  </script>
+</body>
+</html>

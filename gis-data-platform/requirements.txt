@@ -1,0 +1,16 @@
+# gis-data-platform API
+fastapi>=0.115
+uvicorn[standard]>=0.30
+numpy>=2.0
+Pillow>=10.0
+pytest>=8.0
+# starlette.testclient prefers httpx2 (httpx kept as fallback for older starlette)
+httpx2>=2.16
+httpx>=0.27
+
+# heightmap-30m DEM engine (bundled in engine/) - fetch/build/verify jobs
+#   rasterio: GeoTIFF/COG read + reprojection (manylinux wheel, no system GDAL)
+#   requests + remotezip: FABDEM range-request downloads
+rasterio>=1.4
+requests>=2.32
+remotezip>=0.12

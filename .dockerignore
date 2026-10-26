@@ -1,0 +1,17 @@
+.git
+.gitignore
+**/.venv
+**/node_modules
+**/dist
+**/__pycache__
+**/.pytest_cache
+**/*.pyc
+*.log
+*.tmp
+*.part
+.env
+.env.*
+!**/.env.example
+# Data is deliberately not sent to the image build context. Compose mounts a
+# named volume for runtime data instead.
+gis-data-platform/data

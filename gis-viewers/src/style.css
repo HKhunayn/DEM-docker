@@ -1,0 +1,41 @@
+* { box-sizing: border-box; }
+:root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; color: #e8edf5; background: #0b1220; }
+body { margin: 0; min-width: 320px; }
+/* Fixed-height shell: with min-height the grid grows with its content, and
+   Cesium (canvas sized to its container) ratchets itself thousands of px tall. */
+#app { height: 100vh; overflow: hidden; display: grid; grid-template-rows: auto minmax(0, 1fr); }
+header { display: flex; gap: 1rem; align-items: center; padding: .8rem 1rem; background: #111c2f; border-bottom: 1px solid #293954; }
+h1 { font-size: 1.05rem; margin: 0; }
+nav { display: flex; gap: .4rem; flex-wrap: wrap; }
+button { border: 1px solid #385174; border-radius: .35rem; padding: .42rem .7rem; color: #e8edf5; background: #17263d; cursor: pointer; }
+button.active, button:hover { background: #1c79a9; border-color: #49b9e8; }
+main { min-height: 0; display: grid; grid-template-columns: 285px minmax(0, 1fr); }
+aside { overflow: auto; padding: 1rem; background: #101a2c; border-right: 1px solid #293954; }
+aside h2 { font-size: .9rem; margin: 0 0 .6rem; }
+#status { font-size: .82rem; line-height: 1.45; margin: .75rem 0; border-radius: .35rem; padding: .55rem .65rem; background: #17263d; border: 1px solid #293954; }
+.status.busy { border-color: #3779a6; color: #b9dcf1; }
+.status.success { border-color: #2b8d67; color: #b9efd5; }
+.status.warning { border-color: #b98135; color: #ffe1ab; }
+.status.error, .notice.error { border-color: #b74c55; color: #ffd2d5; }
+.panel-heading { display: flex; justify-content: space-between; align-items: center; gap: .5rem; }
+.panel-heading h2 { margin: 0; }
+button.quiet { padding: .25rem .55rem; }
+.loading { color: #9bb1cc; padding: .65rem 0; font-size: .82rem; }
+.item { display: block; }
+.item.selected, .item.selected:hover { background: #1c79a9; border-color: #49b9e8; }
+.details { margin-top: 1rem; padding-top: .85rem; border-top: 1px solid #293954; display: grid; gap: .35rem; font-size: .78rem; color: #9bb1cc; }
+.details strong { color: #e8edf5; }
+.map-message { position: absolute; left: 1rem; right: 1rem; top: 1rem; z-index: 20; padding: .75rem .9rem; border-radius: .45rem; background: rgba(35, 20, 24, .92); border: 1px solid #b74c55; color: #ffd2d5; font-size: .82rem; }
+#items { display: grid; gap: .5rem; }
+.item { width: 100%; text-align: left; font-size: .78rem; }
+.item small { display: block; color: #8fa4bf; margin-top: .2rem; }
+#map { min-height: 0; height: 100%; position: relative; overflow: hidden; }
+.viewer { position: absolute; inset: 0; }
+.hidden { display: none; }
+.notice { padding: 1rem; color: #aabbd0; }
+@media (max-width: 720px) { main { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); } aside { max-height: 35vh; border-right: 0; border-bottom: 1px solid #293954; } }
+.esri-view, .cesium-viewer { height: 100%; width: 100%; }
+.cesium-widget-credits { display: none !important; }
+.imagery-heading { margin-top: 1.2rem; padding-top: .85rem; border-top: 1px solid #293954; }
+#imagery-select { width: 100%; margin-top: .6rem; padding: .4rem .5rem; color: #e8edf5; background: #17263d; border: 1px solid #385174; border-radius: .35rem; font: inherit; font-size: .8rem; }
+.imagery-info { margin-top: .5rem; font-size: .75rem; line-height: 1.4; color: #9bb1cc; }

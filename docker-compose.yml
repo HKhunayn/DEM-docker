@@ -1,0 +1,52 @@
+services:
+  data-platform:
+    build:
+      context: ./gis-data-platform
+      dockerfile: Dockerfile
+    image: local-gis-data-platform:latest
+    environment:
+      GIS_DATA_ROOT: /app/data
+      HEIGHTMAP_ENGINE_ROOT: /opt/heightmap-30m
+      HEIGHTMAP_PYTHON: /usr/local/bin/python
+      LEAFLET_ROOT: /opt/leaflet
+    volumes:
+      - gis-data:/app/data
+      # The DEM engine is baked into the image at /opt/heightmap-30m (copied
+      # from gis-data-platform/engine). Uncomment to override it with a local
+      # engine checkout while developing the engine itself:
+      # - ${HEIGHTMAP_ENGINE_ROOT:-../heightmap-30m}:/opt/heightmap-30m:ro
+    expose:
+      - "8787"
+    ports:
+      - "${GIS_PLATFORM_PORT:-8787}:8787"
+    # Internal name used by the viewer's nginx reverse proxy.
+    networks:
+      - gis
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  viewer:
+    build:
+      context: ./gis-viewers
+      dockerfile: Dockerfile
+      args:
+        VITE_PLATFORM_URL: ${VITE_PLATFORM_URL:-}
+    image: local-gis-viewer:latest
+    depends_on:
+      data-platform:
+        condition: service_healthy
+    ports:
+      - "${GIS_VIEWER_PORT:-5173}:80"
+    networks:
+      - gis
+
+volumes:
+  gis-data:
+
+networks:
+  gis:
+    driver: bridge
