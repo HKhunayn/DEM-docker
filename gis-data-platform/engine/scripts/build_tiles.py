@@ -149,6 +149,11 @@ def main() -> int:
         print(f"z{z}: tiles x={x0}..{x1} y={y0}..{y1} (cumulative {total})")
 
     # 3) TileJSON metadata for the client
+    if total == 0 or not (math.isfinite(gmin) and math.isfinite(gmax)):
+        print(f"ERROR: wrote {total} tiles, elevation range {gmin}..{gmax}. "
+              f"The bbox probably does not intersect the source DEM footprint. "
+              f"No tilejson.json written.")
+        return 1
     meta = {
         "tilejson": "3.0.0",
         "name": "Copernicus DEM 30m (Terrarium)",

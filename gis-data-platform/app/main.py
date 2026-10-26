@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,22 @@ class IngestRequest(BaseModel):
 
 class DeleteResponse(BaseModel):
     deleted: bool
+
+
+def _finite(obj: Any) -> Any:
+    """Recursively replace non-finite floats (inf/nan) with None.
+
+    JSON has no infinity/NaN. A degenerate build (e.g. zero tiles written,
+    so the tile statistics stay at math.inf) must not 500 the endpoints that
+    serve metadata read from disk.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _finite(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_finite(v) for v in obj]
+    return obj
 
 
 def _base(request: Request) -> str:
@@ -172,7 +189,7 @@ def terrain_tilejson(request: Request) -> JSONResponse:
     version = TERRAIN.version()
     data["tiles"] = [f"{_base(request)}/tiles/terrain/{{z}}/{{x}}/{{y}}.png?v={version}"]
     data["imagery"] = [f"{_base(request)}/tiles/imagery/{{z}}/{{x}}/{{y}}.png?v={version}"]
-    response = JSONResponse(data)
+    response = JSONResponse(_finite(data))
     response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -203,7 +220,7 @@ def arcgis_metadata(name: str) -> JSONResponse:
     # ArcGISTiledElevationTerrainProvider requires it (reads extent.xmax).
     if "extent" not in data and "fullExtent" in data:
         data["extent"] = data["fullExtent"]
-    return JSONResponse(data)
+    return JSONResponse(_finite(data))
 
 
 @app.get("/arcgis/rest/services/{name}/ImageServer/tilemap/{level}/{row}/{col}/{height}/{width}")

@@ -200,8 +200,12 @@ def main():
 
     meta_path = os.path.join(os.path.dirname(args.tiles.rstrip("/\\")), "tilejson.json")
     meta = json.load(open(meta_path)) if os.path.exists(meta_path) else None
-    print(f"pyramid: {count} tiles in AOI, elevation {gmin:.1f}..{gmax:.1f} m"
-          + (f" (ignored {stale} stale tiles from earlier builds)" if stale else ""))
+    if count:
+        print(f"pyramid: {count} tiles in AOI, elevation {gmin:.1f}..{gmax:.1f} m"
+              + (f" (ignored {stale} stale tiles from earlier builds)" if stale else ""))
+    else:
+        print("pyramid: no tiles in AOI"
+              + (f" (ignored {stale} stale tiles from earlier builds)" if stale else ""))
     if meta:
         print(f"tilejson statistics: {meta['statistics']}")
         ok = (count > 0
