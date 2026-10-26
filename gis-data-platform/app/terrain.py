@@ -157,11 +157,18 @@ class TerrainSource:
                 pass
             bounds = data.get("bounds")
             stats = data.get("statistics") or {}
+            # A failed or degenerate build writes null/inf statistics. Don't
+            # trust its maxzoom — fall back to the default so terrain tiles
+            # still serve from the previous good build's pyramid.
+            stat_min = stats.get("min")
+            stat_max = stats.get("max")
+            degenerate = stat_min is None or stat_max is None
+            file_maxzoom = int(data.get("maxzoom", 13))
             meta = _Meta(
                 key=key,
                 bounds=tuple(float(v) for v in bounds) if isinstance(bounds, list) and len(bounds) == 4 else None,
-                maxzoom=int(data.get("maxzoom", 13)),
-                base=float(stats.get("min", 0.0) or 0.0),
+                maxzoom=13 if degenerate else file_maxzoom,
+                base=float(stat_min or 0.0),
             )
             self._meta, self._fields, self._tiles = meta, {}, {}
             return meta

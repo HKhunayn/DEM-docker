@@ -165,6 +165,9 @@ def _run_job(
     job = _JOBS[job_id]
     outcome = "done"
     error: str | None = None
+    # Preserve the previous tilejson so a failed build doesn't corrupt it.
+    tilejson_path = TILE_ROOT / "tilejson.json"
+    tilejson_backup = tilejson_path.read_bytes() if tilejson_path.exists() else None
     try:
         for entry, step in zip(job["steps"], STEPS):
             entry["state"] = "running"
@@ -195,6 +198,14 @@ def _run_job(
         error = f"{job['step']} step failed ({exc})"
         with _LOCK:
             job["log"].append(f"FATAL {exc}")
+
+    if outcome == "error":
+        # Restore the previous tilejson so a failed build doesn't leave
+        # degenerate metadata (e.g. maxzoom=0) that 404s all terrain tiles.
+        if tilejson_backup is not None:
+            tilejson_path.write_bytes(tilejson_backup)
+        elif tilejson_path.exists():
+            tilejson_path.unlink()
 
     result = None
     if outcome == "done":

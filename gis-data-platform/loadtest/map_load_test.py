@@ -162,7 +162,11 @@ class VirtualUser:
         self.result = UserResult(user_id)
         self.lon, self.lat = sources.center
         self._session = None
-        self.zoom = min(max(config.min_zoom, 2), min(config.max_zoom, sources.max_zoom))
+        # Clamp the zoom range to the server's advertised limits so the
+        # test never requests tiles the server intentionally 404s.
+        self._eff_max_zoom = min(config.max_zoom, sources.max_zoom)
+        self._eff_min_zoom = min(config.min_zoom, self._eff_max_zoom)
+        self.zoom = max(self._eff_min_zoom, min(self._eff_max_zoom, 2))
 
     async def _request(self, session: aiohttp.ClientSession, url: str) -> None:
         started = time.perf_counter()
@@ -179,7 +183,7 @@ class VirtualUser:
     def _move(self) -> None:
         self.lon = max(-179.0, min(179.0, self.lon + self.random.uniform(-8.0, 8.0)))
         self.lat = max(-80.0, min(80.0, self.lat + self.random.uniform(-5.0, 5.0)))
-        self.zoom = max(self.config.min_zoom, min(self.sources.max_zoom, self.zoom + self.random.choice([-2, -1, 1, 1, 2])))
+        self.zoom = max(self._eff_min_zoom, min(self._eff_max_zoom, self.zoom + self.random.choice([-2, -1, 1, 1, 2])))
 
     async def run_once(self) -> UserResult:
         if aiohttp is None:
