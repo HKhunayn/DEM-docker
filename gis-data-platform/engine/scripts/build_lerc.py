@@ -1,16 +1,18 @@
-"""Build an ArcGIS-compatible elevation tile pyramid (LERC) from a DEM mosaic.
+"""Build an ArcGIS-compatible elevation tile pyramid (LERC) from DEM COGs.
+
+Windowed, resumable and parallel like build_tiles.py: each tile reads only
+its own footprint from the sources (constant memory at any AOI size), tiles
+already on disk are skipped unless --force is given, and encoding runs in a
+process pool (--workers, default: all CPUs).
 
 Output layout (served by scripts/serve.py):
   <out>/arcgis/rest/services/<name>/ImageServer.json      <- service metadata
-  <out>/arcgis/rest/services/<name>/tile/{z}/{row}/{col}  <- Lerc2 blobs (float32 meters)
+  <out>/arcgis/rest/services/<name>/tile/{z}/{row}/{col}  <- Lerc1 blobs (float32 meters)
 
 The metadata mirrors the fields of Esri's WorldElevation3D/Terrain3D ImageServer
 (fetched and checked field-by-field), so ANY ArcGIS client (ArcGIS Maps SDK for
 JavaScript/Qt/.NET/iOS/Android, ArcGIS Pro, ArcGIS Earth) can consume it as a
 plain ElevationLayer URL — no custom code.
-
-LERC encoding is done with GDAL (libLERC, Apache-2.0): each tile is written as a
-single-tile GeoTIFF with COMPRESS=LERC and the raw Lerc2 blob is carved out.
 
 Usage:
   python build_lerc.py --src dem1.tif [dem2.tif ...] --bbox 6.6 45.6 7.2 46.0 \
@@ -21,23 +23,26 @@ import argparse
 import json
 import math
 import os
-import struct
 import subprocess
 import sys
 import tempfile
 
+# Cap GDAL's block cache per process (MB) before rasterio/GDAL initialize —
+# the default is 5% of RAM, which OOMs the VM when many worker processes
+# each open hundreds of COGs.
+os.environ.setdefault("GDAL_CACHEMAX", "128")
+
 import numpy as np
 import rasterio
-from rasterio.crs import CRS
 from rasterio.io import MemoryFile
-from rasterio.merge import merge
-from rasterio.transform import from_bounds
-from rasterio.warp import Resampling, reproject, transform_bounds
+from rasterio.warp import transform_bounds
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from build_tiles import (  # noqa: E402
-    NODATA, MERC, ORIGIN_SHIFT, TILE_PX, lonlat_to_tile, tile_merc_bounds,
+    NODATA, TILE_PX, SourceIndex, _default_workers, build_tile,
+    lonlat_to_tile, source_stats,
 )
+from pool_runner import describe_limits, run_pool  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -101,6 +106,35 @@ def lerc2_blob(arr: np.ndarray) -> bytes:
     return raw[off:]
 
 
+# ---- worker pool -----------------------------------------------------------
+
+_IDX: SourceIndex | None = None
+
+
+def _init_worker(src_paths):
+    global _IDX
+    _IDX = SourceIndex(src_paths)
+    import atexit
+    atexit.register(_IDX.close)
+
+
+def _lerc_job(task):
+    z, x, y, tile_root, force, flavor, maxzerr = task
+    tile_path = os.path.join(tile_root, str(z), str(y), str(x))
+    if (not force) and os.path.exists(tile_path) and os.path.getsize(tile_path) > 0:
+        return "skip", os.path.getsize(tile_path)
+    dst = build_tile(_IDX, x, y, z)
+    if dst is None:
+        return "empty", 0
+    blob = lerc1_blob(dst, maxzerr) if flavor == "lerc1" else lerc2_blob(dst)
+    os.makedirs(os.path.dirname(tile_path), exist_ok=True)
+    tmp_path = tile_path + ".part"
+    with open(tmp_path, "wb") as f:
+        f.write(blob)
+    os.replace(tmp_path, tile_path)
+    return "write", len(blob)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", nargs="+", required=True)
@@ -118,54 +152,72 @@ def main() -> int:
                     help="lerc1 (CntZImage) = what ArcGIS clients decode; lerc2 = experimental")
     ap.add_argument("--maxzerr", type=float, default=0.01,
                     help="Lerc1 quantization bound in meters (0 = lossless raw floats)")
+    ap.add_argument("--force", action="store_true",
+                    help="re-encode tiles even when they already exist on disk")
+    ap.add_argument("--workers", type=int, default=0,
+                    help="build processes (default: number of CPUs)")
     args = ap.parse_args()
 
     minlon, minlat, maxlon, maxlat = args.bbox
+    workers = args.workers or _default_workers()
 
-    datasets = [rasterio.open(p) for p in args.src]
-    mosaic, transform = merge(datasets, bounds=(minlon, minlat, maxlon, maxlat),
-                             resampling=Resampling.bilinear, nodata=NODATA)
-    src_arr = mosaic[0].astype(np.float32)
-    src_arr[src_arr < -1000.0] = NODATA
-    src_crs = datasets[0].crs
-    for ds in datasets:
-        ds.close()
+    idx = SourceIndex(args.src)
+    print(f"sources: {len(idx.datasets)} DEM file(s); windowed LERC build, "
+          f"resume={'off' if args.force else 'on'}, workers={workers}; "
+          f"{describe_limits()}")
+    sys.stdout.flush()
 
-    valid = src_arr > NODATA + 1.0
-    v = src_arr[valid]
-    stats = dict(min=float(v.min()), max=float(v.max()),
-                 mean=float(v.mean()), stdv=float(v.std()))
-    print(f"mosaic {src_arr.shape[1]}x{src_arr.shape[0]} px, "
-          f"elevation {stats['min']:.1f}..{stats['max']:.1f} m")
+    # Statistics: prefer the Terrarium tilejson written by build_tiles for the
+    # same footprint (exact min/max); fall back to overview reads of the sources.
+    overview = source_stats(idx)
+    tj_path = os.path.join(args.out, "tilejson.json")
+    tj = None
+    if os.path.exists(tj_path):
+        try:
+            with open(tj_path) as f:
+                tj = json.load(f).get("statistics")
+        except Exception:  # noqa: BLE001
+            tj = None
+    if tj and overview and all(k in tj for k in ("min", "max")):
+        stats = dict(min=float(tj["min"]), max=float(tj["max"]),
+                     mean=overview["mean"], stdv=overview["stdv"])
+    elif overview:
+        stats = overview
+    else:
+        print("ERROR: no elevation data found in the sources", file=sys.stderr)
+        return 1
+    print(f"elevation {stats['min']:.1f}..{stats['max']:.1f} m "
+          f"(mean {stats['mean']:.1f}, stdv {stats['stdv']:.1f})")
+    sys.stdout.flush()
+    idx.close()
 
     svc_root = os.path.join(args.out, "arcgis", "rest", "services", args.name)
     tile_root = os.path.join(svc_root, "tile")
-    total, nbytes = 0, 0
+    written_total = skipped_total = nbytes = 0
 
     for z in range(args.minzoom, args.maxzoom + 1):
         x0, y0 = lonlat_to_tile(minlon, maxlat, z)
         x1, y1 = lonlat_to_tile(maxlon, minlat, z)
-        for x in range(x0, x1 + 1):
-            for y in range(y0, y1 + 1):
-                dst = np.full((TILE_PX, TILE_PX), NODATA, np.float32)
-                minx, miny, maxx, maxy = tile_merc_bounds(x, y, z)
-                reproject(
-                    source=src_arr, destination=dst,
-                    src_transform=transform, src_crs=src_crs, src_nodata=NODATA,
-                    dst_transform=from_bounds(minx, miny, maxx, maxy, TILE_PX, TILE_PX),
-                    dst_crs=MERC, dst_nodata=NODATA, resampling=Resampling.bilinear,
-                )
-                if not (dst > NODATA + 1.0).any():
-                    continue
-                blob = (lerc1_blob(dst, args.maxzerr) if args.flavor == "lerc1"
-                        else lerc2_blob(dst))
-                out_dir = os.path.join(tile_root, str(z), str(y))
-                os.makedirs(out_dir, exist_ok=True)
-                with open(os.path.join(out_dir, str(x)), "wb") as f:
-                    f.write(blob)
-                total += 1
-                nbytes += len(blob)
-        print(f"z{z}: x={x0}..{x1} y={y0}..{y1} (cumulative {total})")
+        tasks = [(z, x, y, tile_root, args.force, args.flavor, args.maxzerr)
+                 for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
+        c = {"w": 0, "s": 0, "b": 0}
+
+        def on_result(res, c=c):
+            status, size = res
+            c["b"] += size
+            if status == "write":
+                c["w"] += 1
+            elif status == "skip":
+                c["s"] += 1
+
+        workers = run_pool(_lerc_job, tasks, workers, _init_worker,
+                           (list(args.src),), on_result, f"lerc z{z}")
+        nbytes += c["b"]
+        written_total += c["w"]
+        skipped_total += c["s"]
+        print(f"z{z}: x={x0}..{x1} y={y0}..{y1} written={c['w']} skipped={c['s']} "
+              f"(cumulative written {written_total})")
+        sys.stdout.flush()
 
     # ---- ArcGIS ImageServer metadata (field-for-field compatible with
     #      WorldElevation3D/Terrain3D; lods limited to what we actually serve)
@@ -216,7 +268,8 @@ def main() -> int:
     with open(os.path.join(svc_root, "ImageServer.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
-    print(f"WROTE {total} LERC tiles ({nbytes / 1e6:.2f} MB) + ImageServer.json -> {svc_root}")
+    print(f"WROTE {written_total} LERC tiles, skipped {skipped_total} existing "
+          f"({nbytes / 1e6:.2f} MB on disk) + ImageServer.json -> {svc_root}")
     print(f"SERVICE URL: {args.out}/arcgis/rest/services/{args.name} "
           f"(serve with: python ../terrainhub.py serve --root {args.out})")
     return 0

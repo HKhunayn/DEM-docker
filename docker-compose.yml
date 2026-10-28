@@ -4,6 +4,13 @@ services:
       context: ./gis-data-platform
       dockerfile: Dockerfile
     image: local-gis-data-platform:latest
+    # Hard memory ceiling for the API + tile builds. Keeps a country-scale
+    # build from starving the Docker VM (that wedged the whole Docker engine
+    # once). memswap = mem -> no swap thrash; the builders' pool watchdog
+    # (engine/scripts/pool_runner.py) keeps usage under 75% of this cap.
+    # Raise it if you give WSL more RAM in %UserProfile%\.wslconfig.
+    mem_limit: ${GIS_PLATFORM_MEM_LIMIT:-20g}
+    memswap_limit: ${GIS_PLATFORM_MEM_LIMIT:-20g}
     environment:
       GIS_DATA_ROOT: /app/data
       HEIGHTMAP_ENGINE_ROOT: /opt/heightmap-30m

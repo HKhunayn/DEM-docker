@@ -26,10 +26,18 @@ echo Starting GIS data platform and viewer containers...
 docker compose up -d --build
 if errorlevel 1 exit /b 1
 
+rem --- read the actual host ports from .env (compose reads the same file) ---
+set "API_PORT=8787"
+set "VIEWER_PORT=5173"
+if exist ".env" (
+  for /f "tokens=2 delims==" %%p in ('findstr /b "GIS_PLATFORM_PORT=" .env 2^>nul') do set "API_PORT=%%p"
+  for /f "tokens=2 delims==" %%p in ('findstr /b "GIS_VIEWER_PORT=" .env 2^>nul') do set "VIEWER_PORT=%%p"
+)
+
 echo.
-echo Viewer:  http://127.0.0.1:5173/
-echo API:     http://127.0.0.1:8787/docs
-echo Fetch:   http://127.0.0.1:5173/fetch/
+echo Viewer:  http://127.0.0.1:%VIEWER_PORT%/
+echo API:     http://127.0.0.1:%API_PORT%/docs
+echo Fetch:   http://127.0.0.1:%VIEWER_PORT%/fetch/
 exit /b 0
 
 :down

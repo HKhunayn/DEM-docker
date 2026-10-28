@@ -83,6 +83,14 @@ def main() -> int:
         sp = sub.add_parser(c, parents=[common])
         if c == "fetch":
             sp.add_argument("--out", default=DATA_DIR, help="source DEM output dir")
+            sp.add_argument("--check", action="store_true",
+                            help="report cached vs missing source tiles without downloading")
+        if c in ("build", "all"):
+            sp.add_argument("--force", action="store_true",
+                            help="rebuild tiles even when they already exist on disk")
+
+    sub.add_parser("status", parents=[common],
+                   help="alias for `fetch --check`: show what is already downloaded")
 
     sp = sub.add_parser("serve")
     sp.add_argument("--root", default=PUBLIC_DIR, help="static UI pages (public/)")
@@ -97,10 +105,11 @@ def main() -> int:
                                "--port", str(args.port)])
 
     def fetch():
+        check = ["--check"] if getattr(args, "check", False) else []
         if args.provider == "fabdem":
-            return run(fetch_fabdem.main, ["--bbox", *map(str, bbox), "--out", args.data])
+            return run(fetch_fabdem.main, ["--bbox", *map(str, bbox), "--out", args.data] + check)
         return run(fetch_dem.main, ["--bbox", *map(str, bbox), "--res", str(args.res),
-                                    "--out", args.data])
+                                    "--out", args.data] + check)
 
     def dataset():
         """Local source files + bbox + provider: data/manifest.json if present,
@@ -121,12 +130,13 @@ def main() -> int:
             return 1
         argv = ["--src", *srcs, "--bbox", *map(str, bb),
                 "--minzoom", str(args.minzoom), "--maxzoom", str(args.maxzoom)]
-        rc = run(build_tiles.main, argv + ["--out", f"{args.root}/terrarium",
-                                           "--hillshade-out", f"{args.root}/hillshade"])
+        force = ["--force"] if getattr(args, "force", False) else []
+        rc = run(build_tiles.main, argv + force + ["--out", f"{args.root}/terrarium",
+                                                   "--hillshade-out", f"{args.root}/hillshade"])
         if rc:
             return rc
-        return run(build_lerc.main, argv + ["--name", args.name, "--out", args.root,
-                                            "--provider", provider])
+        return run(build_lerc.main, argv + force + ["--name", args.name, "--out", args.root,
+                                                    "--provider", provider])
 
     def verify():
         srcs, bb, _provider = dataset()
@@ -135,6 +145,9 @@ def main() -> int:
                                        "--minzoom", str(args.minzoom),
                                        "--maxzoom", str(args.maxzoom)])
 
+    if args.cmd == "status":
+        args.check = True
+        return fetch()
     if args.cmd == "fetch":
         return fetch()
     if args.cmd == "build":

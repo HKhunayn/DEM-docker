@@ -82,9 +82,28 @@ def main() -> int:
     ap.add_argument("--bbox", nargs=4, type=float, required=True,
                     metavar=("MINLON", "MINLAT", "MAXLON", "MAXLAT"))
     ap.add_argument("--out", default="data")
+    ap.add_argument("--check", action="store_true",
+                    help="report cached vs missing tiles without downloading")
     args = ap.parse_args()
     minlon, minlat, maxlon, maxlat = args.bbox
     os.makedirs(args.out, exist_ok=True)
+
+    if args.check:
+        tiles = [(lat, lon)
+                 for lat in range(int(minlat // 1), int(maxlat // 1) + 1)
+                 for lon in range(int(minlon // 1), int(maxlon // 1) + 1)]
+        cached = missing = 0
+        for lat, lon in tiles:
+            member = tile_member(lat, lon)
+            dest = os.path.join(args.out, member)
+            if os.path.exists(dest) and os.path.getsize(dest) > 0:
+                print(f"  cached  {member} ({os.path.getsize(dest) / 1e6:.1f} MB)")
+                cached += 1
+            else:
+                print(f"  missing {member} (may be ocean/void)")
+                missing += 1
+        print(f"check: {cached}/{len(tiles)} FABDEM tiles already downloaded")
+        return 0
 
     blocks = discover_blocks(os.path.join(args.out, "fabdem_index.html"))
     print(f"block index: {len(blocks)} FABDEM blocks")
