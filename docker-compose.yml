@@ -1,9 +1,23 @@
+# Shared json-file log rotation: at most 5 x 20 MB per container.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   data-platform:
     build:
       context: ./gis-data-platform
       dockerfile: Dockerfile
     image: local-gis-data-platform:latest
+    restart: unless-stopped
+    # tini as PID 1: reaps the engine subprocesses (fetch/build/verify jobs and
+    # their worker pools) and forwards SIGTERM so `compose stop` is clean.
+    init: true
+    # Give uvicorn and a running job time to shut down before SIGKILL.
+    stop_grace_period: 60s
+    logging: *default-logging
     # Hard memory ceiling for the API + tile builds. Keeps a country-scale
     # build from starving the Docker VM (that wedged the whole Docker engine
     # once). memswap = mem -> no swap thrash; the builders' pool watchdog
@@ -11,6 +25,8 @@ services:
     # Raise it if you give WSL more RAM in %UserProfile%\.wslconfig.
     mem_limit: ${GIS_PLATFORM_MEM_LIMIT:-20g}
     memswap_limit: ${GIS_PLATFORM_MEM_LIMIT:-20g}
+    # Optional CPU cap (e.g. leave cores free for the desktop during a build):
+    # cpus: "${GIS_PLATFORM_CPUS:-8}"
     environment:
       GIS_DATA_ROOT: /app/data
       HEIGHTMAP_ENGINE_ROOT: /opt/heightmap-30m
@@ -43,6 +59,8 @@ services:
       args:
         VITE_PLATFORM_URL: ${VITE_PLATFORM_URL:-}
     image: local-gis-viewer:latest
+    restart: unless-stopped
+    logging: *default-logging
     depends_on:
       data-platform:
         condition: service_healthy

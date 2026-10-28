@@ -1,6 +1,26 @@
+# Build context = gis-data-platform/. Keep local junk and runtime data out of
+# the image (data lives in the gis-data named volume).
 Dockerfile
+.dockerignore
+.git
 .venv
-__pycache__
+venv
+**/__pycache__
+**/*.pyc
+**/*.pyo
 .pytest_cache
-*.pyc
+**/.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
 data
+**/*.log
+**/*.tmp
+**/*.part
+.env
+.env.*
+Run.bat
+Run.sh
+engine/scripts/lerc1enc.exe
+engine/scripts/lerc1enc

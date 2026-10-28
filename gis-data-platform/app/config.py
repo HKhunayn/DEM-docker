@@ -12,6 +12,23 @@ DEM_ROOT = DATA_ROOT / "dem"          # source DEM GeoTIFFs + manifest.json
 TILE_ROOT = DATA_ROOT / "tiles"       # derived: terrarium/, hillshade/, arcgis/, tilejson.json
 IMAGERY_ROOT = DATA_ROOT / "imagery"  # fetched imagery sets: <name>/{z}/{x}/{y}.jpg + imagery.json
 CATALOG_PATH = CATALOG_ROOT / "catalog.json"
+JOBS_ROOT = DATA_ROOT / "jobs"        # persisted job records (<id>.json) + full logs (<id>.log)
+JOB_LOCK_PATH = DATA_ROOT / ".job.lock"  # PID of the running engine (cross-process guard)
+INCOMING_ROOT = DATA_ROOT / "incoming"   # default allow-listed directory for POST /api/ingest
+
+
+def ingest_root() -> Path:
+    """Directory POST /api/ingest may read from (env GIS_INGEST_ROOT overrides)."""
+    configured = os.environ.get("GIS_INGEST_ROOT")
+    return Path(configured) if configured else INCOMING_ROOT
+
+
+def ingest_max_bytes() -> int:
+    """Largest file POST /api/ingest accepts (env GIS_INGEST_MAX_BYTES, default 20 GB)."""
+    try:
+        return int(os.environ.get("GIS_INGEST_MAX_BYTES", str(20 * 1024 ** 3)))
+    except ValueError:
+        return 20 * 1024 ** 3
 
 # heightmap-30m engine: the existing fetch/build/verify CLI reused for jobs.
 # Resolution order: explicit env var -> engine bundled with this project
@@ -57,7 +74,7 @@ def engine_python() -> Path:
             return candidate
     return Path(sys.executable)
 
-for directory in (SOURCE_ROOT, CATALOG_ROOT, DEM_ROOT, TILE_ROOT, IMAGERY_ROOT):
+for directory in (SOURCE_ROOT, CATALOG_ROOT, DEM_ROOT, TILE_ROOT, IMAGERY_ROOT, JOBS_ROOT, INCOMING_ROOT):
     directory.mkdir(parents=True, exist_ok=True)
 
 SUPPORTED_KIND_HINTS = {

@@ -1,0 +1,39 @@
+# Local configuration / secrets (copy .env.example to .env)
+.env
+.env.*
+!.env.example
+gis-viewers/.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Node / Vite
+node_modules/
+dist/
+.vite/
+
+# Runtime data (lives in the gis-data Docker volume / local data dir)
+gis-data-platform/data/
+
+# Build artefacts and temp files
+gis-data-platform/engine/scripts/lerc1enc
+*.obj
+*.log
+*.tmp
+*.part
+DEM-docker.zip
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

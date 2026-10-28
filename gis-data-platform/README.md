@@ -49,6 +49,18 @@ python -m venv .venv
 .venv/Scripts/python -m app --host 127.0.0.1 --port 8787
 ```
 
+On Linux/macOS `./Run.sh` does the same (creates `.venv`, installs
+`requirements.txt`, then runs `.venv/bin/python -m app`; override with
+`HOST=0.0.0.0 PORT=8790 ./Run.sh`).
+
+`requirements.txt` holds the pinned runtime dependencies (what the Docker image
+installs). For the test suite install the dev extras as well:
+
+```bash
+.venv/Scripts/python -m pip install -r requirements-dev.txt
+.venv/Scripts/python -m pytest
+```
+
 The existing elevation pyramid is served through `/tiles/terrain.json`, `/tiles/terrain/{z}/{x}/{y}.png`, and `/arcgis/rest/services/<name>/ImageServer`, read from `data/tiles/`.
 
 ## Ingest

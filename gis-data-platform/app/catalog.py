@@ -1,14 +1,23 @@
 from __future__ import annotations
 import json
 import mimetypes
+import os
 import shutil
+import stat
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import CATALOG_PATH, SOURCE_ROOT
+from .config import CATALOG_PATH, SOURCE_ROOT, ingest_max_bytes, ingest_root
+
+TITLE_MAX_LEN = 200
+CRS_MAX_LEN = 100
+
+
+class NameConflictError(Exception):
+    """A saved area / imagery set name is already used with another provider (HTTP 409)."""
 
 # The catalog is read-modify-written from API requests and job threads; every
 # edit holds this lock and writes through a unique temp file before replacing.
@@ -37,13 +46,63 @@ def catalog_items() -> list[dict[str, Any]]:
 def item_path(item: dict[str, Any]) -> Path:
     return SOURCE_ROOT / item["id"] / item["filename"]
 
+def _clean_text(value: str | None, field: str, max_len: int) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    value = value.strip()
+    if len(value) > max_len:
+        raise ValueError(f"{field} is too long (max {max_len} characters)")
+    if any(ord(c) < 32 or 127 <= ord(c) < 160 for c in value):
+        raise ValueError(f"{field} must not contain control characters")
+    return value or None
+
+
+def resolve_ingest_source(source: Path | str) -> Path:
+    """Resolve an ingest path inside the allow-listed ingest root.
+
+    Relative paths are taken relative to the root. Raises PermissionError for
+    anything resolving outside the root (including symlinks that escape it),
+    FileNotFoundError when it does not exist, ValueError for non-regular files,
+    oversized files or malformed paths.
+    """
+    raw = str(source)
+    if not raw.strip() or "\x00" in raw:
+        raise ValueError("invalid source path")
+    root = ingest_root().resolve()
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    resolved = candidate.resolve()  # follows symlinks: an escaping link resolves outside
+    if not resolved.is_relative_to(root):
+        raise PermissionError(f"ingest is restricted to files under {root}")
+    try:
+        info = resolved.stat()
+    except FileNotFoundError:
+        raise FileNotFoundError(str(source)) from None
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("source path is not a regular file")
+    limit = ingest_max_bytes()
+    if info.st_size > limit:
+        raise ValueError(f"source file is too large ({info.st_size} bytes, limit {limit})")
+    return resolved
+
+
 def ingest_file(source: Path, kind: str = "unknown", title: str | None = None, crs: str | None = None) -> dict[str, Any]:
-    if not source.exists() or not source.is_file():
-        raise FileNotFoundError(str(source))
+    title = _clean_text(title, "title", TITLE_MAX_LEN)
+    crs = _clean_text(crs, "crs", CRS_MAX_LEN)
+    source = resolve_ingest_source(source)
     item_id = uuid.uuid4().hex
     destination = SOURCE_ROOT / item_id / source.name
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, destination)
+    partial = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.part")
+    try:
+        shutil.copy2(source, partial)
+        os.replace(partial, destination)
+    except BaseException:
+        shutil.rmtree(destination.parent, ignore_errors=True)
+        raise
     mime, _ = mimetypes.guess_type(source.name)
     item: dict[str, Any] = {
         "type": "Feature",
@@ -99,6 +158,24 @@ def find_area(area_id: str) -> dict[str, Any] | None:
     return next((area for area in list_areas() if area.get("id") == area_id), None)
 
 
+def _area_kind(area: dict[str, Any]) -> str:
+    return area.get("kind") or "elevation"
+
+
+def check_area_provider(name: str, provider: str, kind: str = "elevation") -> None:
+    """Raise NameConflictError when `name` is saved with a different provider.
+
+    Areas are keyed (name, provider), but the ArcGIS service dir / imagery set
+    dir is keyed by name only, so two providers would overwrite each other.
+    """
+    for area in list_areas():
+        if area.get("name") == name and _area_kind(area) == kind and area.get("provider") != provider:
+            raise NameConflictError(
+                f"{'imagery set' if kind == 'imagery' else 'area'} '{name}' already exists with provider "
+                f"'{area.get('provider')}'; delete it first or choose another name"
+            )
+
+
 def create_area(
     name: str,
     bbox: list[float],
@@ -142,6 +219,7 @@ def upsert_area(
     (name, provider), so re-running a fetch refreshes that area instead of
     leaving a new row with the same name in the viewer's selection list."""
     with _EDIT_LOCK:
+        check_area_provider(name, provider, kind)
         catalog = load_catalog()
         existing = next(
             (a for a in catalog.get("areas", []) if a.get("name") == name and a.get("provider") == provider),
@@ -184,3 +262,34 @@ def delete_area(area_id: str) -> bool:
         catalog["areas"] = kept
         save_catalog(catalog)
     return True
+
+
+def delete_areas(name: str, kind: str) -> int:
+    """Remove every saved area called `name` of `kind`; returns how many."""
+    with _EDIT_LOCK:
+        catalog = load_catalog()
+        old = catalog.get("areas", [])
+        kept = [a for a in old if not (a.get("name") == name and _area_kind(a) == kind)]
+        if len(kept) != len(old):
+            catalog["areas"] = kept
+            save_catalog(catalog)
+        return len(old) - len(kept)
+
+
+def mark_interrupted_areas(message: str) -> int:
+    """Startup: datasets left in state 'building' by a dead job -> 'interrupted'."""
+    with _EDIT_LOCK:
+        if not CATALOG_PATH.exists():
+            return 0
+        catalog = load_catalog()
+        changed = 0
+        for area in catalog.get("areas", []):
+            dataset = area.get("dataset")
+            if isinstance(dataset, dict) and dataset.get("state") == "building":
+                dataset["state"] = "interrupted"
+                dataset["error"] = message
+                area["updated"] = _now()
+                changed += 1
+        if changed:
+            save_catalog(catalog)
+        return changed

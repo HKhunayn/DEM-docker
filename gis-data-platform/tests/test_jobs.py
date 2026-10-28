@@ -1,6 +1,5 @@
 """Background fetch/build jobs: engine CLI steps, status API, area persistence."""
 
-import sys
 import time
 
 JOB = {
@@ -17,7 +16,7 @@ def wait_done(client, job_id, timeout=20.0):
     last = None
     while time.time() < deadline:
         last = client.get(f"/api/jobs/{job_id}").json()
-        if last["state"] in ("done", "error"):
+        if last["state"] in ("done", "error", "cancelled", "interrupted"):
             return last
         time.sleep(0.05)
     raise AssertionError(f"job did not finish: {last}")
@@ -133,3 +132,43 @@ def test_job_can_skip_area_save(client):
     assert started["areaId"] is None
     wait_done(client, started["id"])
     assert client.get("/api/areas").json()["count"] == 0
+
+
+def test_verify_failure_keeps_build_and_finishes_done_with_warning(client, monkeypatch, tmp_path):
+    tiles = tmp_path / "data" / "tiles"
+    (tiles / "tilejson.json").write_text('{"old": true}', encoding="utf-8")
+    monkeypatch.setenv("STUB_TILEJSON", '{"new": true}')
+    monkeypatch.setenv("STUB_FAIL", "verify")
+    started = client.post("/api/jobs", json=JOB).json()
+    job = wait_done(client, started["id"])
+    assert job["state"] == "done"
+    assert job["result"]["verified"] is False
+    assert job["result"]["tilesBuilt"] == 42
+    assert "verify" in job["warning"]
+    assert job["error"] is None
+    assert job["steps"][2]["state"] == "error"
+    # the new build is kept: no rollback for a verify-only failure
+    assert (tiles / "tilejson.json").read_text(encoding="utf-8") == '{"new": true}'
+    area = client.get(f"/api/areas/{started['areaId']}").json()
+    assert area["dataset"]["state"] == "done" and area["dataset"]["verified"] is False
+    assert "verify" in area["dataset"]["warning"]
+
+
+def test_build_failure_restores_previous_tilejson(client, monkeypatch, tmp_path):
+    tiles = tmp_path / "data" / "tiles"
+    (tiles / "tilejson.json").write_text('{"old": true}', encoding="utf-8")
+    monkeypatch.setenv("STUB_TILEJSON", '{"broken": true}')
+    monkeypatch.setenv("STUB_FAIL", "build")
+    job = wait_done(client, client.post("/api/jobs", json=JOB).json()["id"])
+    assert job["state"] == "error"
+    assert (tiles / "tilejson.json").read_text(encoding="utf-8") == '{"old": true}'
+    assert not list(tiles.glob("*.restore"))
+
+
+def test_fetch_failure_does_not_touch_tilejson(client, monkeypatch, tmp_path):
+    tiles = tmp_path / "data" / "tiles"
+    monkeypatch.setenv("STUB_FAIL", "fetch")
+    job = wait_done(client, client.post("/api/jobs", json=JOB).json()["id"])
+    assert job["state"] == "error" and "fetch" in job["error"]
+    assert job["steps"][1]["state"] == "pending"
+    assert not (tiles / "tilejson.json").exists()

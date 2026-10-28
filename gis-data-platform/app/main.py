@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import json
 import math
+import os
+import re
+import threading
+from collections import OrderedDict
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,12 +16,26 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from .catalog import catalog_items, delete_item, find_item, ingest_file, item_path, load_catalog
-from .config import TILE_ROOT, public_base
+from .config import TILE_ROOT
 from .fetch_api import router as fetch_router
 from .imagery_api import router as imagery_router
 from .terrain import TerrainSource
 
-app = FastAPI(title="Local Open GIS Data Platform", version="0.1.0")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    yield
+    # Terminate running engine subprocesses on shutdown, if the jobs module
+    # provides a hook (getattr: older jobs modules don't have one).
+    try:
+        from . import jobs
+    except Exception:  # pragma: no cover - jobs module optional here
+        return
+    shutdown = getattr(jobs, "shutdown", None)
+    if callable(shutdown):
+        shutdown()
+
+
+app = FastAPI(title="Local Open GIS Data Platform", version="0.1.0", lifespan=_lifespan)
 app.include_router(fetch_router)
 app.include_router(imagery_router)
 app.add_middleware(
@@ -61,6 +81,26 @@ def _base(request: Request) -> str:
     return str(request.base_url).rstrip("/")
 
 
+# ArcGIS service names: one plain path segment (no '.', '..', separators).
+_SERVICE_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+
+
+def _service_dir(name: str) -> Path:
+    if not _SERVICE_NAME.match(name) or ".." in name:
+        raise HTTPException(status_code=404, detail="ImageServer not found", headers=_NO_STORE)
+    return TILE_DIR / "arcgis" / "rest" / "services" / name
+
+
+def _read_json(path: Path) -> Any:
+    """Parse a JSON file another process may be rewriting.
+    Raises 503 (retry shortly) on a partial/unreadable file instead of 500."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise HTTPException(status_code=503, detail="metadata is being rewritten, retry",
+                            headers={"Retry-After": "2", "Cache-Control": "no-store"})
+
+
 def _tile_file(relative: str) -> Path | None:
     candidate = (TILE_DIR / relative).resolve()
     try:
@@ -104,6 +144,10 @@ def ingest(body: IngestRequest, request: Request) -> dict[str, Any]:
         item = ingest_file(Path(body.path), body.kind, body.title, body.crs)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="source path does not exist")
+    except PermissionError as exc:  # path outside the allowed ingest root
+        raise HTTPException(status_code=403, detail=str(exc) or "path not allowed")
+    except ValueError as exc:  # bad input (not a file, unsupported type, ...)
+        raise HTTPException(status_code=400, detail=str(exc) or "invalid ingest request")
     item["assets"]["source"]["href"] = f"{_base(request)}/api/assets/{item['id']}"
     return item
 
@@ -155,33 +199,52 @@ def _transparent_tile() -> bytes:
     return _TRANSPARENT_TILE
 
 
-# Tiles change whenever a new build runs ("last build wins"), so they must be
-# revalidated, never cached as immutable.
-_REVALIDATE = "no-cache"
+# Tiles change whenever a new build runs ("last build wins"): never
+# `immutable`. Terrain/imagery URLs carry a per-build ?v= token, so a day is
+# safe; ArcGIS tile URLs are unversioned, so they get a shorter max-age (the
+# FileResponse ETag/Last-Modified make revalidation cheap). Errors: no-store.
+_TILE_CACHE = "public, max-age=86400"
+_ARCGIS_TILE_CACHE = "public, max-age=3600"
+_NO_STORE = {"Cache-Control": "no-store"}
+_DEFAULT_TILEJSON: dict[str, Any] = {"tilejson": "3.0.0", "name": "local terrain", "minzoom": 0, "maxzoom": 13,
+                                     "encoding": "terrarium", "tileSize": 256}
 
 
 @app.get("/tiles/terrain/{z}/{x}/{y}.png")
 def terrain(z: int, x: int, y: int) -> Response:
     if z < 0 or z > 24 or not (0 <= x < 2 ** z) or not (0 <= y < 2 ** z):
-        raise HTTPException(status_code=404, detail="terrain tile not found")
+        raise HTTPException(status_code=404, detail="terrain tile not found", headers=_NO_STORE)
     # Seamless field: real heights inside coverage, edge heights eased to a
     # flat base outside. Above maxzoom -> 404 so clients over-zoom the parent.
     payload = TERRAIN.tile_png(z, x, y)
     if payload is None:
-        raise HTTPException(status_code=404, detail="above terrain maxzoom")
+        raise HTTPException(status_code=404, detail="above terrain maxzoom", headers=_NO_STORE)
     response = Response(content=payload, media_type="image/png")
-    response.headers["Cache-Control"] = _REVALIDATE
+    response.headers["Cache-Control"] = _TILE_CACHE
     return response
 
 
 @app.get("/tiles/terrain.json")
 def terrain_tilejson(request: Request) -> JSONResponse:
-    old = TILE_DIR / "tilejson.json"
-    if old.exists():
-        import json
-        data = json.loads(old.read_text(encoding="utf-8"))
+    path = TILE_DIR / "tilejson.json"
+    data: Any = None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        data = dict(_DEFAULT_TILEJSON)
+    except (OSError, ValueError):
+        data = None  # the engine is rewriting it right now
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=503, detail="terrain metadata is being rewritten, retry",
+                            headers={"Retry-After": "2", "Cache-Control": "no-store"})
+    meta = TERRAIN.meta()
+    # Advertise what is actually served (degenerate stats / invalid maxzoom
+    # fall back to the default) and only finite bounds.
+    data["maxzoom"] = meta.maxzoom
+    if meta.bounds is not None:
+        data["bounds"] = list(meta.bounds)
     else:
-        data = {"tilejson": "3.0.0", "name": "local terrain", "minzoom": 0, "maxzoom": 13, "encoding": "terrarium", "tileSize": 256}
+        data.pop("bounds", None)
     # Versioned URLs: the token changes with every build (and with the tile
     # algorithm revision), so browsers never reuse stale tiles - including
     # copies cached as `immutable` by earlier platform versions or saved
@@ -200,22 +263,30 @@ def imagery(z: int, x: int, y: int) -> Response:
     # outside the current bounds (or above maxzoom) are not served: they would
     # float over unrelated terrain. Empty coverage is a 256x256 transparent
     # PNG (a 1x1 image is not a usable web-mercator tile for CesiumJS).
+    if z < 0 or z > 24 or not (0 <= x < 2 ** z) or not (0 <= y < 2 ** z):
+        raise HTTPException(status_code=404, detail="imagery tile not found", headers=_NO_STORE)
     path = _tile_file(f"hillshade/{z}/{x}/{y}.png") if TERRAIN.tile_in_coverage(z, x, y) else None
+    payload = None
     if path:
-        response: Response = Response(content=TERRAIN.hillshade_png(path, z, x, y), media_type="image/png")
-    else:
-        response = Response(content=_transparent_tile(), media_type="image/png")
-    response.headers["Cache-Control"] = _REVALIDATE
+        try:
+            payload = TERRAIN.hillshade_png(path, z, x, y)
+        except (OSError, ValueError, SyntaxError):
+            payload = None  # tile being rewritten by a running build
+    response: Response = Response(content=payload or _transparent_tile(), media_type="image/png")
+    response.headers["Cache-Control"] = _TILE_CACHE if payload else "no-cache"
     return response
 
 
 @app.get("/arcgis/rest/services/{name}/ImageServer")
 def arcgis_metadata(name: str) -> JSONResponse:
-    import json
-    path = _tile_file(f"arcgis/rest/services/{name}/ImageServer.json")
+    service = _service_dir(name)
+    path = _tile_file(f"arcgis/rest/services/{service.name}/ImageServer.json")
     if not path:
-        raise HTTPException(status_code=404, detail="ImageServer not found")
-    data = json.loads(path.read_text(encoding="utf-8"))
+        raise HTTPException(status_code=404, detail="ImageServer not found", headers=_NO_STORE)
+    data = _read_json(path)
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=503, detail="metadata is being rewritten, retry",
+                            headers={"Retry-After": "2", "Cache-Control": "no-store"})
     # Real ImageServers expose `extent`; CesiumJS's
     # ArcGISTiledElevationTerrainProvider requires it (reads extent.xmax).
     if "extent" not in data and "fullExtent" in data:
@@ -230,29 +301,78 @@ def arcgis_tilemap(name: str, level: int, row: int, col: int, height: int, width
     # reject every terrain tile, leaving an empty globe.
     if not (0 <= level <= 24 and 0 < height <= 256 and 0 < width <= 256 and row >= 0 and col >= 0):
         raise HTTPException(status_code=400, detail="invalid tilemap request")
-    root = _tile_file(f"arcgis/rest/services/{name}/ImageServer.json")
+    service = _service_dir(name)
+    root = _tile_file(f"arcgis/rest/services/{service.name}/ImageServer.json")
     if not root:
-        raise HTTPException(status_code=404, detail="ImageServer not found")
-    level_dir = root.parent / "tile" / str(level)
-    present: set[tuple[int, int]] = set()
-    if level_dir.is_dir():
-        for row_dir in level_dir.iterdir():
-            if row_dir.is_dir() and row_dir.name.isdigit() and row <= int(row_dir.name) < row + height:
-                r = int(row_dir.name)
-                for tile in row_dir.iterdir():
-                    if tile.is_file() and tile.name.isdigit() and col <= int(tile.name) < col + width:
-                        present.add((r, int(tile.name)))
-    data = [1 if (r, c) in present else 0 for r in range(row, row + height) for c in range(col, col + width)]
+        raise HTTPException(status_code=404, detail="ImageServer not found", headers=_NO_STORE)
+    try:
+        stamp = root.stat().st_mtime_ns
+    except OSError:
+        stamp = 0
+    key = (service.name, stamp, level, row, col, height, width)
+    data = _tilemap_cache_get(key)
+    if data is None:
+        data = _scan_tilemap(root.parent / "tile" / str(level), row, col, height, width)
+        _tilemap_cache_put(key, data)
     return JSONResponse({"adjusted": False, "location": {"left": col, "top": row, "width": width, "height": height}, "data": data})
+
+
+# Tilemap answers keyed by ImageServer.json mtime (rewritten when a LERC
+# build completes), so repeated Cesium/ArcGIS requests don't re-scan disk.
+_TILEMAP_CACHE: "OrderedDict[tuple, list[int]]" = OrderedDict()
+_TILEMAP_LOCK = threading.Lock()
+_TILEMAP_MAX = 1024
+
+
+def _tilemap_cache_get(key: tuple) -> list[int] | None:
+    with _TILEMAP_LOCK:
+        data = _TILEMAP_CACHE.get(key)
+        if data is not None:
+            _TILEMAP_CACHE.move_to_end(key)
+        return data
+
+
+def _tilemap_cache_put(key: tuple, data: list[int]) -> None:
+    with _TILEMAP_LOCK:
+        _TILEMAP_CACHE[key] = data
+        while len(_TILEMAP_CACHE) > _TILEMAP_MAX:
+            _TILEMAP_CACHE.popitem(last=False)
+
+
+def _scan_tilemap(level_dir: Path, row: int, col: int, height: int, width: int) -> list[int]:
+    """Presence bitmap for rows [row, row+height) x cols [col, col+width).
+    Only the requested row directories are listed (never the whole level)."""
+    data = [0] * (height * width)
+    for i, r in enumerate(range(row, row + height)):
+        try:
+            entries = os.scandir(level_dir / str(r))
+        except OSError:
+            continue  # row absent (or not a directory)
+        with entries:
+            for entry in entries:
+                name = entry.name
+                if not name.isdigit():
+                    continue
+                c = int(name)
+                if col <= c < col + width:
+                    try:
+                        if entry.is_file():
+                            data[i * width + (c - col)] = 1
+                    except OSError:
+                        pass
+    return data
 
 
 @app.get("/arcgis/rest/services/{name}/ImageServer/tile/{z}/{row}/{col}")
 def arcgis_tile(name: str, z: int, row: int, col: int) -> FileResponse:
-    path = _tile_file(f"arcgis/rest/services/{name}/tile/{z}/{row}/{col}")
+    service = _service_dir(name)
+    if z < 0 or row < 0 or col < 0:
+        raise HTTPException(status_code=404, detail="ArcGIS tile not found", headers=_NO_STORE)
+    path = _tile_file(f"arcgis/rest/services/{service.name}/tile/{z}/{row}/{col}")
     if not path:
-        raise HTTPException(status_code=404, detail="ArcGIS tile not found")
+        raise HTTPException(status_code=404, detail="ArcGIS tile not found", headers=_NO_STORE)
     response = FileResponse(path, media_type="application/octet-stream")
-    response.headers["Cache-Control"] = _REVALIDATE
+    response.headers["Cache-Control"] = _ARCGIS_TILE_CACHE
     return response
 
 

@@ -18,10 +18,16 @@ import json
 import os
 import re
 import sys
+import shutil
 import time
-import urllib.request
+import uuid
 
 from remotezip import RemoteZip
+
+RETRIES = 4
+HTTP_TIMEOUT = (30, 180)       # (connect, read) seconds for the index page
+ZIP_TIMEOUT = (30, 600)        # (connect, read) seconds for range requests
+TIFF_MAGIC = (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+")
 
 DATASET_PAGE = "https://data.bris.ac.uk/data/dataset/s5hqmjcdj8yo2ibzi9b4ew3sn"
 BLOCK_RE = re.compile(
@@ -39,6 +45,45 @@ def tile_member(lat, lon):
     return f"{ns}{abs(lat):02d}{ew}{abs(lon):03d}_FABDEM_V1-2.tif"
 
 
+def _backoff(attempt: int) -> float:
+    return min(3.0 * (2 ** (attempt - 1)), 60.0)
+
+
+def is_cached(path: str) -> bool:
+    """A usable cached tile: non-empty and starts with a TIFF header."""
+    try:
+        if os.path.getsize(path) <= 0:
+            return False
+        with open(path, "rb") as f:
+            return f.read(4) in TIFF_MAGIC
+    except OSError:
+        return False
+
+
+def extract_member(z, member_name: str, dest: str) -> int:
+    """Stream one zip member to a unique .part file, verify its size against the
+    zip directory (and the TIFF magic), then atomically move it into place."""
+    expected = z.getinfo(member_name).file_size
+    tmp = f"{dest}.{os.getpid()}.{uuid.uuid4().hex[:8]}.part"
+    try:
+        with z.open(member_name) as src, open(tmp, "wb") as out:
+            shutil.copyfileobj(src, out, 1 << 20)
+        got = os.path.getsize(tmp)
+        if got != expected:
+            raise IOError(f"size mismatch for {member_name}: got {got}, expected {expected}")
+        with open(tmp, "rb") as f:
+            if f.read(4) not in TIFF_MAGIC:
+                raise IOError(f"{member_name} is not a TIFF")
+        os.replace(tmp, dest)
+        return got
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def discover_blocks(cache_path):
     """Scrape the dataset page for block name -> (bbox, direct URL)."""
     html = None
@@ -48,20 +93,23 @@ def discover_blocks(cache_path):
         print(f"fetching block index: {DATASET_PAGE}")
         import requests
         last = None
-        for attempt in range(1, 4):
+        for attempt in range(1, RETRIES + 1):
             try:
-                r = requests.get(DATASET_PAGE, timeout=(30, 180))
+                r = requests.get(DATASET_PAGE, timeout=HTTP_TIMEOUT)
                 r.raise_for_status()
                 html = r.text
                 break
             except Exception as exc:  # noqa: BLE001
                 last = exc
-                print(f"  retry {attempt}/3 for block index: {exc}", file=sys.stderr)
-                time.sleep(3 * attempt)
+                print(f"  retry {attempt}/{RETRIES} for block index: {exc}", file=sys.stderr)
+                if attempt < RETRIES:
+                    time.sleep(_backoff(attempt))
         if html is None:
             raise RuntimeError(f"could not fetch FABDEM block index: {last}")
-        with open(cache_path, "w", encoding="utf-8") as f:
+        tmp = f"{cache_path}.{os.getpid()}.part"
+        with open(tmp, "w", encoding="utf-8") as f:
             f.write(html)
+        os.replace(tmp, cache_path)
 
     blocks = {}
     for url in re.findall(r"https://data\.bris\.ac\.uk/datasets/[^\"' ]*FABDEM_V1-2\.zip", html):
@@ -96,7 +144,7 @@ def main() -> int:
         for lat, lon in tiles:
             member = tile_member(lat, lon)
             dest = os.path.join(args.out, member)
-            if os.path.exists(dest) and os.path.getsize(dest) > 0:
+            if is_cached(dest):
                 print(f"  cached  {member} ({os.path.getsize(dest) / 1e6:.1f} MB)")
                 cached += 1
             else:
@@ -116,7 +164,7 @@ def main() -> int:
     for lat, lon in tiles:
         member = tile_member(lat, lon)
         dest = os.path.join(args.out, member)
-        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        if is_cached(dest):
             print(f"  cached  {member}")
             files.append(dest)
             continue
@@ -135,27 +183,27 @@ def main() -> int:
         name, info = hit
         print(f"  {member} <- {name}")
         ok = False
-        for attempt in range(1, 4):
+        for attempt in range(1, RETRIES + 1):
             try:
                 # the blocks are 1-8 GB; we only range-read the index + this member
-                with RemoteZip(info["url"], timeout=(30, 600)) as z:
+                with RemoteZip(info["url"], timeout=ZIP_TIMEOUT) as z:
                     names = z.namelist()
                     match = [n for n in names if n.endswith(member)]
                     if not match:
                         print(f"  MISSING {member} not in {name} (ocean?)", file=sys.stderr)
                         ok = True  # nothing to download
                         break
-                    with z.open(match[0]) as src, open(dest, "wb") as out:
-                        out.write(src.read())
+                    extract_member(z, match[0], dest)
                 print(f"  saved   {dest} ({os.path.getsize(dest) / 1e6:.1f} MB)")
                 files.append(dest)
                 ok = True
                 break
             except Exception as exc:  # noqa: BLE001
-                print(f"  retry {attempt}/3 for {member}: {exc}", file=sys.stderr)
-                time.sleep(3 * attempt)
+                print(f"  retry {attempt}/{RETRIES} for {member}: {exc}", file=sys.stderr)
+                if attempt < RETRIES:
+                    time.sleep(_backoff(attempt))
         if not ok:
-            print(f"  FAILED  {member} after 3 attempts", file=sys.stderr)
+            print(f"  FAILED  {member} after {RETRIES} attempts", file=sys.stderr)
 
     if not files:
         print("No FABDEM tiles downloaded.", file=sys.stderr)
@@ -163,8 +211,11 @@ def main() -> int:
 
     manifest = {"provider": "fabdem", "res": 30,
                 "bbox": [minlon, minlat, maxlon, maxlat], "files": files}
-    with open(os.path.join(args.out, "manifest.json"), "w") as f:
+    manifest_path = os.path.join(args.out, "manifest.json")
+    tmp_manifest = f"{manifest_path}.{os.getpid()}.part"
+    with open(tmp_manifest, "w") as f:
         json.dump(manifest, f, indent=2)
+    os.replace(tmp_manifest, manifest_path)
     print(f"Done: {len(files)} tile(s) -> manifest {args.out}/manifest.json")
     return 0
 

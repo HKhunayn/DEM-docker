@@ -19,7 +19,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
-import fetch_dem, fetch_fabdem, build_tiles, build_lerc, verify_tiles, serve  # noqa: E402,F401
+import fetch_dem, fetch_fabdem, build_tiles, verify_tiles, serve  # noqa: E402
 
 # Single data root: gis-data-platform owns storage, this project is only the
 # build engine. Sources land in <root>/dem, pyramids in <root>/tiles.
@@ -61,6 +61,52 @@ def bbox_src_files(bbox, res=30, out="data"):
     return files
 
 
+def _name_cell(path):
+    """(lat0, lon0) of a 1-degree DEM tile from its Copernicus/FABDEM file
+    name (..._N24_00_E046_00_... or N24E046...), or None."""
+    import re
+    base = os.path.basename(path).upper()
+    m = re.search(r"([NS])(\d{2})(?:_00)?_?([EW])(\d{3})", base)
+    if not m:
+        return None
+    lat = int(m.group(2)) * (1 if m.group(1) == "N" else -1)
+    lon = int(m.group(4)) * (1 if m.group(3) == "E" else -1)
+    return lat, lon
+
+
+def build_cover(bbox, minzoom):
+    """lon/lat extent of the tiles a build touches: the tile range at the
+    coarsest zoom covers every finer zoom."""
+    x0, y0, x1, y1 = build_tiles.tile_range(bbox, max(0, minzoom))
+    lon0, _, _, lat1 = build_tiles.tile_lonlat_bounds(x0, y0, max(0, minzoom))
+    _, lat0, lon1, _ = build_tiles.tile_lonlat_bounds(x1, y1, max(0, minzoom))
+    return lon0, max(lat0, -90.0), lon1, min(lat1, 90.0)
+
+
+def files_in_bbox(files, bbox):
+    """Source files whose footprint intersects the bbox (plus a small margin
+    so tiles at the bbox edge still see their neighbours). Uses the file name
+    when it encodes the 1-degree cell, else the raster bounds."""
+    minlon, minlat, maxlon, maxlat = bbox
+    m = 0.05
+    out = []
+    for p in files:
+        cell = _name_cell(p)
+        if cell is not None:
+            b = (cell[1], cell[0], cell[1] + 1, cell[0] + 1)
+        else:
+            try:
+                import rasterio
+                with rasterio.open(p) as ds:
+                    b = tuple(ds.bounds)
+            except Exception:  # noqa: BLE001 - unreadable: let the build report it
+                out.append(p)
+                continue
+        if b[0] <= maxlon + m and b[2] >= minlon - m and b[1] <= maxlat + m and b[3] >= minlat - m:
+            out.append(p)
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -99,6 +145,11 @@ def main() -> int:
 
     args = ap.parse_args()
     bbox = getattr(args, "bbox", None)
+    if bbox is not None:
+        try:
+            bbox = list(build_tiles.validate_bbox(bbox))
+        except ValueError as e:
+            ap.error(str(e))
 
     if args.cmd == "serve":
         return run(serve.main, ["--root", args.root, "--tiles", args.tiles,
@@ -112,15 +163,30 @@ def main() -> int:
                                     "--out", args.data] + check)
 
     def dataset():
-        """Local source files + bbox + provider: data/manifest.json if present,
-        else the Copernicus naming convention for the requested bbox."""
+        """Local source files + bbox + provider. The tile range ALWAYS comes
+        from --bbox; data/manifest.json (if present) only supplies the file
+        list (filtered to files intersecting the bbox) and the provider.
+        Without a manifest the Copernicus naming convention is used."""
         mpath = os.path.join(args.data, "manifest.json")
         if os.path.exists(mpath):
-            with open(mpath) as f:
-                m = json.load(f)
+            try:
+                with open(mpath) as f:
+                    m = json.load(f)
+            except (OSError, ValueError) as e:
+                print(f"WARNING: unreadable {mpath} ({e}); using file naming "
+                      f"convention", file=sys.stderr)
+                m = {}
+            mb = m.get("bbox")
+            if mb and [round(float(v), 6) for v in mb] != [round(float(v), 6) for v in bbox]:
+                print(f"WARNING: --bbox {list(bbox)} differs from the manifest bbox "
+                      f"{mb}; building --bbox (manifest used for the file list only)")
             files = [p for p in m.get("files", []) if os.path.exists(p)]
+            # keep every file under the tiles being built: at low zooms a
+            # tile reaches far outside the bbox and must keep its neighbours'
+            # data (else a small-area rebuild would blank shared z0-z5 tiles)
+            files = files_in_bbox(files, build_cover(bbox, args.minzoom))
             if files:
-                return files, m.get("bbox", bbox), m.get("provider", args.provider)
+                return files, bbox, m.get("provider", args.provider)
         return bbox_src_files(bbox, args.res, args.data), bbox, args.provider
 
     def build():
@@ -131,12 +197,13 @@ def main() -> int:
         argv = ["--src", *srcs, "--bbox", *map(str, bb),
                 "--minzoom", str(args.minzoom), "--maxzoom", str(args.maxzoom)]
         force = ["--force"] if getattr(args, "force", False) else []
-        rc = run(build_tiles.main, argv + force + ["--out", f"{args.root}/terrarium",
-                                                   "--hillshade-out", f"{args.root}/hillshade"])
-        if rc:
-            return rc
-        return run(build_lerc.main, argv + force + ["--name", args.name, "--out", args.root,
-                                                    "--provider", provider])
+        # one pass: each tile is reprojected once for Terrarium, hillshade
+        # and LERC (ImageServer.json written at the end, as build_lerc does)
+        return run(build_tiles.main, argv + force + [
+            "--out", f"{args.root}/terrarium",
+            "--hillshade-out", f"{args.root}/hillshade",
+            "--lerc-out", args.root, "--lerc-name", args.name,
+            "--provider", provider])
 
     def verify():
         srcs, bb, _provider = dataset()

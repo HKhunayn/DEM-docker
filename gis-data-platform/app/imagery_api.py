@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from . import imagery, jobs
+from . import catalog, imagery, jobs
 
 router = APIRouter()
 
@@ -82,8 +82,8 @@ def start_imagery_job(body: ImageryJobInput) -> dict[str, Any]:
             name=body.name, bbox=list(body.bbox), provider=body.provider,
             minzoom=body.minzoom, maxzoom=body.maxzoom, save_area=body.saveArea,
         )
-    except jobs.JobRunningError:
-        raise HTTPException(status_code=409, detail="a fetch job is already running")
+    except (jobs.JobRunningError, catalog.NameConflictError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -96,7 +96,12 @@ def imagery_sets(request: Request) -> dict[str, Any]:
 
 @router.delete("/api/imagery/{name}")
 def delete_imagery_set(name: str) -> dict[str, Any]:
-    if not imagery.delete_set(name):
+    if jobs.imagery_set_busy(name):
+        raise HTTPException(status_code=409, detail=f"an imagery job is still writing '{name}'; "
+                                                    "cancel it or wait for it to finish")
+    removed = imagery.delete_set(name)
+    areas = catalog.delete_areas(name, kind="imagery")
+    if not removed and not areas:
         raise HTTPException(status_code=404, detail="imagery set not found")
     return {"deleted": True}
 

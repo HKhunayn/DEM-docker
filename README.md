@@ -30,7 +30,19 @@ Open:
 
 Useful commands are `./Run.sh down`, `./Run.sh logs`, and `./Run.sh build`
 (or the corresponding `Run.bat` command). Set `GIS_PLATFORM_PORT` and
-`GIS_VIEWER_PORT` in `.env` to change host ports.
+`GIS_VIEWER_PORT` in `.env` to change host ports; both launchers print the URLs
+for the ports in `.env`.
+
+`up`, `restart` and `down` recreate/stop the API container, which kills a
+running fetch/build job (job state is in memory). Both launchers check
+`/api/jobs/current` first and ask for confirmation when a job is running; pass
+`-y` (`./Run.sh -y up`, `Run.bat -y up`) to skip the prompt. `Run.bat` also
+finds Docker Desktop's `docker.exe` when it is not on `PATH`, and pauses with a
+hint on errors (e.g. Docker Desktop not running).
+
+Both containers use `restart: unless-stopped` and json-file log rotation
+(5 x 20 MB). The viewer's nginx resolves `data-platform` per request, so
+recreating the API container needs no viewer restart.
 
 The DEM engine is bundled in `gis-data-platform/engine/` (the `heightmap-30m`
 `terrainhub.py` + `scripts/`, including the Lerc1 encoder sources) and baked
@@ -43,7 +55,7 @@ hosted separately.
 
 | Image | Contents |
 | --- | --- |
-| `gis-data-platform` | Python API + `requirements.txt` (fastapi, uvicorn, numpy, Pillow, rasterio, requests, remotezip, httpx2/httpx, pytest), the `engine/` DEM build toolchain with `lerc1enc` compiled from source, Leaflet 1.9.4 vendor assets |
+| `gis-data-platform` | Python API + pinned runtime `requirements.txt` (fastapi, uvicorn, numpy, Pillow, rasterio, requests, remotezip; test tools are in `requirements-dev.txt`, not in the image), the `engine/` DEM build toolchain with `lerc1enc` compiled from source, Leaflet 1.9.4 vendor assets (SHA-256 verified) |
 | `gis-viewers` | Vite build of the MapLibre / ArcGIS / CesiumJS viewer, served by nginx with `/api`, `/tiles`, `/arcgis`, `/fetch`, `/vendor` proxied to the API |
 
 Runtime data (DEM tiles, pyramids, catalog) lives in the named `gis-data`

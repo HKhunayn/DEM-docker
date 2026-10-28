@@ -1,57 +1,83 @@
 """Verify the Terrarium tile pyramid against the source DEM.
 
 Checks (all scoped to the AOI being verified — nothing is hard-coded to a
-particular mountain):
-  1. PNG encode/decode round-trip is lossless within the quantization step.
-  2. The decoded height at a sample point inside the AOI (default: bbox center)
-     matches the source GeoTIFF at the same coordinate (nearest + bilinear).
+particular place):
+  1. PNG encode/decode round-trip is lossless within the quantization step,
+     and transparent (alpha = 0) pixels decode as no-data.
+  2. EVERY zoom of this build: a sample of tiles (random ones plus tiles on
+     the 1-degree source boundaries crossing the AOI, plus the tile at
+     --lon/--lat or the AOI centre) is decoded on a pixel grid and compared
+     with the source DEM:
+       * a transparent pixel where the source has data is a failure
+         (catches sources overwriting each other and misplaced reads);
+       * the median |tile - source| per zoom must stay within a tolerance
+         scaled by the zoom's pixel size (--tolerance at full resolution).
+         Fine zooms compare against the source sampled at the pixel centre
+         (nearest/bilinear); coarse zooms against the source averaged over
+         the pixel footprint.
   3. min/max elevation over the tiles OF THIS BUILD matches tilejson.json.
-     Tiles outside the AOI's tile ranges (left over from earlier builds of
-     other areas in the shared pyramid dir) are ignored and counted.
+     Up to --max-scan tiles are decoded (all of them for small builds, an
+     exact comparison); bigger pyramids are sampled and the sampled range
+     must lie inside the tilejson range. Tiles outside the AOI's tile ranges
+     (earlier builds of other areas in a shared pyramid dir) are ignored.
 
 Usage:
-  python verify_tiles.py --src data/*.tif --bbox 24.7 46.49 25.3 46.9 \\
-                         --tiles public/terrarium
+  python verify_tiles.py --src data/*.tif --bbox 46.49 24.7 46.9 25.3 \\
+                         --tiles public/terrarium [--minzoom 0 --maxzoom 13]
 """
 
 import argparse
+import io
 import json
 import math
 import os
+import random
 import sys
 
 import numpy as np
 import rasterio
+import rasterio.windows
 from PIL import Image
+from rasterio.enums import Resampling
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from build_tiles import NODATA, encode_terrarium  # noqa: E402
+from build_tiles import (  # noqa: E402
+    NODATA, TILE_PX, SourceIndex, encode_terrarium, lonlat_to_tile,
+    pixel_center_lonlat, tile_range, validate_bbox,
+)
 
+__all__ = ["lonlat_to_tile", "tile_range", "main"]
 
-def lonlat_to_tile(lon, lat, z):
-    n = 2**z
-    x = int((lon + 180.0) / 360.0 * n)
-    lat_r = math.radians(lat)
-    y = int((1.0 - math.log(math.tan(lat_r) + 1 / math.cos(lat_r)) / math.pi) / 2 * n)
-    return x, y
+EQUATOR_RES = 156543.03392800014  # m/px at z0
+SOURCE_RES_M = 30.0
+GRID = 8                          # sample pixels per tile edge
 
 
 def decode_png(path):
-    arr = np.asarray(Image.open(path).convert("RGBA")).astype(np.int64)
+    with Image.open(path) as im:
+        arr = np.asarray(im.convert("RGBA")).astype(np.int64)
     h, w, _ = arr.shape
     v = arr[..., 0] * 256 * 256 + arr[..., 1] * 256 + arr[..., 2]
     heights = v / 256.0 - 32768.0
-    heights[arr[..., 3] == 0] = -32768.0
+    heights[arr[..., 3] == 0] = NODATA
     return heights, (w, h)
 
 
+def _valid(v):
+    return v is not None and math.isfinite(v) and v > -1000.0
+
+
 def sample_source(ds, lon, lat):
-    """Return (nearest, bilinear) source heights at a coordinate."""
-    fx, fy = ~ds.transform * (lon, lat)
+    """Return (nearest, bilinear) source heights at a coordinate (NaN where
+    the source has no data)."""
+    inv = ~ds.transform
+    fx = inv.a * lon + inv.b * lat + inv.c
+    fy = inv.d * lon + inv.e * lat + inv.f
     col, row = int(math.floor(fx)), int(math.floor(fy))
     win = rasterio.windows.Window(col - 1, row - 1, 3, 3)
     nod = ds.nodata if ds.nodata is not None else NODATA
     arr = ds.read(1, window=win, boundless=True, fill_value=nod).astype(np.float64)
+    arr[(arr < -1000.0) | (arr == nod)] = np.nan
     nearest = float(arr[1, 1])
     # bilinear around the 4 pixel centers surrounding the coordinate
     cx, cy = fx - 0.5, fy - 0.5
@@ -64,159 +90,313 @@ def sample_source(ds, lon, lat):
     return nearest, float(bilinear)
 
 
-def main():
+def footprint_mean(ds, lon0, lat0, lon1, lat1):
+    """Mean source height over a lon/lat box (overview-aware decimated read)."""
+    win = rasterio.windows.from_bounds(lon0, lat0, lon1, lat1, transform=ds.transform)
+    try:
+        win = rasterio.windows.intersection(
+            win, rasterio.windows.Window(0, 0, ds.width, ds.height))
+    except Exception:  # noqa: BLE001 - disjoint
+        return math.nan
+    k = max(1, min(16, int(math.ceil(min(win.width, win.height)))))
+    arr = ds.read(1, window=win, out_shape=(k, k),
+                  resampling=Resampling.average).astype(np.float64)
+    v = arr[arr > -1000.0]
+    return float(v.mean()) if v.size else math.nan
+
+
+class Source:
+    """Point lookups against all sources."""
+
+    def __init__(self, paths):
+        self.idx = SourceIndex(paths)
+
+    def close(self):
+        self.idx.close()
+
+    def covering(self, lon, lat):
+        for ds in self.idx.sources_for(lon, lat, lon, lat):
+            b = ds.bounds
+            if b.left <= lon < b.right and b.bottom < lat <= b.top:
+                return ds
+        return None
+
+    def covered(self, lon, lat):
+        return self.covering(lon, lat) is not None
+
+
+def zoom_tolerance(base, z, lat):
+    """Allowed median |tile - source| at zoom z: base at (or finer than) the
+    30 m source resolution, growing with the pixel's ground size."""
+    pixel_m = EQUATOR_RES / 2**z * math.cos(math.radians(lat))
+    return base * max(1.0, pixel_m / SOURCE_RES_M) ** 0.5, pixel_m
+
+
+def pick_tiles(bbox, z, n, rng, extra_points):
+    """Sample of tiles of zoom z in the bbox: points on every 1-degree line
+    crossing the bbox, the extra points, then random tiles up to n."""
+    x0, y0, x1, y1 = tile_range(bbox, z)
+    minlon, minlat, maxlon, maxlat = bbox
+    chosen = []
+
+    def add(t):
+        if t not in chosen and x0 <= t[0] <= x1 and y0 <= t[1] <= y1:
+            chosen.append(t)
+
+    for lon, lat in extra_points:
+        add(lonlat_to_tile(lon, lat, z))
+    for L in range(math.ceil(minlon), math.floor(maxlon) + 1):
+        for lat in (minlat + (maxlat - minlat) * f for f in (0.25, 0.5, 0.75)):
+            add(lonlat_to_tile(L, lat, z))
+    for L in range(math.ceil(minlat), math.floor(maxlat) + 1):
+        for lon in (minlon + (maxlon - minlon) * f for f in (0.25, 0.5, 0.75)):
+            add(lonlat_to_tile(lon, L, z))
+    total = (x1 - x0 + 1) * (y1 - y0 + 1)
+    if total <= n:
+        for x in range(x0, x1 + 1):
+            for y in range(y0, y1 + 1):
+                add((x, y))
+    else:
+        tries = 0
+        while len(chosen) < n and tries < n * 20:
+            add((rng.randint(x0, x1), rng.randint(y0, y1)))
+            tries += 1
+    return chosen
+
+
+def check_zoom(src, tiles_dir, bbox, z, tiles, base_tol, rng):
+    """Returns dict with counts and error stats for one zoom."""
+    res = {"tiles": 0, "missing": 0, "points": 0, "nodata_where_src": 0,
+           "errors": [], "examples": []}
+    for x, y in tiles:
+        path = os.path.join(tiles_dir, str(z), str(x), f"{y}.png")
+        grid = [(c, r) for r in np.linspace(2, TILE_PX - 3, GRID).astype(int)
+                for c in np.linspace(2, TILE_PX - 3, GRID).astype(int)]
+        jitter = [(min(TILE_PX - 1, c + rng.randint(0, 3)),
+                   min(TILE_PX - 1, r + rng.randint(0, 3))) for c, r in grid]
+        heights = None
+        if os.path.exists(path):
+            heights, _ = decode_png(path)
+            res["tiles"] += 1
+        for col, row in jitter:
+            lon, lat = pixel_center_lonlat(x, y, z, col, row)
+            # pixel corners must be covered too: the coverage edge itself is
+            # legitimately fuzzy
+            hl, hr = pixel_center_lonlat(x, y, z, col - 0.5, row - 0.5), \
+                pixel_center_lonlat(x, y, z, col + 0.5, row + 0.5)
+            if not (src.covered(*hl) and src.covered(*hr)
+                    and src.covered(hl[0], hr[1]) and src.covered(hr[0], hl[1])):
+                continue
+            ds = src.covering(lon, lat)
+            nearest, bilin = sample_source(ds, lon, lat)
+            if not (_valid(nearest) and _valid(bilin)):
+                continue
+            res["points"] += 1
+            if heights is None:
+                res["missing"] += 1
+                if len(res["examples"]) < 5:
+                    res["examples"].append(f"missing tile {z}/{x}/{y}")
+                break
+            t = float(heights[row, col])
+            if t <= NODATA + 1.0:
+                res["nodata_where_src"] += 1
+                if len(res["examples"]) < 5:
+                    res["examples"].append(
+                        f"transparent pixel {z}/{x}/{y} px({col},{row}) at "
+                        f"({lat:.5f}, {lon:.5f}); source {nearest:.1f} m")
+                continue
+            tol, pixel_m = zoom_tolerance(base_tol, z, lat)
+            if pixel_m <= 2 * SOURCE_RES_M:
+                err = min(abs(t - nearest), abs(t - bilin))
+            else:
+                truth = footprint_mean(ds, hl[0], hr[1], hr[0], hl[1])
+                if not _valid(truth):
+                    continue
+                err = abs(t - truth)
+            res["errors"].append(err)
+    return res
+
+
+def roundtrip_check():
+    """Terrarium encoder round-trip (in memory)."""
+    rng = np.random.default_rng(42)
+    synthetic = rng.uniform(-400, 4800, (256, 256)).astype(np.float32)
+    synthetic[0, :5] = NODATA
+    buf = io.BytesIO()
+    encode_terrarium(synthetic).save(buf, format="PNG")
+    buf.seek(0)
+    with Image.open(buf) as im:
+        arr = np.asarray(im.convert("RGBA")).astype(np.int64)
+    v = arr[..., 0] * 65536 + arr[..., 1] * 256 + arr[..., 2]
+    rt = v / 256.0 - 32768.0
+    valid = synthetic > NODATA + 1.0
+    err = float(np.abs(rt[valid] - synthetic[valid]).max())
+    alpha_ok = bool((arr[..., 3][~valid] == 0).all() and (arr[..., 3][valid] == 255).all())
+    return err, alpha_ok
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", nargs="+", required=True)
     ap.add_argument("--tiles", default="public/terrarium")
     ap.add_argument("--bbox", nargs=4, type=float, default=None,
                     metavar=("MINLON", "MINLAT", "MAXLON", "MAXLAT"))
     ap.add_argument("--lon", type=float, default=None,
-                    help="sample point (default: AOI center)")
+                    help="extra sample point (default: AOI center)")
     ap.add_argument("--lat", type=float, default=None)
-    ap.add_argument("--tolerance", type=float, default=5.0)
+    ap.add_argument("--tolerance", type=float, default=5.0,
+                    help="median |tile - source| allowed at full resolution (m); "
+                         "scaled up with the pixel size at coarser zooms")
     ap.add_argument("--minzoom", type=int, default=None,
                     help="zooms of THIS build — scope checks to them")
     ap.add_argument("--maxzoom", type=int, default=None)
-    args = ap.parse_args()
+    ap.add_argument("--tiles-per-zoom", type=int, default=12,
+                    help="sampled tiles per zoom (1-degree boundary tiles are added)")
+    ap.add_argument("--max-scan", type=int, default=3000,
+                    help="tiles decoded for the min/max stats check (sampled above this)")
+    ap.add_argument("--seed", type=int, default=1)
+    args = ap.parse_args(argv)
 
     failures = 0
+    rng = random.Random(args.seed)
 
-    # 0) encoder round-trip: encode used by build_tiles must decode back within
-    #    the Terrarium quantization step (1/256 m)
-    rng = np.random.default_rng(42)
-    synthetic = rng.uniform(-400, 4800, (256, 256)).astype(np.float32)
-    synthetic[0, 0] = NODATA
-    tmp_png = os.path.join(args.tiles, "..", "_roundtrip.png")
-    os.makedirs(os.path.dirname(tmp_png), exist_ok=True)
-    encode_terrarium(synthetic).save(tmp_png)
-    rt, _ = decode_png(tmp_png)
-    valid = synthetic > NODATA + 1.0
-    err = float(np.abs(rt[valid] - synthetic[valid]).max())
-    os.remove(tmp_png)
-    ok = err <= 1 / 256 + 1e-6
-    print(f"encoder round-trip max error: {err:.6f} m "
-          f"({'PASS' if ok else 'FAIL'}, quantization step {1/256:.4f} m)")
+    # 0) encoder round-trip within the Terrarium quantization step (1/256 m)
+    err, alpha_ok = roundtrip_check()
+    ok = err <= 1 / 256 + 1e-6 and alpha_ok
+    print(f"encoder round-trip max error: {err:.6f} m, nodata->alpha 0: "
+          f"{'yes' if alpha_ok else 'NO'} ({'PASS' if ok else 'FAIL'}, "
+          f"quantization step {1/256:.4f} m)")
     failures += 0 if ok else 1
 
-    # sample point: explicit, else AOI center, else source bounds center
-    if args.lon is not None and args.lat is not None:
-        lon, lat = args.lon, args.lat
-    elif args.bbox:
-        lon = (args.bbox[0] + args.bbox[2]) / 2
-        lat = (args.bbox[1] + args.bbox[3]) / 2
-    else:
-        with rasterio.open(args.src[0]) as ds:
-            lon = (ds.bounds.left + ds.bounds.right) / 2
-            lat = (ds.bounds.bottom + ds.bounds.top) / 2
+    src = Source(args.src)
+    try:
+        if args.bbox:
+            bbox = list(validate_bbox(args.bbox))
+        else:
+            b = [ds.bounds for ds in src.idx.datasets]
+            bbox = [min(v.left for v in b), min(v.bottom for v in b),
+                    max(v.right for v in b), max(v.top for v in b)]
+        if args.lon is not None and args.lat is not None:
+            extra = [(args.lon, args.lat)]
+        else:
+            extra = [((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)]
 
-    # 1) deepest zoom OF THIS BUILD, tile at the sample point
-    zooms = [int(z) for z in os.listdir(args.tiles) if z.isdigit()]
-    if args.minzoom is not None:
-        zooms = [z for z in zooms if z >= args.minzoom]
-    if args.maxzoom is not None:
-        zooms = [z for z in zooms if z <= args.maxzoom]
-    if not zooms:
-        print(f"no zoom levels of this build under {args.tiles} "
-              f"(wanted {args.minzoom or 0}..{args.maxzoom or 'max'})")
-        return 1
-    zoom = max(zooms)
-    x, y = lonlat_to_tile(lon, lat, zoom)
-    tile_path = os.path.join(args.tiles, str(zoom), str(x), f"{y}.png")
-    if not os.path.exists(tile_path):
-        print(f"sample tile missing: {tile_path} (sample point outside the build?)")
-        failures += 1
-        tile_h = None
-    else:
-        heights, (w, h) = decode_png(tile_path)
-        n = 2**zoom
-        wx = (lon + 180.0) / 360.0 * n * w
-        lat_r = math.radians(lat)
-        wy = (1.0 - math.log(math.tan(lat_r) + 1 / math.cos(lat_r)) / math.pi) / 2 * n * h
-        px, py = int(wx - x * w), int(wy - y * h)
-        px, py = min(max(px, 0), w - 1), min(max(py, 0), h - 1)
-        tile_h = float(heights[py, px])
-        # the tile value describes the pixel CENTER — evaluate the source there
-        # too, so the comparison measures encoder error, not point-vs-center offset
-        gx, gy = x * w + px + 0.5, y * h + py + 0.5
-        lon = gx / (n * w) * 360.0 - 180.0
-        lat = math.degrees(2 * math.atan(math.exp(math.pi * (1 - 2 * gy / (n * h))))
-                           - math.pi / 2)
-        print(f"tile z{zoom} {tile_path}: {w}x{h}, decoded height at pixel "
-              f"center ({lat:.5f}, {lon:.5f}) = {tile_h:.2f} m")
+        zooms = sorted(int(z) for z in os.listdir(args.tiles) if z.isdigit()) \
+            if os.path.isdir(args.tiles) else []
+        if args.minzoom is not None:
+            zooms = [z for z in zooms if z >= args.minzoom]
+        if args.maxzoom is not None:
+            zooms = [z for z in zooms if z <= args.maxzoom]
+        if not zooms:
+            print(f"no zoom levels of this build under {args.tiles} "
+                  f"(wanted {args.minzoom or 0}..{args.maxzoom or 'max'})")
+            return 1
+        if args.minzoom is not None and args.maxzoom is not None:
+            absent = sorted(set(range(args.minzoom, args.maxzoom + 1)) - set(zooms))
+            if absent:
+                print(f"zoom levels missing from the pyramid: {absent} (FAIL)")
+                failures += 1
 
-    # 2) source value at the same point (nearest + bilinear; the pyramid is
-    #    built with bilinear resampling, so either may legitimately match)
-    src_h = src_b = None
-    for p in args.src:
-        with rasterio.open(p) as ds:
-            if (ds.bounds.left <= lon <= ds.bounds.right
-                    and ds.bounds.bottom <= lat <= ds.bounds.top):
-                src_h, src_b = sample_source(ds, lon, lat)
-                break
-    if src_h is None:
-        print(f"no source tile covers the sample point ({lat:.4f}, {lon:.4f})")
-        failures += 1
-    elif tile_h is not None:
-        print(f"source DEM height: nearest {src_h:.2f} m, bilinear {src_b:.2f} m")
-        diff = min(abs(tile_h - src_h), abs(tile_h - src_b))
-        ok = diff < args.tolerance
-        print(f"difference: {diff:.3f} m "
-              f"({'PASS' if ok else 'FAIL'} at {args.tolerance:g} m tolerance)")
-        failures += 0 if ok else 1
-
-    # 3) stats over THIS BUILD's tiles only (shared pyramid may hold tiles
-    #    from earlier builds of other areas)
-    ranges = {}
-    if args.bbox:
+        # 1) per-zoom accuracy + coverage
+        mid_lat = (bbox[1] + bbox[3]) / 2
         for z in zooms:
-            x0, y1 = lonlat_to_tile(args.bbox[0], args.bbox[1], z)
-            x1, y0 = lonlat_to_tile(args.bbox[2], args.bbox[3], z)
-            ranges[z] = (range(x0, x1 + 1), range(y0, y1 + 1))
+            tiles = pick_tiles(bbox, z, args.tiles_per_zoom, rng, extra)
+            r = check_zoom(src, args.tiles, bbox, z, tiles, args.tolerance, rng)
+            tol, pixel_m = zoom_tolerance(args.tolerance, z, mid_lat)
+            e = np.array(r["errors"]) if r["errors"] else np.array([np.nan])
+            med = float(np.median(e))
+            p95 = float(np.percentile(e, 95))
+            bad = []
+            if r["missing"]:
+                bad.append(f"{r['missing']} missing tile(s) where the source has data")
+            if r["nodata_where_src"]:
+                bad.append(f"{r['nodata_where_src']} transparent pixel(s) where the "
+                           f"source has data")
+            if r["errors"] and med > tol:
+                bad.append(f"median error {med:.2f} m > {tol:.2f} m")
+            if not r["errors"] and not r["missing"] and not r["nodata_where_src"]:
+                print(f"z{z}: no sample point with source data in {len(tiles)} tile(s) "
+                      f"— skipped")
+                continue
+            status = "FAIL" if bad else "PASS"
+            print(f"z{z}: {r['tiles']}/{len(tiles)} tiles, {r['points']} points, "
+                  f"pixel {pixel_m:.0f} m, median |tile-source| {med:.2f} m, "
+                  f"p95 {p95:.2f} m, tolerance {tol:.2f} m, transparent-with-data "
+                  f"{r['nodata_where_src']} ({status})")
+            for b in bad:
+                print(f"    {b}")
+            for ex in r["examples"]:
+                print(f"    e.g. {ex}")
+            failures += 1 if bad else 0
+    finally:
+        src.close()
 
-    gmin, gmax, count, stale = math.inf, -math.inf, 0, 0
+    # 2) stats over THIS BUILD's tiles only (a shared pyramid may hold tiles
+    #    from earlier builds of other areas)
+    files, stale = [], 0
     for z in zooms:
         zdir = os.path.join(args.tiles, str(z))
-        xr, yr = ranges.get(z, (None, None))
+        x0, y0, x1, y1 = tile_range(bbox, z)
         for xs in os.listdir(zdir):
             if not xs.isdigit():
                 continue
             xi = int(xs)
-            if xr is not None and xi not in xr:
-                stale += sum(1 for f in os.listdir(os.path.join(zdir, xs))
-                             if f.endswith(".png"))
+            names = [f for f in os.listdir(os.path.join(zdir, xs)) if f.endswith(".png")]
+            if not x0 <= xi <= x1:
+                stale += len(names)
                 continue
-            for f in os.listdir(os.path.join(zdir, xs)):
-                if not f.endswith(".png"):
-                    continue
-                yi = int(f[:-4])
-                if yr is not None and yi not in yr:
+            for f in names:
+                yi = int(f[:-4]) if f[:-4].isdigit() else -1
+                if y0 <= yi <= y1:
+                    files.append(os.path.join(zdir, xs, f))
+                else:
                     stale += 1
-                    continue
-                hh, _ = decode_png(os.path.join(zdir, xs, f))
-                v = hh[hh > -32767.0]
-                if v.size:
-                    gmin, gmax = min(gmin, float(v.min())), max(gmax, float(v.max()))
-                    count += 1
+    exact = len(files) <= args.max_scan
+    scan = files if exact else rng.sample(files, args.max_scan)
+    gmin, gmax, count = math.inf, -math.inf, 0
+    for p in scan:
+        hh, _ = decode_png(p)
+        v = hh[hh > NODATA + 1.0]
+        if v.size:
+            gmin, gmax = min(gmin, float(v.min())), max(gmax, float(v.max()))
+            count += 1
 
     meta_path = os.path.join(os.path.dirname(args.tiles.rstrip("/\\")), "tilejson.json")
-    meta = json.load(open(meta_path)) if os.path.exists(meta_path) else None
+    meta = None
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"tilejson.json unreadable: {e} (FAIL)")
+            failures += 1
+    scope = "all" if exact else f"a sample of {len(scan)} of {len(files)}"
+    stale_txt = f" (ignored {stale} stale tiles from earlier builds)" if stale else ""
     if count:
-        print(f"pyramid: {count} tiles in AOI, elevation {gmin:.1f}..{gmax:.1f} m"
-              + (f" (ignored {stale} stale tiles from earlier builds)" if stale else ""))
+        print(f"pyramid: decoded {scope} tiles in AOI, elevation {gmin:.1f}..{gmax:.1f} m"
+              + stale_txt)
     else:
-        print("pyramid: no tiles in AOI"
-              + (f" (ignored {stale} stale tiles from earlier builds)" if stale else ""))
-    if meta:
-        print(f"tilejson statistics: {meta['statistics']}")
-        ok = (count > 0
-              and abs(gmin - meta["statistics"]["min"]) < 0.5
-              and abs(gmax - meta["statistics"]["max"]) < 0.5)
+        print("pyramid: no tiles in AOI" + stale_txt)
+    if meta and isinstance(meta.get("statistics"), dict):
+        st = meta["statistics"]
+        print(f"tilejson statistics: {st}")
+        try:
+            if exact:
+                ok = (count > 0 and abs(gmin - st["min"]) < 0.5
+                      and abs(gmax - st["max"]) < 0.5)
+            else:
+                ok = count > 0 and gmin >= st["min"] - 0.5 and gmax <= st["max"] + 0.5
+        except (KeyError, TypeError):
+            ok = False
     else:
-        print("tilejson.json not found — skipping stats comparison")
+        if meta is None:
+            print("tilejson.json not found — skipping stats comparison")
         ok = count > 0
-    print(f"stats match: {'PASS' if ok else 'FAIL'}")
+    print(f"stats match{'' if exact else ' (sampled: range inside tilejson)'}: "
+          f"{'PASS' if ok else 'FAIL'}")
     failures += 0 if ok else 1
 
+    print(f"verify: {'FAIL' if failures else 'PASS'} ({failures} failed check(s))")
     return 1 if failures else 0
 
 

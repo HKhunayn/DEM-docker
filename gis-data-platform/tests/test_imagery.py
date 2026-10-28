@@ -33,7 +33,7 @@ def wait_done(client, job_id, timeout=20.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
         job = client.get(f"/api/jobs/{job_id}").json()
-        if job["state"] in ("done", "error"):
+        if job["state"] in ("done", "error", "cancelled", "interrupted"):
             return job
         time.sleep(0.05)
     raise AssertionError("imagery job did not finish")
@@ -101,3 +101,170 @@ def test_imagery_job_validation_and_failure(client, monkeypatch):
     assert client.post("/api/imagery/jobs", json={**WORLD, "maxzoom": 9}).status_code == 400  # > 50k tiles
     job = wait_done(client, client.post("/api/imagery/jobs", json=WORLD).json()["id"])
     assert job["state"] == "error" and "failed" in job["error"]
+
+
+def test_html_error_page_is_not_stored_as_tile(client, monkeypatch):
+    imagery = sys.modules["app.imagery"]
+    calls = []
+
+    def fake_get(url, timeout=30.0):
+        calls.append(url)
+        return b"<html>quota exceeded</html>"
+
+    monkeypatch.setattr(imagery, "http_get", fake_get)
+    monkeypatch.setattr(imagery.time, "sleep", lambda s: None)
+    job = wait_done(client, client.post("/api/imagery/jobs", json={**WORLD, "maxzoom": 0}).json()["id"])
+    assert job["state"] == "error"
+    assert any("not a JPEG/PNG" in line for line in job["log"])
+    assert len(calls) == 1  # a bad payload is not retried
+    assert not list(imagery.set_dir("world_test").rglob("*.jpg"))
+
+
+def test_png_payload_accepted_and_oversized_rejected():
+    imagery = sys.modules["app.imagery"]
+    buffer = io.BytesIO()
+    Image.new("RGB", (4, 4)).save(buffer, format="PNG")
+    imagery.check_tile_payload(buffer.getvalue())
+    imagery.check_tile_payload(_jpeg((1, 2, 3)))
+    import pytest
+    for bad in (b"", b"GIF89a....", b"\xff\xd8\xff" + b"0" * (imagery.MAX_TILE_BYTES + 1)):
+        with pytest.raises(imagery.BadTileError):
+            imagery.check_tile_payload(bad)
+
+
+def test_http_get_checks_content_type_and_size(monkeypatch):
+    import pytest
+    imagery = sys.modules["app.imagery"]
+
+    class FakeResponse:
+        def __init__(self, ctype, body, length=None):
+            self.headers = {"Content-Type": ctype}
+            if length is not None:
+                self.headers["Content-Length"] = str(length)
+            self._body = body
+
+        def read(self, n=-1):
+            return self._body if n < 0 else self._body[:n]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    responses = []
+    seen_timeouts = []
+
+    def fake_urlopen(request, timeout=None):
+        seen_timeouts.append(timeout)
+        return responses.pop(0)
+
+    monkeypatch.setattr(imagery.urllib.request, "urlopen", fake_urlopen)
+    responses.append(FakeResponse("image/jpeg", _jpeg((1, 1, 1))))
+    assert imagery.http_get("https://x/0/0/0.jpg")[:3] == b"\xff\xd8\xff"
+    assert seen_timeouts[0] and seen_timeouts[0] <= 60
+    responses.append(FakeResponse("text/html; charset=utf-8", b"<html>"))
+    with pytest.raises(imagery.BadTileError, match="Content-Type"):
+        imagery.http_get("https://x/0/0/0.jpg")
+    responses.append(FakeResponse("image/jpeg", b"x", length=imagery.MAX_TILE_BYTES + 1))
+    with pytest.raises(imagery.BadTileError, match="too large"):
+        imagery.http_get("https://x/0/0/0.jpg")
+    responses.append(FakeResponse("image/jpeg", b"x" * (imagery.MAX_TILE_BYTES + 10)))
+    with pytest.raises(imagery.BadTileError):
+        imagery.http_get("https://x/0/0/0.jpg")
+
+
+def test_corrupt_ancestor_tile_gives_transparent_png_not_500(client, monkeypatch):
+    _stub_http(monkeypatch)
+    job = wait_done(client, client.post("/api/imagery/jobs", json=WORLD).json()["id"])
+    assert job["state"] == "done"
+    imagery = sys.modules["app.imagery"]
+    (imagery.set_dir("world_test") / "1" / "1" / "0.jpg").write_bytes(b"\xff\xd8\xff truncated garbage")
+    deep = client.get("/tiles/imagery-sets/world_test/12/2048/1300")
+    assert deep.status_code == 200 and deep.headers["content-type"] == "image/png"
+
+
+def test_get_set_is_cached_by_mtime(client, monkeypatch):
+    import json
+    import os
+    _stub_http(monkeypatch)
+    wait_done(client, client.post("/api/imagery/jobs", json=WORLD).json()["id"])
+    imagery = sys.modules["app.imagery"]
+    meta_path = imagery.set_dir("world_test") / "imagery.json"
+    reads = []
+    original = type(meta_path).read_text
+
+    def counting_read(self, *args, **kwargs):
+        if self.name == "imagery.json":
+            reads.append(self)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(meta_path), "read_text", counting_read)
+    imagery._SET_CACHE.clear()
+    for _ in range(5):
+        assert imagery.get_set("world_test")["maxzoom"] == 1
+    assert len(reads) == 1
+    meta = json.loads(original(meta_path, encoding="utf-8"))
+    meta["maxzoom"] = 0
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    later = os.stat(meta_path).st_mtime + 5
+    os.utime(meta_path, (later, later))
+    assert imagery.get_set("world_test")["maxzoom"] == 0
+
+
+def test_imagery_set_provider_clash_and_delete(client, monkeypatch):
+    _stub_http(monkeypatch)
+    wait_done(client, client.post("/api/imagery/jobs", json={**WORLD, "maxzoom": 0}).json()["id"])
+    clash = client.post("/api/imagery/jobs", json={**WORLD, "maxzoom": 0, "provider": "bluemarble"})
+    assert clash.status_code == 409
+    assert "s2cloudless" in clash.json()["detail"] and "delete it first" in clash.json()["detail"]
+    imagery = sys.modules["app.imagery"]
+    assert imagery.get_set("world_test")["provider"] == "s2cloudless"
+
+    assert client.delete("/api/imagery/world_test").status_code == 200
+    assert not imagery.set_dir("world_test").exists()
+    assert [a for a in client.get("/api/areas").json()["areas"] if a["name"] == "world_test"] == []
+    assert client.delete("/api/imagery/world_test").status_code == 404
+
+    ok = client.post("/api/imagery/jobs", json={**WORLD, "maxzoom": 0, "provider": "bluemarble"})
+    assert ok.status_code == 202
+    assert wait_done(client, ok.json()["id"])["state"] == "done"
+
+
+def test_delete_imagery_set_while_job_writes_it_is_409(client, monkeypatch):
+    import threading
+    imagery = sys.modules["app.imagery"]
+    gate = threading.Event()
+
+    def slow_get(url, timeout=30.0):
+        gate.wait(10)
+        return _jpeg((5, 5, 5))
+
+    monkeypatch.setattr(imagery, "http_get", slow_get)
+    started = client.post("/api/imagery/jobs", json=WORLD).json()
+    try:
+        response = client.delete("/api/imagery/world_test")
+        assert response.status_code == 409
+        assert "still writing" in response.json()["detail"]
+    finally:
+        gate.set()
+    assert wait_done(client, started["id"])["state"] == "done"
+    assert client.delete("/api/imagery/world_test").status_code == 200
+
+
+def test_imagery_job_cancel(client, monkeypatch):
+    import threading
+    imagery = sys.modules["app.imagery"]
+    gate = threading.Event()
+
+    def slow_get(url, timeout=30.0):
+        gate.wait(10)
+        return _jpeg((5, 5, 5))
+
+    monkeypatch.setattr(imagery, "http_get", slow_get)
+    started = client.post("/api/imagery/jobs", json={**WORLD, "maxzoom": 3}).json()
+    threading.Timer(0.3, gate.set).start()
+    job = client.post(f"/api/jobs/{started['id']}/cancel").json()
+    assert job["state"] == "cancelled"
+    area = client.get(f"/api/areas/{started['areaId']}").json()
+    assert area["dataset"]["state"] == "cancelled"

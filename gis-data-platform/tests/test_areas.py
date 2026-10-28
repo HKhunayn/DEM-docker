@@ -89,3 +89,30 @@ def test_concurrent_catalog_writes_are_serialized(client):
     assert listed["count"] == 21
     final = catalog.find_area(area["id"])
     assert final["dataset"]["state"] == "done"
+
+
+def test_same_name_with_other_provider_is_rejected(client):
+    first = client.post("/api/areas", json=AREA)
+    assert first.status_code == 201
+    # same (name, provider) refreshes the record
+    again = client.post("/api/areas", json={**AREA, "bbox": [6.0, 45.0, 7.0, 46.0]})
+    assert again.status_code == 201 and again.json()["id"] == first.json()["id"]
+    # the ArcGIS service dir is keyed by name only: another provider would overwrite it
+    clash = client.post("/api/areas", json={**AREA, "provider": "fabdem"})
+    assert clash.status_code == 409
+    assert "copernicus" in clash.json()["detail"] and "demo-area" in clash.json()["detail"]
+    assert client.get("/api/areas").json()["count"] == 1
+
+
+def test_job_with_clashing_provider_is_rejected(client, monkeypatch):
+    monkeypatch.setattr("app.fetch_api.probe_providers",
+                        lambda: {"copernicus": (True, ""), "fabdem": (True, "")})
+    client.post("/api/areas", json=AREA)
+    response = client.post("/api/jobs", json={**AREA, "provider": "fabdem"})
+    assert response.status_code == 409
+    assert "already exists" in response.json()["detail"]
+    assert client.get("/api/jobs").json()["count"] == 0
+    # after deleting the area the name is free for the other provider
+    area_id = client.get("/api/areas").json()["areas"][0]["id"]
+    client.delete(f"/api/areas/{area_id}")
+    assert client.post("/api/areas", json={**AREA, "provider": "fabdem"}).status_code == 201

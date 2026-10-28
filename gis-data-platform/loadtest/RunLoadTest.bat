@@ -40,8 +40,11 @@ if not "%~7"=="" set "EXTRA_OPTIONS=%EXTRA_OPTIONS% %~7"
 if not "%~8"=="" set "EXTRA_OPTIONS=%EXTRA_OPTIONS% %~8"
 if not "%~9"=="" set "EXTRA_OPTIONS=%EXTRA_OPTIONS% %~9"
 
+rem Prefer gis-data-platform\.venv, then python on PATH, then the py launcher
+rem (on many machines only "py" resolves in cmd).
 set "PYTHON=%~dp0..\.venv\Scripts\python.exe"
 if not exist "%PYTHON%" set "PYTHON=python"
+if "%PYTHON%"=="python" python --version >nul 2>&1 || set "PYTHON=py"
 
 "%PYTHON%" --version >nul 2>&1
 if errorlevel 1 goto :no_python
@@ -94,6 +97,6 @@ exit /b 2
 
 :install_failed
 echo [ERROR] Could not install aiohttp.
-echo Try manually: python -m pip install -r "%~dp0requirements.txt"
+echo Try manually: "%PYTHON%" -m pip install -r "%~dp0requirements.txt"
 pause
 exit /b 2

@@ -39,3 +39,10 @@ button.quiet { padding: .25rem .55rem; }
 .imagery-heading { margin-top: 1.2rem; padding-top: .85rem; border-top: 1px solid #293954; }
 #imagery-select { width: 100%; margin-top: .6rem; padding: .4rem .5rem; color: #e8edf5; background: #17263d; border: 1px solid #385174; border-radius: .35rem; font: inherit; font-size: .8rem; }
 .imagery-info { margin-top: .5rem; font-size: .75rem; line-height: 1.4; color: #9bb1cc; }
+
+/* Partial-load warnings (optional platform parts that failed) */
+.warnings { font-size: .76rem; line-height: 1.4; margin: 0 0 .75rem; padding: .5rem .65rem; border-radius: .35rem; border: 1px solid #b98135; color: #ffe1ab; background: #2a2114; }
+.warnings ul { margin: .3rem 0 0; padding-left: 1.1rem; }
+.warnings button { margin-top: .45rem; }
+.notice.error button { margin-top: .6rem; }
+button:disabled, button:disabled:hover { opacity: .55; cursor: progress; background: #17263d; border-color: #385174; }

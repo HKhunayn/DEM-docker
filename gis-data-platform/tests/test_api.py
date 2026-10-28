@@ -160,9 +160,13 @@ def test_repeated_fetch_refreshes_area_instead_of_duplicating(tmp_path, monkeypa
     client = TestClient(app)
     payload = {"name": "same_name", "bbox": [1, 2, 3, 4], "provider": "copernicus",
                "minzoom": 0, "maxzoom": 13}
-    first = client.post("/api/areas", json=payload).json()
-    second = client.post("/api/jobs", json=payload)
-    # whether the area is created via the API or via a job, the name stays unique
-    client.post("/api/jobs", json={**payload, "bbox": [5, 6, 7, 8]})
+    created = client.post("/api/areas", json=payload)
+    assert created.status_code in (200, 201), created.text
+    started = client.post("/api/jobs", json=payload)
+    assert started.status_code in (200, 201, 202), started.text
+    # whether the area is created via the API or via a job, the name stays unique;
+    # the second job may be refused (409) while the first one still runs.
+    again = client.post("/api/jobs", json={**payload, "bbox": [5, 6, 7, 8]})
+    assert again.status_code in (200, 201, 202, 409), again.text
     names = [a["name"] for a in client.get("/api/areas").json()["areas"]]
     assert names.count("same_name") == 1, f"duplicate saved areas: {names}"

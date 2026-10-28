@@ -1,21 +1,37 @@
 import * as Cesium from "cesium";
+import {LruCache, decodeTerrarium} from "./terrarium.js";
+
+const TILE_TIMEOUT_MS = 20000;
+const CACHE_ENTRIES = 256;   // ~256 KB of Float32 per 256 px tile -> ~64 MB max
+
+function timeoutSignal(ms) {
+  return typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(ms) : undefined;
+}
 
 // Decode one Terrarium PNG into a Float32 height grid (row-major, north first).
-async function fetchTerrarium(url) {
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`Terrain tile failed (${response.status})`);
-  const bitmap = await createImageBitmap(await response.blob());
-  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-  const context = canvas.getContext("2d", {willReadFrequently: true});
-  context.drawImage(bitmap, 0, 0);
-  const rgba = context.getImageData(0, 0, bitmap.width, bitmap.height).data;
-  const size = bitmap.width;
-  const values = new Float32Array(size * size);
-  for (let i = 0; i < values.length; i += 1) {
-    const p = i * 4;
-    values[i] = rgba[p] * 256 + rgba[p + 1] + rgba[p + 2] / 256 - 32768;
+async function fetchTerrarium(url, noDataHeight) {
+  let response;
+  try {
+    response = await fetch(url, {signal: timeoutSignal(TILE_TIMEOUT_MS)});
+  } catch (error) {
+    if (error?.name === "TimeoutError") throw new Error(`Terrain tile timed out after ${TILE_TIMEOUT_MS / 1000} s`);
+    throw error;
   }
-  return {values, size};
+  if (!response.ok) throw new Error(`Terrain tile failed (${response.status})`);
+  // Raw bytes are data, not colour: no colour-space conversion and no alpha
+  // premultiplication (premultiplied RGB of a semi-transparent pixel decodes
+  // to the wrong height).
+  const bitmap = await createImageBitmap(await response.blob(), {colorSpaceConversion: "none", premultiplyAlpha: "none"});
+  try {
+    const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+    const context = canvas.getContext("2d", {willReadFrequently: true});
+    context.drawImage(bitmap, 0, 0);
+    const rgba = context.getImageData(0, 0, bitmap.width, bitmap.height).data;
+    const size = bitmap.width;
+    return {values: decodeTerrarium(rgba, size * size, noDataHeight), size};
+  } finally {
+    bitmap.close();
+  }
 }
 
 /**
@@ -45,25 +61,36 @@ export function resampleWindow(parent, size, edgeX, edgeY, span, n) {
  *
  * Levels above `maxzoom` are never requested (the server has no such tiles);
  * they are bilinearly over-zoomed from the maxzoom ancestor, as MapLibre does
- * for `raster-dem` maxzoom. Every tile is resampled to an edge-inclusive grid
- * so neighbouring Cesium tiles share border samples (no cracks at seams).
+ * for `raster-dem` maxzoom. Every tile is resampled to an edge-inclusive grid,
+ * so Cesium tiles cut from the SAME Terrarium tile share their border samples
+ * exactly. Across two different Terrarium tiles each side is clamped to its
+ * own outermost pixel centre (there is no neighbour apron), so border heights
+ * can differ by up to one source-pixel step; Cesium's tile skirts hide those
+ * hairline gaps -- the grids themselves do not match exactly at such seams.
+ *
+ * Options: maxzoom, size (grid, default 65), credit, noDataHeight (height for
+ * a tile that is entirely alpha=0, default 0), cacheEntries (default 256).
  */
 export function makePlatformTerrainProvider(tileTemplates, options = {}) {
   const templates = Array.isArray(tileTemplates) ? tileTemplates.filter(Boolean) : [];
   if (!templates.length) throw new Error("Platform returned no terrain tile URL");
   const maxzoom = Number.isFinite(options.maxzoom) ? options.maxzoom : 13;
   const grid = options.size || 65;
-  const cache = new Map();
+  const noDataHeight = Number.isFinite(options.noDataHeight) ? options.noDataHeight : 0;
+  const cache = new LruCache(options.cacheEntries || CACHE_ENTRIES);
 
   const tileUrl = (z, x, y) => templates[0].replace("{z}", z).replace("{x}", x).replace("{y}", y);
   const load = (z, x, y) => {
     const key = `${z}/${x}/${y}`;
-    if (!cache.has(key)) {
-      const promise = fetchTerrarium(tileUrl(z, x, y)).catch((error) => { cache.delete(key); throw error; });
-      cache.set(key, promise);
-      if (cache.size > 512) cache.delete(cache.keys().next().value);
-    }
-    return cache.get(key);
+    const cached = cache.get(key);   // an LRU hit refreshes recency
+    if (cached) return cached;
+    const promise = fetchTerrarium(tileUrl(z, x, y), noDataHeight).catch((error) => {
+      // Drop the failed load so the tile is retried, never a newer entry.
+      if (cache.map.get(key) === promise) cache.delete(key);
+      throw error;
+    });
+    cache.set(key, promise);
+    return promise;
   };
 
   return new Cesium.CustomHeightmapTerrainProvider({

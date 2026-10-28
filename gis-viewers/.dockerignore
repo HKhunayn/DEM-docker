@@ -1,6 +1,14 @@
+# Build context = gis-viewers/. node_modules is installed fresh by npm ci.
 Dockerfile
+.dockerignore
+.git
 node_modules
 dist
+.vite
+coverage
+*.log
+.env
 .env.local
 .env.*
 !.env.example
+Run.bat

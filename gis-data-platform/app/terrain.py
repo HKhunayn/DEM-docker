@@ -5,8 +5,8 @@ transparent (no-data) pixels at its edges. Rendered raw, a 3-D client shows
 that as cliffs: no-data decodes to -32768 m, a missing tile to 0 m, and a
 constant fill leaves a plateau with vertical walls at the coverage edge.
 
-This module serves every tile (z <= maxzoom) from a per-zoom mosaic of the
-current build's coverage:
+This module serves every tile (z <= maxzoom) from the current build's
+coverage rectangle:
 
 * inside the coverage rectangle: the original heights (interior holes filled
   from neighbours);
@@ -16,16 +16,27 @@ current build's coverage:
 
 Tiles from older builds outside the current bounds are ignored ("last build
 wins"), so stale slivers from earlier areas no longer appear.
+
+Memory is bounded per request: the height field is never mosaicked for the
+whole bbox (Saudi Arabia at z13 would be ~116 GB). Each request decodes only
+the coverage tile its pixels clamp to, plus a one-tile apron (3x3 tiles) for
+hole filling and the edge blur (radius <= 64 px < 256 px apron). Tiles
+outside coverage reuse the cached local field of the coverage tile they clamp
+to (an edge segment), and tiles beyond the fade distance are flat base without
+touching disk. Local fields and encoded tiles live in bounded LRU caches.
 """
 from __future__ import annotations
 
 import io
 import json
 import math
+import os
 import threading
+from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 import numpy as np
 from PIL import Image
@@ -37,7 +48,28 @@ BLEND_METERS = 600.0    # raw edge -> smoothed edge transition distance
 EARTH_CIRCUMFERENCE = 40075016.686
 # Bump when the served tile content changes for the same build (part of the
 # URL version token, so clients refetch).
-ALGORITHM_REVISION = 3
+ALGORITHM_REVISION = 4
+DEFAULT_MAXZOOM = 13
+MAX_LAT = 85.05112878
+# Hard cap on pixels allocated for one local field window (3x3 tiles is
+# 0.59 Mpx; this guards against any future change blowing up again).
+MAX_WINDOW_PX = 64 * 1024 * 1024
+MAX_BLUR_RADIUS = 64  # must stay below TILE so the 1-tile apron covers it
+# Holes are filled from data at most this far away (row, then column), so a
+# pixel's value depends only on data within the 1-tile apron (+ blur radius).
+# Larger holes fall back to the flat base.
+FILL_MAX_PX = TILE - MAX_BLUR_RADIUS
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
+TILE_CACHE_BYTES = _env_int("TERRAIN_TILE_CACHE_MB", 128) * 1024 * 1024
+FIELD_CACHE_ENTRIES = _env_int("TERRAIN_FIELD_CACHE_ENTRIES", 64)
 
 
 @dataclass
@@ -50,10 +82,127 @@ class _Meta:
 
 @dataclass
 class _Field:
+    """Local height field for (the coverage part of) one tile."""
     gx0: int
     gy0: int
-    heights: np.ndarray  # float32, filled, shape (h, w)
+    heights: np.ndarray  # float32, filled, shape (h, w) <= (TILE, TILE)
     smooth: np.ndarray   # box-blurred heights, used for the outside extension
+
+
+def _number(value: Any) -> float | None:
+    """Finite float or None (json.loads accepts Infinity/NaN; bools aren't numbers)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _parse_maxzoom(value: Any) -> int:
+    number = _number(value)
+    if number is None or number != int(number) or not 0 <= number <= 24:
+        return DEFAULT_MAXZOOM
+    return int(number)
+
+
+def _parse_bounds(value: Any) -> tuple[float, float, float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    numbers = [_number(v) for v in value]
+    if any(n is None for n in numbers):
+        return None
+    west, south, east, north = numbers  # type: ignore[misc]
+    west, east = (max(-180.0, min(180.0, v)) for v in (west, east))
+    south, north = (max(-MAX_LAT, min(MAX_LAT, v)) for v in (south, north))
+    if not (west < east and south < north):
+        return None
+    return (west, south, east, north)
+
+
+def parse_meta(data: Any, key: tuple = ("parsed",)) -> _Meta:
+    """Build metadata from a (possibly hostile/degenerate) tilejson dict."""
+    if not isinstance(data, dict):
+        data = {}
+    stats = data.get("statistics")
+    if not isinstance(stats, dict):
+        stats = {}
+    stat_min = _number(stats.get("min"))
+    # A failed or degenerate build writes null/inf statistics (json.loads
+    # turns Infinity into float inf). Don't trust its maxzoom: fall back to
+    # the default so terrain still serves from the previous good pyramid.
+    # A missing "max" alone is not degenerate (only "min" is used here).
+    degenerate = stat_min is None or ("max" in stats and _number(stats.get("max")) is None)
+    if not degenerate and _number(stats.get("max")) is not None and stat_min > _number(stats["max"]):  # type: ignore[operator]
+        degenerate = True
+    return _Meta(
+        key=key,
+        bounds=_parse_bounds(data.get("bounds")),
+        maxzoom=DEFAULT_MAXZOOM if degenerate else _parse_maxzoom(data.get("maxzoom", DEFAULT_MAXZOOM)),
+        base=stat_min if stat_min is not None else 0.0,
+    )
+
+
+class _ByteLRU:
+    """Thread-safe LRU of bytes payloads bounded by total size."""
+
+    def __init__(self, max_bytes: int) -> None:
+        self.max_bytes = max_bytes
+        self.bytes = 0
+        self._data: OrderedDict[tuple, bytes] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key: tuple) -> bytes | None:
+        with self._lock:
+            value = self._data.get(key)
+            if value is not None:
+                self._data.move_to_end(key)
+            return value
+
+    def put(self, key: tuple, value: bytes) -> None:
+        if len(value) > self.max_bytes:
+            return
+        with self._lock:
+            old = self._data.pop(key, None)
+            if old is not None:
+                self.bytes -= len(old)
+            self._data[key] = value
+            self.bytes += len(value)
+            while self.bytes > self.max_bytes and self._data:
+                _, evicted = self._data.popitem(last=False)
+                self.bytes -= len(evicted)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+            self.bytes = 0
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+
+class _KeyLocks:
+    """Per-key locks (refcounted, so the dict doesn't grow without bound).
+    Lets concurrent requests for the same tile compute it once."""
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._locks: dict[tuple, list] = {}
+
+    @contextmanager
+    def hold(self, key: tuple) -> Iterator[None]:
+        with self._guard:
+            entry = self._locks.setdefault(key, [threading.Lock(), 0])
+            entry[1] += 1
+        try:
+            with entry[0]:
+                yield
+        finally:
+            with self._guard:
+                entry[1] -= 1
+                if entry[1] == 0:
+                    self._locks.pop(key, None)
 
 
 def _box_blur(a: np.ndarray, radius: int) -> np.ndarray:
@@ -102,17 +251,28 @@ def encode_terrarium(heights: np.ndarray) -> bytes:
     return buffer.getvalue()
 
 
-def _fill_holes(a: np.ndarray) -> np.ndarray:
-    """Fill NaNs from the nearest valid value along rows, then columns."""
+def _fill_holes(a: np.ndarray, max_dist: int | None = None) -> np.ndarray:
+    """Fill NaNs from the nearest valid value along rows, then columns.
+
+    With `max_dist`, only valid pixels at most that far away (in the row,
+    then in the column) are used and farther holes stay NaN. That makes the
+    result for a pixel depend only on its +-2*max_dist neighbourhood, never on
+    where the processing window happens to end - so per-tile windows give
+    the same values on both sides of a tile edge (no seams).
+    """
     if not np.isnan(a).any():
         return a
 
     def ffill(x: np.ndarray) -> np.ndarray:
         mask = np.isnan(x)
-        idx = np.where(~mask, np.arange(x.shape[1])[None, :], 0)
+        cols = np.arange(x.shape[1])[None, :]
+        idx = np.where(~mask, cols, -1)
         np.maximum.accumulate(idx, axis=1, out=idx)
-        out = x[np.arange(x.shape[0])[:, None], idx]
-        return out
+        out = x[np.arange(x.shape[0])[:, None], np.maximum(idx, 0)]
+        too_far = idx < 0
+        if max_dist is not None:
+            too_far |= (cols - idx) > max_dist
+        return np.where(too_far, np.nan, out)
 
     def fill_rows(x: np.ndarray) -> np.ndarray:
         fwd = ffill(x)
@@ -128,10 +288,12 @@ def _fill_holes(a: np.ndarray) -> np.ndarray:
 class TerrainSource:
     def __init__(self, public_root: Path) -> None:
         self.public = public_root
-        self._lock = threading.Lock()
+        self._meta_lock = threading.Lock()
         self._meta: _Meta | None = None
-        self._fields: dict[int, _Field | None] = {}
-        self._tiles: dict[tuple, bytes] = {}
+        self._tiles = _ByteLRU(TILE_CACHE_BYTES)
+        self._fields: OrderedDict[tuple, _Field | None] = OrderedDict()
+        self._fields_lock = threading.Lock()
+        self._keylocks = _KeyLocks()
 
     # -- metadata -----------------------------------------------------------
     def version(self) -> str:
@@ -144,90 +306,155 @@ class TerrainSource:
         path = self.public / "tilejson.json"
         try:
             stat = path.stat()
-            key = (stat.st_mtime_ns, stat.st_size)
+            key: tuple = (stat.st_mtime_ns, stat.st_size)
         except OSError:
             key = ("missing",)
-        with self._lock:
+        current = self._meta
+        if current is not None and current.key == key:
+            return current
+        with self._meta_lock:
             if self._meta is not None and self._meta.key == key:
                 return self._meta
-            data: dict[str, Any] = {}
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                pass
-            bounds = data.get("bounds")
-            stats = data.get("statistics") or {}
-            # A failed or degenerate build writes null/inf statistics. Don't
-            # trust its maxzoom — fall back to the default so terrain tiles
-            # still serve from the previous good build's pyramid.
-            stat_min = stats.get("min")
-            stat_max = stats.get("max")
-            degenerate = stat_min is None or stat_max is None
-            file_maxzoom = int(data.get("maxzoom", 13))
-            meta = _Meta(
-                key=key,
-                bounds=tuple(float(v) for v in bounds) if isinstance(bounds, list) and len(bounds) == 4 else None,
-                maxzoom=13 if degenerate else file_maxzoom,
-                base=float(stat_min or 0.0),
-            )
-            self._meta, self._fields, self._tiles = meta, {}, {}
+            data: Any = {}
+            if key != ("missing",):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    if not isinstance(data, dict):
+                        raise ValueError("tilejson is not an object")
+                except (OSError, ValueError):
+                    # Partially written (the engine rewrites it in place) or
+                    # unreadable: keep serving the last good metadata and do
+                    # NOT cache this state under the new mtime key, so the
+                    # next request re-reads the finished file.
+                    if self._meta is not None:
+                        return self._meta
+                    return parse_meta({}, key=("unreadable",))
+            meta = parse_meta(data, key=key)
+            self._meta = meta
+            self._tiles.clear()
+            with self._fields_lock:
+                self._fields.clear()
             return meta
 
-    # -- per-zoom height field ----------------------------------------------
-    def _field(self, z: int, meta: _Meta) -> _Field | None:
-        if z in self._fields:
-            return self._fields[z]
-        field = None
-        if meta.bounds:
-            west, south, east, north = meta.bounds
-            fx0, fy0 = _global_px(west, north, z)
-            fx1, fy1 = _global_px(east, south, z)
-            # Coverage rectangle in global pixels, shrunk half a pixel so
-            # resampled edge pixels (often no-data) are excluded.
-            gx0, gy0 = int(math.floor(fx0 + 0.5)), int(math.floor(fy0 + 0.5))
-            gx1, gy1 = max(gx0 + 1, int(math.ceil(fx1 - 0.5))), max(gy0 + 1, int(math.ceil(fy1 - 0.5)))
-            heights = np.full((gy1 - gy0, gx1 - gx0), np.nan, dtype=np.float32)
-            for ty in range(gy0 // TILE, (gy1 - 1) // TILE + 1):
-                for tx in range(gx0 // TILE, (gx1 - 1) // TILE + 1):
-                    path = self.public / "terrarium" / str(z) / str(tx) / f"{ty}.png"
-                    if not path.is_file():
-                        continue
-                    tile = decode_terrarium(np.asarray(Image.open(path).convert("RGBA")))
-                    # Intersection of this tile with the rectangle.
-                    ax0, ay0 = max(gx0, tx * TILE), max(gy0, ty * TILE)
-                    ax1, ay1 = min(gx1, (tx + 1) * TILE), min(gy1, (ty + 1) * TILE)
-                    heights[ay0 - gy0:ay1 - gy0, ax0 - gx0:ax1 - gx0] = tile[ay0 - ty * TILE:ay1 - ty * TILE, ax0 - tx * TILE:ax1 - tx * TILE]
-            if not np.isnan(heights).all():
-                filled = _fill_holes(heights)
-                lat = (south + north) / 2.0
-                meters_per_px = EARTH_CIRCUMFERENCE * math.cos(math.radians(lat)) / (TILE * 2 ** z)
-                radius = int(min(64, max(0, round(SMOOTH_METERS / meters_per_px))))
-                field = _Field(gx0, gy0, filled, _box_blur(filled, radius))
-        self._fields[z] = field
-        return field
+    # -- geometry -----------------------------------------------------------
+    @staticmethod
+    def _rect(meta: _Meta, z: int) -> tuple[int, int, int, int] | None:
+        """Coverage rectangle [gx0, gx1) x [gy0, gy1) in global pixels at z,
+        shrunk half a pixel so resampled edge pixels (often no-data) are
+        excluded."""
+        if not meta.bounds:
+            return None
+        west, south, east, north = meta.bounds
+        fx0, fy0 = _global_px(west, north, z)
+        fx1, fy1 = _global_px(east, south, z)
+        gx0, gy0 = int(math.floor(fx0 + 0.5)), int(math.floor(fy0 + 0.5))
+        gx1, gy1 = max(gx0 + 1, int(math.ceil(fx1 - 0.5))), max(gy0 + 1, int(math.ceil(fy1 - 0.5)))
+        return gx0, gy0, gx1, gy1
+
+    @staticmethod
+    def _meters_per_px(meta: _Meta, z: int) -> float:
+        lat = (meta.bounds[1] + meta.bounds[3]) / 2.0 if meta.bounds else 0.0
+        return EARTH_CIRCUMFERENCE * math.cos(math.radians(lat)) / (TILE * 2 ** z)
+
+    def _load_tile(self, z: int, tx: int, ty: int) -> np.ndarray | None:
+        path = self.public / "terrarium" / str(z) / str(tx) / f"{ty}.png"
+        try:
+            with Image.open(path) as image:
+                rgba = np.asarray(image.convert("RGBA"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, SyntaxError):
+            return None  # truncated / being rewritten by a running build
+        if rgba.shape[:2] != (TILE, TILE):
+            return None
+        return decode_terrarium(rgba)
+
+    # -- local height field (one tile + 1-tile apron) ------------------------
+    def _local_field(self, meta: _Meta, z: int, tx: int, ty: int,
+                     rect: tuple[int, int, int, int]) -> _Field | None:
+        """Filled + blurred heights for the coverage part of tile (tx, ty).
+        Bounded memory: decodes at most the 3x3 tiles around it."""
+        key = (meta.key, z, tx, ty)
+        with self._fields_lock:
+            if key in self._fields:
+                self._fields.move_to_end(key)
+                return self._fields[key]
+        with self._keylocks.hold(("field",) + key):
+            with self._fields_lock:
+                if key in self._fields:
+                    return self._fields[key]
+            field = self._compute_field(meta, z, tx, ty, rect)
+            with self._fields_lock:
+                self._fields[key] = field
+                while len(self._fields) > FIELD_CACHE_ENTRIES:
+                    self._fields.popitem(last=False)
+            return field
+
+    def _compute_field(self, meta: _Meta, z: int, tx: int, ty: int,
+                       rect: tuple[int, int, int, int]) -> _Field | None:
+        gx0, gy0, gx1, gy1 = rect
+        # Window: coverage ∩ 3x3 tiles around (tx, ty).
+        wx0, wx1 = max(gx0, (tx - 1) * TILE), min(gx1, (tx + 2) * TILE)
+        wy0, wy1 = max(gy0, (ty - 1) * TILE), min(gy1, (ty + 2) * TILE)
+        if wx1 <= wx0 or wy1 <= wy0:
+            return None
+        if (wx1 - wx0) * (wy1 - wy0) > MAX_WINDOW_PX:
+            raise MemoryError("terrain window exceeds MAX_WINDOW_PX")
+        window = np.full((wy1 - wy0, wx1 - wx0), np.nan, dtype=np.float32)
+        for sty in range(wy0 // TILE, (wy1 - 1) // TILE + 1):
+            for stx in range(wx0 // TILE, (wx1 - 1) // TILE + 1):
+                tile = self._load_tile(z, stx, sty)
+                if tile is None:
+                    continue
+                ax0, ay0 = max(wx0, stx * TILE), max(wy0, sty * TILE)
+                ax1, ay1 = min(wx1, (stx + 1) * TILE), min(wy1, (sty + 1) * TILE)
+                window[ay0 - wy0:ay1 - wy0, ax0 - wx0:ax1 - wx0] = \
+                    tile[ay0 - sty * TILE:ay1 - sty * TILE, ax0 - stx * TILE:ax1 - stx * TILE]
+        if np.isnan(window).all():
+            return None  # no data near here: callers use the flat base
+        filled = _fill_holes(window, FILL_MAX_PX)
+        filled = np.where(np.isnan(filled), np.float32(meta.base), filled).astype(np.float32)
+        radius = int(min(MAX_BLUR_RADIUS, max(0, round(SMOOTH_METERS / self._meters_per_px(meta, z)))))
+        smooth = _box_blur(filled, radius)
+        # Keep only the coverage part of the centre tile.
+        ox0, ox1 = max(gx0, tx * TILE), min(gx1, (tx + 1) * TILE)
+        oy0, oy1 = max(gy0, ty * TILE), min(gy1, (ty + 1) * TILE)
+        sl = (slice(oy0 - wy0, oy1 - wy0), slice(ox0 - wx0, ox1 - wx0))
+        return _Field(ox0, oy0, np.ascontiguousarray(filled[sl], dtype=np.float32),
+                      np.ascontiguousarray(smooth[sl], dtype=np.float32))
 
     # -- tiles --------------------------------------------------------------
     def heights(self, z: int, x: int, y: int) -> np.ndarray:
         meta = self.meta()
-        with self._lock:
-            field = self._field(z, meta)
+        flat = np.full((TILE, TILE), meta.base, dtype=np.float32)
+        rect = self._rect(meta, z)
+        if rect is None:
+            return flat
+        gx0, gy0, gx1, gy1 = rect
+        meters_per_px = self._meters_per_px(meta, z)
+        # Distance (px) from this tile to the coverage rectangle: beyond the
+        # fade every pixel is exactly the base - no need to touch any data.
+        dx = max(0, gx0 - (x * TILE + TILE - 1), x * TILE - (gx1 - 1))
+        dy = max(0, gy0 - (y * TILE + TILE - 1), y * TILE - (gy1 - 1))
+        if math.hypot(dx, dy) * meters_per_px >= FADE_METERS:
+            return flat
+        # Every pixel clamps into the coverage part of one tile (an edge
+        # segment for tiles outside coverage, the tile itself inside).
+        ctx = min(max(x, gx0 // TILE), (gx1 - 1) // TILE)
+        cty = min(max(y, gy0 // TILE), (gy1 - 1) // TILE)
+        field = self._local_field(meta, z, ctx, cty, rect)
         if field is None:
-            return np.full((TILE, TILE), meta.base, dtype=np.float32)
-        h, w = field.heights.shape
+            return flat
         gx = x * TILE + np.arange(TILE)
         gy = y * TILE + np.arange(TILE)
-        cx = np.clip(gx, field.gx0, field.gx0 + w - 1)
-        cy = np.clip(gy, field.gy0, field.gy0 + h - 1)
+        cx = np.clip(gx, gx0, gx1 - 1)
+        cy = np.clip(gy, gy0, gy1 - 1)
         iy = (cy - field.gy0)[:, None]
         ix = (cx - field.gx0)[None, :]
         values = field.heights[iy, ix].astype(np.float64)
         dist_px = np.hypot((gx - cx)[None, :], (gy - cy)[:, None])
         if not dist_px.any():
             return values.astype(np.float32)
-        lat = 0.0
-        if meta.bounds:
-            lat = (meta.bounds[1] + meta.bounds[3]) / 2.0
-        meters_per_px = EARTH_CIRCUMFERENCE * math.cos(math.radians(lat)) / (TILE * 2 ** z)
         dist_m = dist_px * meters_per_px
         # Clamp-to-edge copies edge pixels outward as streaks; blend from the
         # raw edge to a smoothed edge profile within BLEND_METERS, then ease
@@ -239,22 +466,25 @@ class TerrainSource:
         ease = t * t * (3.0 - 2.0 * t)
         return (edge + (meta.base - edge) * ease).astype(np.float32)
 
-    def tile_png(self, z: int, x: int, y: int) -> bytes | None:
-        """Encoded Terrarium tile, or None above the pyramid's maxzoom
-        (clients then over-zoom their parent tile, which is correct)."""
-        meta = self.meta()
-        if z > meta.maxzoom:
-            return None
-        key = (meta.key, z, x, y)
+    def _cached(self, key: tuple, compute: Callable[[], bytes]) -> bytes:
         cached = self._tiles.get(key)
         if cached is not None:
             return cached
-        payload = encode_terrarium(self.heights(z, x, y))
-        with self._lock:
-            if len(self._tiles) > 4096:
-                self._tiles.clear()
-            self._tiles[key] = payload
-        return payload
+        with self._keylocks.hold(("tile",) + key):
+            cached = self._tiles.get(key)
+            if cached is not None:
+                return cached
+            payload = compute()
+            self._tiles.put(key, payload)
+            return payload
+
+    def tile_png(self, z: int, x: int, y: int) -> bytes | None:
+        """Encoded Terrarium tile, or None above the pyramid's maxzoom or
+        outside the world (clients then over-zoom their parent tile)."""
+        meta = self.meta()
+        if z < 0 or z > meta.maxzoom or not (0 <= x < 2 ** z and 0 <= y < 2 ** z):
+            return None
+        return self._cached((meta.key, z, x, y), lambda: encode_terrarium(self.heights(z, x, y)))
 
     def coverage_mask(self, z: int, x: int, y: int, inset_px: float = 3.0) -> np.ndarray:
         """Boolean 256x256 mask of pixels inside the current coverage, inset
@@ -276,20 +506,17 @@ class TerrainSource:
         legacy tiles are opaque greyscale: no-data is painted grey/black)."""
         stat = path.stat()
         key = ("hs", self.meta().key, z, x, y, stat.st_mtime_ns)
-        cached = self._tiles.get(key)
-        if cached is not None:
-            return cached
-        grey = np.asarray(Image.open(path).convert("L"))
-        alpha = np.where(self.coverage_mask(z, x, y), 255, 0).astype(np.uint8)
-        rgba = np.dstack([grey, grey, grey, alpha])
-        buffer = io.BytesIO()
-        Image.fromarray(rgba, "RGBA").save(buffer, format="PNG")
-        payload = buffer.getvalue()
-        with self._lock:
-            if len(self._tiles) > 4096:
-                self._tiles.clear()
-            self._tiles[key] = payload
-        return payload
+
+        def compute() -> bytes:
+            with Image.open(path) as image:
+                grey = np.asarray(image.convert("L"))
+            alpha = np.where(self.coverage_mask(z, x, y), 255, 0).astype(np.uint8)
+            rgba = np.dstack([grey, grey, grey, alpha])
+            buffer = io.BytesIO()
+            Image.fromarray(rgba, "RGBA").save(buffer, format="PNG")
+            return buffer.getvalue()
+
+        return self._cached(key, compute)
 
     def tile_in_coverage(self, z: int, x: int, y: int) -> bool:
         meta = self.meta()

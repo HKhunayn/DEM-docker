@@ -12,6 +12,7 @@ import WebTileLayer from "@arcgis/core/layers/WebTileLayer.js";
 import * as Cesium from "cesium";
 import {PlatformApi, formatError, imageryTemplate, itemBounds, mergeItems, resolveApiUrl, tileUrls} from "./platformApi.js";
 import {makePlatformTerrainProvider} from "./cesiumTerrain.js";
+import {formatElapsed, isAbortError, templatesKey, withTimeout} from "./uiHelpers.js";
 
 // A production container serves the viewer and reverse-proxies the platform
 // under the same origin. VITE_PLATFORM_URL remains available for local dev or
@@ -20,6 +21,8 @@ const platform = (import.meta.env.VITE_PLATFORM_URL || window.location.origin ||
 const api = new PlatformApi(platform);
 const app = document.querySelector("#app");
 
+// Static shell only: no server data is ever interpolated into HTML. All
+// catalog/area/imagery strings are inserted with textContent via el().
 app.innerHTML = `
   <header>
     <div class="brand"><h1>Open GIS Viewers</h1><p>Platform-backed saved areas</p></div>
@@ -33,6 +36,7 @@ app.innerHTML = `
     <aside aria-label="Platform catalog">
       <div class="panel-heading"><h2>Saved areas</h2><button id="reload" class="quiet" title="Reload platform state">↻</button></div>
       <div id="status" class="status" role="status" aria-live="polite">Loading platform state…</div>
+      <div id="warnings" class="warnings hidden" role="alert"></div>
       <div id="items" aria-live="polite"></div>
       <div id="details" class="details hidden"></div>
       <div class="panel-heading imagery-heading"><h2>Imagery</h2></div>
@@ -48,37 +52,96 @@ app.innerHTML = `
   </main>`;
 
 const status = document.querySelector("#status");
+const warningsEl = document.querySelector("#warnings");
 const itemsEl = document.querySelector("#items");
 const detailsEl = document.querySelector("#details");
 const mapMessage = document.querySelector("#map-message");
+const reloadButton = document.querySelector("#reload");
+const imageryInfo = document.querySelector("#imagery-info");
+const imagerySelect = document.querySelector("#imagery-select");
 let state = null;
 let selectedItem = null;
-let maplibre;
-let arcgisView;
-let arcgisMap;
-let cesiumViewer;
+let maplibre = null;
+let arcgisView = null;
+let arcgisMap = null;
+let cesiumViewer = null;
 let selectedImagery = null;
 let arcgisPendingGoTo = false;
 let mapLibreReady = false;
 let arcgisImageryLayer = null;
+let arcgisElevationLayer = null;
+let arcgisElevationUrl = null;
 let cesiumImageryLayer = null;
-const imageryInfo = document.querySelector("#imagery-info");
-const imagerySelect = document.querySelector("#imagery-select");
+let cesiumHillshadeLayer = null;
+let appliedTerrainKey = null;
+let appliedImageryKey = null;
+let loading = false;
+let selectionToken = 0;
+
+const VIEWER_LABELS = {maplibre: "MapLibre", arcgis: "ArcGIS", cesium: "CesiumJS"};
+const NAVIGATION_TIMEOUT_MS = 10000;
+
+/** Build a DOM node; strings become text nodes, never HTML. */
+function el(tag, props = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(props)) {
+    if (value == null || value === false) continue;
+    if (key === "className") node.className = value;
+    else if (key === "text") node.textContent = String(value);
+    else if (key.startsWith("on") && typeof value === "function") node.addEventListener(key.slice(2), value);
+    else node.setAttribute(key, value === true ? "" : String(value));
+  }
+  for (const child of children.flat()) {
+    if (child == null || child === false) continue;
+    node.append(child instanceof Node ? child : String(child));
+  }
+  return node;
+}
+
+// ---- status line: busy states show an elapsed-seconds counter -------------
+
+let busyTicker = null;
+
+function stopBusyTicker() {
+  clearInterval(busyTicker);
+  busyTicker = null;
+}
 
 function setStatus(message, kind = "info") {
+  stopBusyTicker();
   status.textContent = message;
   status.className = `status ${kind}`;
 }
 
+function setBusyStatus(message) {
+  stopBusyTicker();
+  const started = performance.now();
+  const render = () => { status.textContent = `${message} · ${formatElapsed(performance.now() - started)}`; };
+  status.className = "status busy";
+  render();
+  busyTicker = setInterval(render, 1000);
+}
+
+function renderWarnings(warnings = [], {retry = false} = {}) {
+  warningsEl.replaceChildren();
+  if (!warnings.length) { warningsEl.classList.add("hidden"); return; }
+  warningsEl.append(el("strong", {text: retry ? "Reload failed" : "Partially loaded"}));
+  warningsEl.append(el("ul", {}, warnings.map(({part, message}) => el("li", {text: part ? `${part}: ${message}` : message}))));
+  if (retry) warningsEl.append(el("button", {type: "button", text: "Retry", onclick: loadPlatformState}));
+  warningsEl.classList.remove("hidden");
+}
+
 // Viewer messages are scoped: a MapLibre tile error must not cover the Cesium
 // tab. "global" messages (platform state) show on every tab. Transient
-// messages (individual tile failures) clear themselves.
+// messages (individual tile failures) clear themselves. Start-up failures of
+// a viewer are kept separately so clearing banners never hides them.
 let activeView = "maplibre";
 const viewMessages = {global: "", maplibre: "", arcgis: "", cesium: ""};
+const viewerFailures = {maplibre: "", arcgis: "", cesium: ""};
 const messageTimers = {};
 
 function renderMapMessage() {
-  const message = viewMessages.global || viewMessages[activeView] || "";
+  const message = viewMessages.global || viewMessages[activeView] || viewerFailures[activeView] || "";
   mapMessage.textContent = message;
   mapMessage.classList.toggle("hidden", !message);
 }
@@ -91,19 +154,29 @@ function setMapMessage(message, view = "global", {timeout = 0} = {}) {
   renderMapMessage();
 }
 
+function setViewerFailure(view, message) {
+  viewerFailures[view] = message;
+  renderMapMessage();
+}
+
 function itemName(item) {
-  return item?.title || item?.name || item?.properties?.title || item?.filename || item?.id || "Untitled area";
+  return String(item?.title || item?.name || item?.properties?.title || item?.filename || item?.id || "Untitled area");
 }
 
 function itemKind(item) {
-  return item?.kind || item?.properties?.kind || item?.type || "area";
+  return String(item?.kind || item?.properties?.kind || item?.type || "area");
+}
+
+function sameItem(a, b) {
+  if (!a || !b) return false;
+  return (a.id && a.id === b.id) || (!a.id && !b.id && a.name && a.name === b.name);
 }
 
 function itemCenter(item) {
   const bbox = itemBounds(item);
   if (bbox) return [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2];
   const center = state?.terrain?.center;
-  return Array.isArray(center) ? center.slice(0, 2) : [46.76, 24.74];
+  return Array.isArray(center) && center.slice(0, 2).every(Number.isFinite) ? center.slice(0, 2) : [46.76, 24.74];
 }
 
 function itemZoom(item) {
@@ -119,15 +192,15 @@ function allItems() {
 
 function renderCatalog(items) {
   if (!items.length) {
-    itemsEl.innerHTML = `<div class="notice">The platform catalog has no saved areas yet.</div>`;
+    itemsEl.replaceChildren(el("div", {className: "notice", text: "The platform catalog has no saved areas yet."}));
     detailsEl.classList.add("hidden");
     return;
   }
-  itemsEl.innerHTML = items.map((item, index) => `
-    <button class="item ${item.id === selectedItem?.id ? "selected" : ""}" data-index="${index}">
-      <span>${itemName(item)}</span><small>${itemKind(item)}${item.id ? ` · ${item.id}` : ""}</small>
-    </button>`).join("");
-  itemsEl.querySelectorAll(".item").forEach((button) => button.addEventListener("click", () => selectItem(items[Number(button.dataset.index)])));
+  itemsEl.replaceChildren(...items.map((item) => el("button", {
+    type: "button",
+    className: `item ${sameItem(item, selectedItem) ? "selected" : ""}`,
+    onclick: () => selectItem(item),
+  }, el("span", {text: itemName(item)}), el("small", {text: `${itemKind(item)}${item?.id ? ` · ${item.id}` : ""}`}))));
 }
 
 function renderDetails(item) {
@@ -136,38 +209,57 @@ function renderDetails(item) {
     return;
   }
   const bbox = itemBounds(item);
-  detailsEl.innerHTML = `<strong>${itemName(item)}</strong><span>${bbox ? `Extent: ${bbox.map((value) => Number(value).toFixed(4)).join(", ")}` : "No extent supplied by platform"}</span>`;
+  detailsEl.replaceChildren(
+    el("strong", {text: itemName(item)}),
+    el("span", {text: bbox ? `Extent: ${bbox.map((value) => Number(value).toFixed(4)).join(", ")}` : "No extent supplied by platform"}),
+  );
   detailsEl.classList.remove("hidden");
 }
 
-function selectItem(item) {
+async function selectItem(item) {
+  const token = ++selectionToken;
   selectedItem = item;
   // Picking an imagery area also switches every viewer to that imagery set.
   if (item?.kind === "imagery") {
     const set = (state?.imagery || []).find((candidate) => candidate.name === item.name);
-    if (set && set !== selectedImagery) setImagery(set);
+    if (set && set !== selectedImagery) setImagery(set, {announce: false});
   }
   renderCatalog(allItems());
   renderDetails(item);
-  setStatus(`${itemName(item)} selected · updating viewers`, "busy");
   setMapMessage("");
-  updateViews();
-  setStatus(`${itemName(item)} selected · viewers synchronized`, "success");
+  setBusyStatus(`${itemName(item)} selected · moving viewers`);
+  const outcome = await syncViews();
+  if (token !== selectionToken) return;   // superseded by a newer selection
+  setStatus(`${itemName(item)} selected · ${outcome.text}`, outcome.kind);
 }
 
 function terrainTemplates() {
-  return tileUrls(state.terrain, api.url("/tiles/terrain.json"));
+  const templates = tileUrls(state?.terrain, api.url("/tiles/terrain.json"));
+  if (templates.length) return templates;
+  // terrain.json unavailable (reported as a warning): the platform's fixed
+  // tile route still serves the pyramid.
+  return [api.url("/tiles/terrain/{z}/{x}/{y}.png").replaceAll("%7B", "{").replaceAll("%7D", "}")];
 }
 
 function imageryTemplates() {
   // Prefer the platform's versioned hillshade URL (cache-busted per build).
-  const versioned = tileUrls({tiles: state.terrain?.imagery}, api.url("/tiles/terrain.json"));
+  const versioned = tileUrls({tiles: state?.terrain?.imagery}, api.url("/tiles/terrain.json"));
   if (versioned.length) return versioned;
-  const configured = state.catalog?.links?.find((link) => link.rel === "imagery")?.href;
+  const configured = state?.catalog?.links?.find((link) => link.rel === "imagery")?.href;
   // Hillshade is only a fallback visualization, not aerial texture. Keep it
   // transparent where coverage is absent; terrain remains the DEM source.
   return [resolveApiUrl(configured || "/tiles/imagery/{z}/{x}/{y}.png", platform)
     .replaceAll("%7B", "{").replaceAll("%7D", "}")];
+}
+
+function terrainMaxzoom() {
+  const value = Number(state?.terrain?.maxzoom);
+  return Number.isFinite(value) && value > 0 ? value : 13;
+}
+
+function terrainBounds() {
+  const bounds = state?.terrain?.bounds;
+  return Array.isArray(bounds) && bounds.length === 4 && bounds.every(Number.isFinite) ? bounds : null;
 }
 
 function serviceForItem(item) {
@@ -188,24 +280,26 @@ function serviceForItem(item) {
 
 function renderImageryPicker() {
   const sets = state?.imagery || [];
-  imagerySelect.innerHTML = `<option value="">— none —</option>` + sets.map((set) =>
-    `<option value="${set.name}">${set.name} · ${set.provider} z${set.minzoom}–${set.maxzoom}</option>`).join("");
+  imagerySelect.replaceChildren(
+    new Option("— none —", ""),
+    ...sets.map((set) => new Option(`${set.name} · ${set.provider ?? "?"} z${set.minzoom ?? "?"}–${set.maxzoom ?? "?"}`, set.name)),
+  );
   imagerySelect.value = selectedImagery?.name || "";
   imagerySelect.disabled = !sets.length;
   imageryInfo.textContent = !sets.length
     ? "No imagery sets yet — fetch one on the platform's /fetch/ page (Imagery tab)."
     : selectedImagery
-      ? `${selectedImagery.tileCount ?? "?"} tiles · ${((selectedImagery.bytes || 0) / 1e6).toFixed(2)} MB · over-zoomed above z${selectedImagery.maxzoom} · ${selectedImagery.attribution || ""}`
+      ? `${selectedImagery.tileCount ?? "?"} tiles · ${((Number(selectedImagery.bytes) || 0) / 1e6).toFixed(2)} MB · over-zoomed above z${selectedImagery.maxzoom ?? "?"} · ${selectedImagery.attribution || ""}`
       : `${sets.length} imagery set(s) available`;
 }
 
-function setImagery(set) {
+function setImagery(set, {announce = true} = {}) {
   selectedImagery = set || null;
   renderImageryPicker();
-  applyMapLibreImagery();
-  applyArcGISImagery();
-  applyCesiumImagery();
-  setStatus(selectedImagery ? `Imagery “${selectedImagery.name}” shown in MapLibre, ArcGIS and CesiumJS` : "Imagery hidden in all viewers", "success");
+  for (const [view, apply] of [["maplibre", applyMapLibreImagery], ["arcgis", applyArcGISImagery], ["cesium", applyCesiumImagery]]) {
+    try { apply(); } catch (error) { setMapMessage(`${VIEWER_LABELS[view]} imagery error: ${formatError(error)}`, view); }
+  }
+  if (announce) setStatus(selectedImagery ? `Imagery “${selectedImagery.name}” shown in MapLibre, ArcGIS and CesiumJS` : "Imagery hidden in all viewers", "success");
 }
 
 imagerySelect.addEventListener("change", () => {
@@ -245,28 +339,57 @@ function applyCesiumImagery() {
   if (cesiumImageryLayer) { cesiumViewer.imageryLayers.remove(cesiumImageryLayer, true); cesiumImageryLayer = null; }
   const set = selectedImagery;
   const url = imageryTemplate(set, platform);
-  if (!url) return;
-  const bounds = Array.isArray(set.bounds) && set.bounds.length === 4 ? set.bounds : null;
-  // Index 0: under the hillshade drape.
-  cesiumImageryLayer = cesiumViewer.imageryLayers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({
-    url, maximumLevel: set.maxzoom ?? 18,
-    rectangle: bounds ? Cesium.Rectangle.fromDegrees(...bounds) : undefined,
-    credit: set.attribution || undefined,
-  }), 0);
+  if (url) {
+    const bounds = Array.isArray(set.bounds) && set.bounds.length === 4 ? set.bounds : null;
+    // Index 0: under the hillshade drape.
+    cesiumImageryLayer = cesiumViewer.imageryLayers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({
+      url, maximumLevel: set.maxzoom ?? 18,
+      rectangle: bounds ? Cesium.Rectangle.fromDegrees(...bounds) : undefined,
+      credit: set.attribution || undefined,
+    }), 0);
+  }
+  cesiumViewer.scene.requestRender();
 }
+
+// ---- ArcGIS elevation: a loaded ElevationLayer ignores a new .url, so the
+// layer is replaced in map.ground.layers whenever the service changes. -------
+
+function setArcGISElevation(url, {force = false} = {}) {
+  if (!arcgisMap) return;
+  if (!url) {
+    if (arcgisElevationLayer) { arcgisMap.ground.layers.remove(arcgisElevationLayer); arcgisElevationLayer.destroy?.(); }
+    arcgisElevationLayer = null; arcgisElevationUrl = null;
+    setMapMessage("The platform has no ArcGIS ImageServer URL for this selection.", "arcgis");
+    return;
+  }
+  if (arcgisElevationLayer && arcgisElevationUrl === url && !force) return;
+  if (arcgisElevationLayer) { arcgisMap.ground.layers.remove(arcgisElevationLayer); arcgisElevationLayer.destroy?.(); }
+  arcgisElevationUrl = url;
+  arcgisElevationLayer = new ElevationLayer({url, title: "Platform elevation"});
+  arcgisMap.ground.layers.add(arcgisElevationLayer);
+  const layer = arcgisElevationLayer;
+  layer.load().catch((error) => {
+    if (layer === arcgisElevationLayer && !isAbortError(error)) setMapMessage(`ArcGIS elevation error: ${formatError(error)}`, "arcgis");
+  });
+}
+
+// ---- viewer construction (each isolated: one failing viewer never blocks
+// the others or masquerades as "platform unavailable") ----------------------
 
 function createMapLibre() {
   const terrain = terrainTemplates();
   const imagery = imageryTemplates();
+  const maxzoom = terrainMaxzoom();
+  const demSource = () => ({type: "raster-dem", tiles: terrain, tileSize: state.terrain?.tileSize || 256, encoding: state.terrain?.encoding || "terrarium", maxzoom});
   maplibre = new maplibregl.Map({
     container: "maplibre",
     center: itemCenter(selectedItem), zoom: itemZoom(selectedItem), pitch: 42,
     style: {version: 8, sources: {
-      terrain: {type: "raster-dem", tiles: terrain, tileSize: state.terrain?.tileSize || 256, encoding: state.terrain?.encoding || "terrarium", maxzoom: state.terrain?.maxzoom || 13},
+      terrain: demSource(),
       // Separate DEM source for shading (MapLibre recommends not sharing the
       // terrain source with a hillshade layer).
-      relief: {type: "raster-dem", tiles: terrain, tileSize: state.terrain?.tileSize || 256, encoding: state.terrain?.encoding || "terrarium", maxzoom: state.terrain?.maxzoom || 13},
-      imagery: {type: "raster", tiles: imagery, tileSize: 256, maxzoom: state.terrain?.maxzoom || 13},
+      relief: demSource(),
+      imagery: {type: "raster", tiles: imagery, tileSize: 256, maxzoom},
     }, layers: [
       {id: "background", type: "background", paint: {"background-color": "#d9d2c3"}},
       // Client-side hillshade only where it means something. Below ~z6 the
@@ -300,69 +423,41 @@ function createMapLibre() {
 }
 
 async function createArcGIS() {
-  const serviceUrl = serviceForItem(selectedItem);
   // Create the SceneView first. Loading a local/custom ImageServer directly in
   // Ground's constructor can abort SceneView initialization on some SDK builds.
   arcgisMap = new ArcGISMap({basemap: "gray-vector", ground: new Ground()});
   arcgisView = new SceneView({container: "arcgis", map: arcgisMap, center: itemCenter(selectedItem), zoom: itemZoom(selectedItem), qualityProfile: "high"});
   if (import.meta.env.DEV) window.__viewers = Object.assign(window.__viewers || {}, {arcgis: arcgisView});
   applyArcGISImagery();
-  try {
-    await arcgisView.when();
-    if (serviceUrl) {
-      arcgisMap.ground.layers.add(new ElevationLayer({url: serviceUrl, title: "Platform elevation"}));
-    } else {
-      setMapMessage("The platform has no ArcGIS ImageServer URL for this selection.", "arcgis");
-    }
-  } catch (error) {
-    setMapMessage(`ArcGIS viewer error: ${formatError(error)}`, "arcgis");
-  }
+  await arcgisView.when();
+  setArcGISElevation(serviceForItem(selectedItem));
 }
 
-async function createCesium() {
-  const serviceUrl = serviceForItem(selectedItem);
-  // Always create the viewer. If the native ArcGIS terrain adapter rejects a
-  // local service, retain a working globe and use the local Terrarium adapter.
-  cesiumViewer = new Cesium.Viewer("cesium", {
-    animation: false, timeline: false, baseLayerPicker: false, geocoder: false,
-    homeButton: false, sceneModePicker: true, baseLayer: false,
-    terrainProvider: new Cesium.EllipsoidTerrainProvider(),
-    // Report render errors in the app banner instead of Cesium's modal, which
-    // stops rendering for good after one bad tile.
-    showRenderLoopErrors: false,
-  });
-  let renderRestarts = 0;
-  cesiumViewer.scene.renderError.addEventListener((_scene, error) => {
-    const message = formatError(error);
-    if (renderRestarts < 3) {
-      renderRestarts += 1;
-      setMapMessage(`Cesium recovered from a render error: ${message}`, "cesium", {timeout: 8000});
-      setTimeout(() => { cesiumViewer.useDefaultRenderLoop = true; }, 250);
-    } else {
-      setMapMessage(`Cesium rendering stopped after repeated errors: ${message}. Reload the page.`, "cesium");
-    }
-  });
-  if (import.meta.env.DEV) window.__viewers = Object.assign(window.__viewers || {}, {cesium: cesiumViewer, Cesium});
-  // No remote basemap: the ground outside the DEM uses the hillshade's
-  // flat-terrain tone (sun at 45 deg -> ~179/255), so the drape edge blends.
-  cesiumViewer.scene.globe.baseColor = Cesium.Color.fromBytes(179, 179, 179, 255);
-  cesiumViewer.scene.globe.depthTestAgainstTerrain = true;
-  const bounds = state.terrain?.bounds;
-  cesiumViewer.imageryLayers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({
+function setCesiumHillshade() {
+  if (!cesiumViewer) return;
+  if (cesiumHillshadeLayer) { cesiumViewer.imageryLayers.remove(cesiumHillshadeLayer, true); cesiumHillshadeLayer = null; }
+  const bounds = terrainBounds();
+  // Added on top, so an imagery set (inserted at index 0) stays underneath.
+  cesiumHillshadeLayer = cesiumViewer.imageryLayers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({
     url: imageryTemplates()[0],
     // Only request the hillshade drape where the platform has DEM coverage.
-    rectangle: Array.isArray(bounds) && bounds.length === 4 ? Cesium.Rectangle.fromDegrees(...bounds) : undefined,
+    rectangle: bounds ? Cesium.Rectangle.fromDegrees(...bounds) : undefined,
     // Hillshade exists up to the terrain maxzoom; Cesium over-zooms beyond.
-    maximumLevel: state.terrain?.maxzoom || 13,
+    maximumLevel: terrainMaxzoom(),
   }));
-  applyCesiumImagery();
-  // Use the platform Terrarium pyramid: the platform fills no-data and serves
-  // flat fill tiles everywhere outside coverage, so the globe has continuous
-  // ground. The per-dataset Lerc ImageServers have no level-0 root tile and
-  // end at the service extent, which leaves CesiumJS with holes/cliffs.
+  cesiumViewer.scene.requestRender();
+}
+
+// Use the platform Terrarium pyramid: the platform fills no-data and serves
+// flat fill tiles everywhere outside coverage, so the globe has continuous
+// ground. The per-dataset Lerc ImageServers have no level-0 root tile and
+// end at the service extent, which leaves CesiumJS with holes/cliffs.
+async function setCesiumTerrain() {
+  if (!cesiumViewer) return;
   try {
-    cesiumViewer.terrainProvider = makePlatformTerrainProvider(terrainTemplates(), {credit: "Platform terrain", maxzoom: state.terrain?.maxzoom ?? 13});
+    cesiumViewer.terrainProvider = makePlatformTerrainProvider(terrainTemplates(), {credit: "Platform terrain", maxzoom: terrainMaxzoom()});
   } catch (error) {
+    const serviceUrl = serviceForItem(selectedItem);
     if (serviceUrl) {
       try {
         cesiumViewer.terrainProvider = await Cesium.ArcGISTiledElevationTerrainProvider.fromUrl(serviceUrl);
@@ -373,54 +468,210 @@ async function createCesium() {
       setMapMessage(`Cesium terrain error: ${formatError(error)}`, "cesium");
     }
   }
+  cesiumViewer?.scene.requestRender();
+}
+
+async function createCesium() {
+  // Always create the viewer with an ellipsoid; the platform terrain is set
+  // afterwards so a terrain failure still leaves a working globe.
+  cesiumViewer = new Cesium.Viewer("cesium", {
+    animation: false, timeline: false, baseLayerPicker: false, geocoder: false,
+    homeButton: false, sceneModePicker: true, baseLayer: false,
+    terrainProvider: new Cesium.EllipsoidTerrainProvider(),
+    // Render only when something changes (camera, tiles, layers) instead of
+    // 60 fps forever -- matters most while the Cesium tab is hidden.
+    requestRenderMode: true,
+    maximumRenderTimeChange: Number.POSITIVE_INFINITY,
+    // Report render errors in the app banner instead of Cesium's modal, which
+    // stops rendering for good after one bad tile.
+    showRenderLoopErrors: false,
+  });
+  const viewer = cesiumViewer;
+  let renderRestarts = 0;
+  viewer.scene.renderError.addEventListener((_scene, error) => {
+    const message = formatError(error);
+    if (renderRestarts < 3) {
+      renderRestarts += 1;
+      setMapMessage(`Cesium recovered from a render error: ${message}`, "cesium", {timeout: 8000});
+      setTimeout(() => { viewer.useDefaultRenderLoop = true; viewer.scene.requestRender(); }, 250);
+    } else {
+      setMapMessage(`Cesium rendering stopped after repeated errors: ${message}. Reload the page.`, "cesium");
+    }
+  });
+  if (import.meta.env.DEV) window.__viewers = Object.assign(window.__viewers || {}, {cesium: viewer, Cesium});
+  // No remote basemap: the ground outside the DEM uses the hillshade's
+  // flat-terrain tone (sun at 45 deg -> ~179/255), so the drape edge blends.
+  viewer.scene.globe.baseColor = Cesium.Color.fromBytes(179, 179, 179, 255);
+  viewer.scene.globe.depthTestAgainstTerrain = true;
+  setCesiumHillshade();
+  applyCesiumImagery();
+  await setCesiumTerrain();
   cesiumFrame(selectedItem, 0);
 }
 
-// Oblique framing of the selected area (a 1500 km nadir view showed only a
-// flat colour).
-function cesiumFrame(item, duration = 1.5) {
-  if (!cesiumViewer) return;
-  const bbox = itemBounds(item);
-  if (bbox && Math.abs(bbox[2] - bbox[0]) > 90) {
-    // Continental/world extents: a bounding sphere of the corners collapses
-    // (±180° share a meridian) and a world Rectangle destination lands at
-    // ground level, so look straight down from a height that fits the span.
-    const [cx, cy] = itemCenter(item);
-    const span = Math.max(Math.abs(bbox[2] - bbox[0]), Math.abs(bbox[3] - bbox[1]) * 2);
-    const height = Math.min(2.2e7, span * 111_320 * 0.9);
-    cesiumViewer.camera.flyTo({destination: Cesium.Cartesian3.fromDegrees(cx, cy, height), duration});
-    return;
+function destroyQuietly(object) {
+  try { object?.destroy?.(); } catch { /* already broken */ }
+}
+
+/** Create every viewer that does not exist yet; each failure is reported per viewer. */
+async function startViewers() {
+  const failures = [];
+  if (!maplibre) {
+    try {
+      createMapLibre();
+      setViewerFailure("maplibre", "");
+    } catch (error) {
+      destroyQuietly(maplibre); maplibre = null; mapLibreReady = false;
+      setViewerFailure("maplibre", `MapLibre failed to start: ${formatError(error)}`);
+      failures.push("MapLibre");
+    }
   }
-  const [lon, lat] = itemCenter(item);
-  const base = Number(state?.terrain?.statistics?.min) || 0;
-  const corners = bbox
-    ? [[bbox[0], bbox[1]], [bbox[2], bbox[1]], [bbox[2], bbox[3]], [bbox[0], bbox[3]]]
-    : [[lon - 0.1, lat - 0.1], [lon + 0.1, lat + 0.1]];
-  const sphere = Cesium.BoundingSphere.fromPoints(corners.map(([x, y]) => Cesium.Cartesian3.fromDegrees(x, y, base)));
-  cesiumViewer.camera.flyToBoundingSphere(sphere, {
-    duration,
-    offset: new Cesium.HeadingPitchRange(0, Cesium.Math.toRadians(-35), sphere.radius * 2.2),
+  // ArcGIS may take a long time to resolve its SceneView; it must not block
+  // CesiumJS, so it runs in the background with its own error handling.
+  if (!arcgisView) {
+    createArcGIS()
+      .then(() => setViewerFailure("arcgis", ""))
+      .catch((error) => {
+        destroyQuietly(arcgisView); arcgisView = null; arcgisMap = null;
+        arcgisElevationLayer = null; arcgisElevationUrl = null; arcgisImageryLayer = null;
+        setViewerFailure("arcgis", `ArcGIS viewer failed to start: ${formatError(error)}`);
+        if (!loading) setStatus(`ArcGIS viewer failed to start: ${formatError(error)}`, "warning");
+      });
+  }
+  if (!cesiumViewer) {
+    try {
+      await createCesium();
+      setViewerFailure("cesium", "");
+    } catch (error) {
+      destroyQuietly(cesiumViewer); cesiumViewer = null; cesiumImageryLayer = null; cesiumHillshadeLayer = null;
+      setViewerFailure("cesium", `CesiumJS failed to start: ${formatError(error)}`);
+      failures.push("CesiumJS");
+    }
+  }
+  return failures;
+}
+
+/**
+ * After a reload: if the platform's terrain/hillshade tile templates changed
+ * (they are versioned per build), point every viewer at the new tiles.
+ */
+function refreshTileSources() {
+  const terrain = terrainTemplates();
+  const imagery = imageryTemplates();
+  const terrainKey = templatesKey(terrain); const imageryKey = templatesKey(imagery);
+  const terrainChanged = appliedTerrainKey !== null && terrainKey !== appliedTerrainKey;
+  const imageryChanged = appliedImageryKey !== null && imageryKey !== appliedImageryKey;
+  appliedTerrainKey = terrainKey; appliedImageryKey = imageryKey;
+  if (maplibre && (terrainChanged || imageryChanged)) {
+    try {
+      if (terrainChanged) {
+        maplibre.getSource("terrain")?.setTiles(terrain);
+        maplibre.getSource("relief")?.setTiles(terrain);
+      }
+      if (imageryChanged) maplibre.getSource("imagery")?.setTiles(imagery);
+    } catch (error) {
+      setMapMessage(`MapLibre could not refresh tile sources: ${formatError(error)}`, "maplibre");
+    }
+  }
+  if (cesiumViewer) {
+    if (terrainChanged || imageryChanged) setCesiumHillshade();
+    if (terrainChanged) setCesiumTerrain();
+  }
+  // A rebuilt dataset keeps its ImageServer URL; force a fresh layer so the
+  // SceneView drops its cached elevation tiles.
+  if (arcgisMap && arcgisView) setArcGISElevation(serviceForItem(selectedItem), {force: terrainChanged});
+  return terrainChanged || imageryChanged;
+}
+
+// ---- navigation: each viewer reports when it has actually arrived ---------
+
+// Oblique framing of the selected area (a 1500 km nadir view showed only a
+// flat colour). Resolves when the flight completes or is cancelled.
+function cesiumFrame(item, duration = 1.5) {
+  if (!cesiumViewer) return Promise.resolve("skipped");
+  return new Promise((resolve) => {
+    const done = {complete: () => resolve("arrived"), cancel: () => resolve("cancelled")};
+    const bbox = itemBounds(item);
+    if (bbox && Math.abs(bbox[2] - bbox[0]) > 90) {
+      // Continental/world extents: a bounding sphere of the corners collapses
+      // (±180° share a meridian) and a world Rectangle destination lands at
+      // ground level, so look straight down from a height that fits the span.
+      const [cx, cy] = itemCenter(item);
+      const span = Math.max(Math.abs(bbox[2] - bbox[0]), Math.abs(bbox[3] - bbox[1]) * 2);
+      const height = Math.min(2.2e7, span * 111_320 * 0.9);
+      cesiumViewer.camera.flyTo({destination: Cesium.Cartesian3.fromDegrees(cx, cy, height), duration, ...done});
+      return;
+    }
+    const [lon, lat] = itemCenter(item);
+    const base = Number(state?.terrain?.statistics?.min) || 0;
+    const corners = bbox
+      ? [[bbox[0], bbox[1]], [bbox[2], bbox[1]], [bbox[2], bbox[3]], [bbox[0], bbox[3]]]
+      : [[lon - 0.1, lat - 0.1], [lon + 0.1, lat + 0.1]];
+    const sphere = Cesium.BoundingSphere.fromPoints(corners.map(([x, y]) => Cesium.Cartesian3.fromDegrees(x, y, base)));
     // A flight cancelled by a newer selection or by user input is expected.
+    cesiumViewer.camera.flyToBoundingSphere(sphere, {
+      duration,
+      offset: new Cesium.HeadingPitchRange(0, Cesium.Math.toRadians(-35), sphere.radius * 2.2),
+      ...done,
+    });
+    cesiumViewer.scene.requestRender();
   });
 }
 
-function updateViews() {
-  if (!selectedItem) return;
-  const center = itemCenter(selectedItem); const zoom = itemZoom(selectedItem);
-  if (maplibre) maplibre.flyTo({center, zoom});
-  if (arcgisView) {
-    const serviceUrl = serviceForItem(selectedItem);
-    const elevation = arcgisMap?.ground?.layers?.getItemAt(0);
-    if (elevation && serviceUrl && elevation.url !== serviceUrl) elevation.url = serviceUrl;
+function mapLibreNavigate(center, zoom) {
+  if (!maplibre) return Promise.resolve("skipped");
+  // Hidden tab: no point animating; jump so the view is ready when shown.
+  if (activeView !== "maplibre") {
+    maplibre.jumpTo({center, zoom});
+    return Promise.resolve("arrived");
+  }
+  return new Promise((resolve) => {
+    maplibre.once("moveend", () => resolve("arrived"));
+    maplibre.flyTo({center, zoom});
+  });
+}
+
+function arcgisNavigate(center, zoom) {
+  if (!arcgisView) return Promise.resolve("skipped");
+  setArcGISElevation(serviceForItem(selectedItem));
+  // A hidden SceneView is suspended: its goTo aborts or never settles. Record
+  // the target and replay it when the ArcGIS tab is shown (setViewer).
+  if (activeView !== "arcgis") {
+    arcgisPendingGoTo = true;
+    return Promise.resolve("deferred");
+  }
+  arcgisPendingGoTo = false;
+  return arcgisView.goTo({center, zoom}).then(() => "arrived", (error) => {
     // goTo rejects with AbortError when superseded by a newer navigation or
     // while the view is hidden in another tab; that is not a failure.
-    // A hidden SceneView aborts goTo; replay it when the ArcGIS tab is shown.
-    arcgisPendingGoTo = activeView !== "arcgis";
-    arcgisView.goTo({center, zoom}).catch((error) => {
-      if (error?.name !== "AbortError" && !/abort/i.test(formatError(error))) setMapMessage(`ArcGIS navigation error: ${formatError(error)}`, "arcgis");
-    });
-  }
-  if (cesiumViewer) cesiumFrame(selectedItem);
+    if (isAbortError(error)) return "deferred";
+    setMapMessage(`ArcGIS navigation error: ${formatError(error)}`, "arcgis");
+    throw error;
+  });
+}
+
+/** Move every viewer to the selection; resolves once all navigations settled. */
+async function syncViews() {
+  if (!selectedItem) return {text: "nothing selected", kind: "warning"};
+  const center = itemCenter(selectedItem); const zoom = itemZoom(selectedItem);
+  const tasks = [
+    ["MapLibre", () => mapLibreNavigate(center, zoom)],
+    ["ArcGIS", () => arcgisNavigate(center, zoom)],
+    // A hidden Cesium widget has a 0x0 canvas and never advances a flight, so
+    // frame it instantly (duration 0 completes synchronously).
+    ["CesiumJS", () => cesiumFrame(selectedItem, activeView === "cesium" ? 1.5 : 0)],
+  ];
+  const results = await Promise.allSettled(tasks.map(([, run]) => {
+    try { return withTimeout(run(), NAVIGATION_TIMEOUT_MS); } catch (error) { return Promise.reject(error); }
+  }));
+  const failed = []; const slow = [];
+  results.forEach((result, index) => {
+    if (result.status === "rejected") failed.push(`${tasks[index][0]} (${formatError(result.reason)})`);
+    else if (result.value?.timedOut) slow.push(tasks[index][0]);
+  });
+  if (failed.length) return {text: `navigation failed in ${failed.join(", ")}`, kind: "warning"};
+  if (slow.length) return {text: `viewers synchronized (${slow.join(", ")} still moving)`, kind: "success"};
+  return {text: "viewers synchronized", kind: "success"};
 }
 
 function setViewer(view) {
@@ -437,48 +688,98 @@ function setViewer(view) {
         // The first time the view becomes visible it may still be starting up
         // and abort the navigation; retry a few times until it lands.
         const target = {center: itemCenter(selectedItem), zoom: itemZoom(selectedItem)};
-        const attempt = (left) => arcgisView.when()
+        const attempt = (left) => arcgisView?.when()
           .then(() => arcgisView.goTo(target))
           .catch(() => { if (left > 0 && activeView === "arcgis") setTimeout(() => attempt(left - 1), 400); });
         attempt(5);
       }
     }
-    if (view === "cesium") cesiumViewer?.resize();
+    if (view === "cesium" && cesiumViewer) { cesiumViewer.resize(); cesiumViewer.scene.requestRender(); }
   });
 }
 
 async function loadPlatformState() {
-  setStatus("Loading catalog, saved areas, and delivery metadata…", "busy");
-  itemsEl.innerHTML = `<div class="loading">Contacting the GIS data platform…</div>`;
-  setMapMessage("");
+  if (loading) return;
+  loading = true;
+  reloadButton.disabled = true;
+  setBusyStatus("Loading catalog, saved areas, and delivery metadata");
+  if (!state) itemsEl.replaceChildren(el("div", {className: "loading", text: "Contacting the GIS data platform…"}));
+  let next;
   try {
-    state = await api.loadState();
+    next = await api.loadState();
+  } catch (error) {
+    // Only a failure of the platform's required state is "unavailable".
+    const message = formatError(error);
+    setStatus(`Platform unavailable · ${message}`, "error");
+    if (state) {
+      // Keep the working viewers and the last catalog; offer a retry.
+      renderWarnings([{part: "", message}], {retry: true});
+    } else {
+      selectedItem = null;
+      itemsEl.replaceChildren(el("div", {className: "notice error"},
+        el("div", {text: message}),
+        el("button", {type: "button", text: "Retry", onclick: loadPlatformState})));
+      setMapMessage(`Platform unavailable: ${message}`);
+    }
+    loading = false;
+    reloadButton.disabled = false;
+    return;
+  }
+
+  try {
+    const firstLoad = !state;
+    state = next;
+    setMapMessage("");
     const items = allItems();
-    // Default to a built elevation area; imagery areas are selectable too.
-    selectedItem = items.find((item) => item?.kind !== "imagery" && item?.dataset?.state === "done")
+    // Keep the current selection across reloads when it still exists;
+    // otherwise default to a built elevation area (imagery areas are
+    // selectable too).
+    selectedItem = items.find((item) => sameItem(item, selectedItem))
+      || items.find((item) => item?.kind !== "imagery" && item?.dataset?.state === "done")
       || items.find((item) => item?.dataset?.service) || items[0] || null;
     // Keep the current imagery choice across reloads when it still exists.
     const sets = state.imagery || [];
-    selectedImagery = sets.find((set) => set.name === selectedImagery?.name) || sets[0] || null;
+    selectedImagery = sets.find((set) => set.name === selectedImagery?.name) || (firstLoad ? sets[0] : null) || null;
     renderCatalog(items); renderDetails(selectedItem); renderImageryPicker();
-    if (!selectedItem) { setStatus("Platform connected · no saved areas", "warning"); setMapMessage("Select a saved area after it is added to the platform catalog."); return; }
-    setStatus(`Platform connected · ${items.length} saved area(s)`, "success");
-    if (!maplibre) {
-      createMapLibre();
-      // ArcGIS may take time to resolve its SceneView, but it must not block
-      // Cesium initialization while the ArcGIS view is hidden in a tab.
-      createArcGIS();
-      await createCesium();
-    } else { updateViews(); setImagery(selectedImagery); }
+    renderWarnings(state.warnings || []);
+    if (!selectedItem) {
+      setStatus("Platform connected · no saved areas", "warning");
+      setMapMessage("Select a saved area after it is added to the platform catalog.");
+      return;
+    }
+    let navigation = {text: "viewers ready", kind: "success"};
+    const anyViewer = maplibre || arcgisView || cesiumViewer;
+    if (anyViewer) {
+      setBusyStatus("Platform reloaded · refreshing viewers");
+      refreshTileSources();
+      setImagery(selectedImagery, {announce: false});
+    } else {
+      setBusyStatus("Platform connected · starting viewers");
+    }
+    // Creates missing viewers (first load, or a retry after a start-up failure).
+    const failures = await startViewers();
+    if (!anyViewer) {
+      appliedTerrainKey = templatesKey(terrainTemplates());
+      appliedImageryKey = templatesKey(imageryTemplates());
+    } else {
+      setBusyStatus("Platform reloaded · moving viewers");
+      navigation = await syncViews();
+    }
+    const parts = [`Platform connected · ${items.length} saved area(s)`];
+    const warningCount = (state.warnings || []).length;
+    if (warningCount) parts.push(`${warningCount} optional part(s) unavailable`);
+    if (failures.length) parts.push(`${failures.join(", ")} failed to start`);
+    parts.push(navigation.text);
+    setStatus(parts.join(" · "), warningCount || failures.length || navigation.kind !== "success" ? "warning" : "success");
   } catch (error) {
-    state = null; selectedItem = null;
-    itemsEl.innerHTML = `<div class="notice error">${formatError(error)}<br><button id="retry">Retry</button></div>`;
-    document.querySelector("#retry")?.addEventListener("click", loadPlatformState);
-    setStatus(`Platform unavailable · ${formatError(error)}`, "error");
-    setMapMessage(`Viewer initialization failed: ${formatError(error)}`);
+    // A bug in rendering/refreshing is not a platform outage.
+    setStatus(`Viewer update failed · ${formatError(error)}`, "error");
+  } finally {
+    loading = false;
+    reloadButton.disabled = false;
   }
 }
 
 document.querySelectorAll("header nav button").forEach((button) => button.addEventListener("click", () => setViewer(button.dataset.view)));
-document.querySelector("#reload").addEventListener("click", loadPlatformState);
+reloadButton.addEventListener("click", loadPlatformState);
 await loadPlatformState();

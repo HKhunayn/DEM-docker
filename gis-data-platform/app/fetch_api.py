@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from . import jobs
-from .catalog import delete_area, find_area, list_areas, upsert_area
+from .catalog import NameConflictError, delete_area, find_area, list_areas, upsert_area
 from .config import LEAFLET_ROOT
 from .jobs import probe_providers
 
@@ -99,7 +99,10 @@ def areas() -> dict[str, Any]:
 
 @router.post("/api/areas", status_code=201)
 def add_area(body: AreaInput) -> dict[str, Any]:
-    return upsert_area(body.name, list(body.bbox), body.provider, body.minzoom, body.maxzoom)
+    try:
+        return upsert_area(body.name, list(body.bbox), body.provider, body.minzoom, body.maxzoom)
+    except NameConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 @router.get("/api/areas/{area_id}")
@@ -131,8 +134,15 @@ def providers() -> dict[str, Any]:
 
 # ---- background jobs -------------------------------------------------------
 
-@router.post("/api/jobs", status_code=202)
-def start_job(body: JobInput) -> dict[str, Any]:
+MAX_TAIL = 5000
+
+
+def _tail(tail: int) -> int:
+    """`tail` query: last N log lines (default 200, clamped to 0..5000)."""
+    return max(0, min(int(tail), MAX_TAIL))
+
+
+def _start(body: JobInput) -> dict[str, Any]:
     available, reason = probe_providers().get(body.provider, (False, "unknown provider"))
     if not available:
         raise HTTPException(
@@ -148,30 +158,47 @@ def start_job(body: JobInput) -> dict[str, Any]:
             maxzoom=body.maxzoom,
             save_area=body.saveArea,
         )
-    except jobs.JobRunningError:
-        raise HTTPException(status_code=409, detail="a fetch job is already running")
+    except jobs.JobRunningError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except NameConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/api/jobs", status_code=202)
+def start_job(body: JobInput) -> dict[str, Any]:
+    return _start(body)
 
 
 @router.get("/api/jobs")
 def job_history() -> dict[str, Any]:
-    items = jobs.list_jobs()
+    items = jobs.list_jobs()  # no `log` (use /api/jobs/{id}?tail=N); `log_total` included
     return {"jobs": items, "count": len(items)}
 
 
 @router.get("/api/jobs/current")
-def job_current() -> dict[str, Any]:
-    job = jobs.current_job()
+def job_current(tail: int = jobs.DEFAULT_TAIL) -> dict[str, Any]:
+    job = jobs.current_job(tail=_tail(tail))
     if not job:
         raise HTTPException(status_code=404, detail="no job has been started")
     return job
 
 
 @router.get("/api/jobs/{job_id}")
-def job_status(job_id: str) -> dict[str, Any]:
-    job = jobs.get_job(job_id)
+def job_status(job_id: str, tail: int = jobs.DEFAULT_TAIL) -> dict[str, Any]:
+    job = jobs.get_job(job_id, tail=_tail(tail))
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
     return job
+
+
+@router.post("/api/jobs/{job_id}/cancel")
+def job_cancel(job_id: str) -> dict[str, Any]:
+    try:
+        return jobs.cancel_job(job_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="job not found")
+    except jobs.JobNotRunningError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 # ---- legacy fetch-page endpoints -------------------------------------------
@@ -183,21 +210,5 @@ def legacy_status() -> dict[str, Any]:
 
 @router.post("/api/fetch")
 def legacy_fetch(body: JobInput) -> dict[str, Any]:
-    available, reason = probe_providers().get(body.provider, (False, "unknown provider"))
-    if not available:
-        raise HTTPException(
-            status_code=400,
-            detail=f"provider '{body.provider}' is not available on this engine: {reason}",
-        )
-    try:
-        job = jobs.start_job(
-            name=body.name,
-            bbox=list(body.bbox),
-            provider=body.provider,
-            minzoom=body.minzoom,
-            maxzoom=body.maxzoom,
-            save_area=body.saveArea,
-        )
-    except jobs.JobRunningError:
-        raise HTTPException(status_code=409, detail="a fetch job is already running")
+    job = _start(body)
     return {"ok": True, "state": job["state"], "jobId": job["id"]}

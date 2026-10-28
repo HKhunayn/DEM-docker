@@ -17,8 +17,10 @@ import json
 import math
 import shutil
 import threading
+import os
 import time
 import urllib.request
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +31,9 @@ from .config import IMAGERY_ROOT
 MERCATOR_MAX_LAT = 85.05112878
 MAX_TILES_PER_JOB = 50_000
 USER_AGENT = "gis-data-platform/0.1 (local open GIS platform)"
+MAX_TILE_BYTES = 4 * 1024 * 1024
+HTTP_TIMEOUT_S = 30.0
+PROVIDER_MARKER = ".provider"  # written when a download starts, before imagery.json exists
 
 PROVIDERS: dict[str, dict[str, Any]] = {
     "s2cloudless": {
@@ -105,11 +110,42 @@ def count_tiles(bbox: list[float], minzoom: int, maxzoom: int) -> int:
 
 # ---- fetch ---------------------------------------------------------------------
 
-def http_get(url: str, timeout: float = 30.0) -> bytes:
-    """Download one tile. Module-level so tests can replace it."""
+class BadTileError(ValueError):
+    """The provider answered, but not with a usable image tile (not retried)."""
+
+
+def http_get(url: str, timeout: float = HTTP_TIMEOUT_S) -> bytes:
+    """Download one tile. Module-level so tests can replace it.
+
+    Only image/* responses up to MAX_TILE_BYTES are accepted: an HTML error
+    page or captive portal answering 200 must not be stored as a tile.
+    """
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read()
+        ctype = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if not ctype.startswith("image/"):
+            raise BadTileError(f"unexpected Content-Type {ctype or '(none)'!r}")
+        length = response.headers.get("Content-Length")
+        if length and length.isdigit() and int(length) > MAX_TILE_BYTES:
+            raise BadTileError(f"tile too large ({length} bytes)")
+        payload = response.read(MAX_TILE_BYTES + 1)
+        if len(payload) > MAX_TILE_BYTES:
+            raise BadTileError(f"tile larger than {MAX_TILE_BYTES} bytes")
+        return payload
+
+
+JPEG_MAGIC = b"\xff\xd8\xff"
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def check_tile_payload(payload: bytes) -> None:
+    """Raise BadTileError unless `payload` is a JPEG or PNG within the size cap."""
+    if not payload:
+        raise BadTileError("empty response")
+    if len(payload) > MAX_TILE_BYTES:
+        raise BadTileError(f"tile larger than {MAX_TILE_BYTES} bytes")
+    if not (payload.startswith(JPEG_MAGIC) or payload.startswith(PNG_MAGIC)):
+        raise BadTileError("response is not a JPEG/PNG image")
 
 
 def _fetch_one(url: str, target: Path, retries: int = 3) -> int:
@@ -117,13 +153,14 @@ def _fetch_one(url: str, target: Path, retries: int = 3) -> int:
     for attempt in range(retries):
         try:
             payload = http_get(url)
-            if not payload:
-                raise ValueError("empty response")
+            check_tile_payload(payload)
             target.parent.mkdir(parents=True, exist_ok=True)
-            temp = target.with_suffix(target.suffix + ".part")
+            temp = target.with_name(f"{target.name}.{uuid.uuid4().hex}.part")
             temp.write_bytes(payload)
             temp.replace(target)
             return len(payload)
+        except BadTileError as exc:
+            raise RuntimeError(f"{url}: {exc}") from None
         except Exception as exc:  # noqa: BLE001
             last = exc
             time.sleep(0.5 * (attempt + 1))
@@ -142,8 +179,12 @@ def download_set(
     maxzoom: int,
     log: Callable[[str], None],
     workers: int = 6,
+    stop: threading.Event | None = None,
 ) -> dict[str, Any]:
-    """Download (resumable: existing tiles are kept) and write imagery.json."""
+    """Download (resumable: existing tiles are kept) and write imagery.json.
+
+    Setting `stop` cancels the pending downloads and raises RuntimeError.
+    """
     info = PROVIDERS[provider]
     bbox = clamp_bbox(list(bbox))
     total = count_tiles(bbox, minzoom, maxzoom)
@@ -152,6 +193,7 @@ def download_set(
                          "(reduce the area or the max zoom)")
     root = set_dir(name)
     root.mkdir(parents=True, exist_ok=True)
+    (root / PROVIDER_MARKER).write_text(provider, encoding="utf-8")
     ext = info["format"]
     log(f"imagery '{name}': {provider} z{minzoom}-{maxzoom}, {total} tile(s), bbox {bbox}")
 
@@ -169,10 +211,19 @@ def download_set(
     done = failed = 0
     downloaded = 0
     errors: list[str] = []
+    def fetch(url: str, target: Path) -> int:
+        if stop is not None and stop.is_set():
+            return 0
+        return _fetch_one(url, target)
+
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        futures = {pool.submit(_fetch_one, url, target): url for url, target in pending}
+        futures = {pool.submit(fetch, url, target): url for url, target in pending}
         step = max(1, len(futures) // 20)
         for future in as_completed(futures):
+            if stop is not None and stop.is_set():
+                pool.shutdown(wait=True, cancel_futures=True)
+                log("  download cancelled")
+                raise RuntimeError("download cancelled")
             try:
                 downloaded += future.result()
                 done += 1
@@ -206,7 +257,9 @@ def download_set(
         "updated": _now(),
     }
     with _META_LOCK:
-        (root / "imagery.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        temp = root / f"imagery.json.{uuid.uuid4().hex}.tmp"
+        temp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        os.replace(temp, root / "imagery.json")
     log(f"WROTE {tiles} imagery tiles ({size / 1e6:.2f} MB) -> {root}")
     if failed:
         raise RuntimeError(f"{failed} tile(s) failed to download: {errors[0]}")
@@ -219,13 +272,43 @@ def _valid_name(name: str) -> bool:
     return bool(name) and all(c.isalnum() or c in "_-" for c in name) and len(name) <= 64
 
 
+_SET_CACHE: dict[str, tuple[int, dict[str, Any]]] = {}
+
+
 def get_set(name: str) -> dict[str, Any] | None:
+    """imagery.json of a set, cached by mtime (tile requests hit this constantly)."""
     if not _valid_name(name):
         return None
     path = set_dir(name) / "imagery.json"
-    if not path.is_file():
+    try:
+        mtime = path.stat().st_mtime_ns
+    except OSError:
+        _SET_CACHE.pop(name, None)
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    cached = _SET_CACHE.get(name)
+    if cached is not None and cached[0] == mtime:
+        return dict(cached[1])
+    try:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+    _SET_CACHE[name] = (mtime, meta)
+    return dict(meta)
+
+
+def set_provider(name: str) -> str | None:
+    """Provider an existing (possibly partial) set was fetched from, else None."""
+    if not _valid_name(name):
+        return None
+    meta = get_set(name)
+    if meta and meta.get("provider"):
+        return str(meta["provider"])
+    try:
+        return (set_dir(name) / PROVIDER_MARKER).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
 
 
 def list_sets() -> list[dict[str, Any]]:
@@ -240,9 +323,14 @@ def list_sets() -> list[dict[str, Any]]:
 
 
 def delete_set(name: str) -> bool:
-    if not get_set(name):
+    """Remove a set directory, including partial downloads without imagery.json."""
+    if not _valid_name(name):
         return False
-    shutil.rmtree(set_dir(name))
+    root = set_dir(name)
+    _SET_CACHE.pop(name, None)
+    if not root.is_dir():
+        return False
+    shutil.rmtree(root)
     return True
 
 
@@ -275,12 +363,16 @@ def tile(name: str, z: int, x: int, y: int) -> tuple[bytes, str] | None:
     ext = meta.get("format", "jpg")
     mime = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
     root = set_dir(name)
-    maxzoom = int(meta["maxzoom"])
+    try:
+        maxzoom = int(meta["maxzoom"])
+    except (KeyError, TypeError, ValueError):
+        return transparent_png(), "image/png"
     if z <= maxzoom:
         path = root / str(z) / str(x) / f"{y}.{ext}"
-        if path.is_file():
+        try:
             return path.read_bytes(), mime
-        return transparent_png(), "image/png"
+        except OSError:
+            return transparent_png(), "image/png"
     shift = z - maxzoom
     ax, ay = x >> shift, y >> shift
     parent = root / str(maxzoom) / str(ax) / f"{ay}.{ext}"
@@ -290,10 +382,14 @@ def tile(name: str, z: int, x: int, y: int) -> tuple[bytes, str] | None:
     scale = 2 ** shift
     size = 256 / scale
     ox, oy = (x - (ax << shift)) * size, (y - (ay << shift)) * size
-    with Image.open(parent) as image:
-        image = image.convert("RGB")
-        # float box: works even when the ancestor footprint is < 1 px
-        crop = image.resize((256, 256), Image.BILINEAR, box=(ox, oy, ox + size, oy + size))
-    buffer = io.BytesIO()
-    crop.save(buffer, format="JPEG", quality=88)
+    try:
+        with Image.open(parent) as image:
+            image = image.convert("RGB")
+            # float box: works even when the ancestor footprint is < 1 px
+            crop = image.resize((256, 256), Image.BILINEAR, box=(ox, oy, ox + size, oy + size))
+        buffer = io.BytesIO()
+        crop.save(buffer, format="JPEG", quality=88)
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
+        # corrupt/truncated ancestor tile: degrade to transparent, not a 500
+        return transparent_png(), "image/png"
     return buffer.getvalue(), "image/jpeg"

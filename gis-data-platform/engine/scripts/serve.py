@@ -10,7 +10,9 @@ Everything is read from a static root directory (default: ./public), so the same
 files can be dropped on any static host later. This server adds:
   - the ImageServer metadata route (URL must end exactly in /ImageServer),
   - CORS for all origins (Next.js dev server on another port works),
-  - long-lived cache headers on immutable tiles.
+  - a one-day Cache-Control on successfully served tiles (never on 404s or
+    errors; tiles get rebuilt, so they are not `immutable`),
+  - path containment: tile/vendor paths cannot escape their root directory.
 
 Usage:  python serve.py [--root public] [--port 8765]
 """
@@ -48,6 +50,38 @@ JOB = {
 }
 JOB_LOCK = threading.Lock()
 
+TILE_PREFIXES = ("/terrarium/", "/hillshade/", "/arcgis/", "/tilejson")
+TILE_CACHE_CONTROL = "public, max-age=86400"
+
+
+def _bad_segment(seg: str) -> bool:
+    """A decoded URL path segment that could escape or alias a directory."""
+    if seg in (".", ".."):
+        return True
+    if "\x00" in seg or ":" in seg or "\\" in seg or "/" in seg:
+        return True
+    if os.sep in seg or (os.altsep and os.altsep in seg):
+        return True
+    return False
+
+
+def safe_join(base: str, *segments: str) -> str | None:
+    """Join decoded path segments under base, or None if any segment is unsafe
+    (``..``, separators, drive letters/ADS ``:``, NUL) or the resolved real path
+    (symlinks followed) leaves base."""
+    parts = [s for s in segments if s != ""]
+    if any(_bad_segment(s) for s in parts):
+        return None
+    base_real = os.path.realpath(base)
+    candidate = os.path.join(base_real, *parts)
+    try:
+        real = os.path.realpath(candidate)
+        if os.path.commonpath([base_real, real]) != base_real:
+            return None
+    except ValueError:  # different drives on Windows, NUL, ...
+        return None
+    return candidate
+
 
 def make_handler(root: str, tiles_root: str | None = None):
     project_root = os.path.dirname(os.path.abspath(root))
@@ -61,21 +95,41 @@ def make_handler(root: str, tiles_root: str | None = None):
             ".geojson": "application/geo+json",
         }
 
+        _status = None
+        _forbidden = False
+
         def __init__(self, *a, **kw):
             super().__init__(*a, directory=root, **kw)
+
+        def send_response(self, code, message=None):
+            self._status = code
+            super().send_response(code, message)
+
+        def _reject(self) -> str:
+            """Mark the request forbidden; send_head answers 403."""
+            self._forbidden = True
+            return os.path.join(tiles, "__forbidden__")
 
         def translate_path(self, path):
             p = urllib.parse.urlparse(path).path
             if p.startswith("/vendor/"):  # node_modules (@arcgis/core, leaflet)
                 rel = urllib.parse.unquote(p[len("/vendor/"):])
-                parts = [x for x in rel.split("/") if x not in ("", ".", "..")]
-                return os.path.join(project_root, "node_modules", *parts)
+                safe = safe_join(os.path.join(project_root, "node_modules"), *rel.split("/"))
+                return safe if safe is not None else self._reject()
             # Tile data lives in the platform's data root, UI pages in public/.
-            if p.startswith(("/terrarium/", "/hillshade/", "/arcgis/", "/tilejson")):
+            if p.startswith(TILE_PREFIXES):
                 rel = urllib.parse.unquote(p.lstrip("/"))
-                parts = [x for x in rel.split("/") if x not in ("", ".", "..")]
-                return os.path.join(tiles, *parts)
+                safe = safe_join(tiles, *rel.split("/"))
+                return safe if safe is not None else self._reject()
             return super().translate_path(p)
+
+        def send_head(self):
+            self._forbidden = False
+            self.translate_path(self.path)  # sets self._forbidden
+            if self._forbidden:
+                self.send_error(403, "Forbidden")
+                return None
+            return super().send_head()
 
         def _send_file(self, path: str, ctype: str):
             try:
@@ -231,32 +285,41 @@ def make_handler(root: str, tiles_root: str | None = None):
             # ArcGIS REST service metadata: .../ImageServer (?f=json|pjson ignored)
             m = re.fullmatch(r"/arcgis/rest/services/([^/]+)/ImageServer/?", path)
             if m:
-                self._send_file(
-                    os.path.join(tiles, "arcgis", "rest", "services", m.group(1), "ImageServer.json"),
-                    "application/json; charset=utf-8",
-                )
+                fpath = safe_join(tiles, "arcgis", "rest", "services", m.group(1),
+                                  "ImageServer.json")
+                if fpath is None:
+                    self.send_error(403, "Forbidden")
+                    return
+                self._send_file(fpath, "application/json; charset=utf-8")
                 return
 
             # ArcGIS REST tile op: .../ImageServer/tile/{level}/{row}/{col}
             m = re.fullmatch(r"/arcgis/rest/services/([^/]+)/ImageServer/tile/(\d+)/(\d+)/(\d+)", path)
             if m:
                 name, z, row, col = m.groups()
-                self._send_file(
-                    os.path.join(tiles, "arcgis", "rest", "services", name, "tile", z, row, col),
-                    "application/octet-stream",
-                )
+                fpath = safe_join(tiles, "arcgis", "rest", "services", name, "tile", z, row, col)
+                if fpath is None:
+                    self.send_error(403, "Forbidden")
+                    return
+                self._send_file(fpath, "application/octet-stream")
                 return
 
-            # everything else: plain static files (query strings ignored)
-            self.path = path
+            # everything else: plain static files (query strings ignored).
+            # Keep the path percent-encoded: translate_path decodes it exactly
+            # once (decoding here too would turn %252e%252e into "..").
+            self.path = parsed.path
             super().do_GET()
 
         def end_headers(self):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "*")
-            if "/tile/" in self.path or "/terrarium/" in self.path:
-                self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            # Cache only successful tile responses, and not forever: tiles get
+            # rebuilt. Errors/404s must never be cached (data may appear later).
+            if self._status == 200 and (
+                    "/tile/" in self.path or "/terrarium/" in self.path
+                    or "/hillshade/" in self.path):
+                self.send_header("Cache-Control", TILE_CACHE_CONTROL)
             super().end_headers()
 
         def do_OPTIONS(self):

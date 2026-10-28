@@ -11,11 +11,14 @@
     #wrap { display: flex; height: 100%; }
     #mapwrap { flex: 1; position: relative; background: #dfe3e8; }
     #map { position: absolute; inset: 0; }
+    #map.drawing { cursor: crosshair; }
     #busy { position: absolute; inset: 0; display: none; z-index: 1200;
             background: rgba(255,255,255,.72); backdrop-filter: blur(1px);
             flex-direction: column; align-items: center; justify-content: center;
             gap: 12px; font-size: 13px; color: #374151; }
     #busy.on { display: flex; }
+    #busytext { white-space: pre-line; text-align: center; max-width: 80%; }
+    #busytext .lost { color: #b45309; font-weight: 600; }
     .spinner { width: 30px; height: 30px; border-radius: 50%;
                border: 3px solid #c7d2fe; border-top-color: #2563eb;
                animation: spin 0.9s linear infinite; }
@@ -28,12 +31,19 @@
                color: #2563eb; background: #fff; border: 1px solid #bfdbfe;
                border-radius: 6px; cursor: pointer; }
     .linkbtn:hover { background: #eff6ff; }
+    .linkbtn:disabled { opacity: .6; cursor: progress; }
     .linkbtn.danger { color: #b91c1c; border-color: #fecaca; }
+    .linkbtn.on { color: #fff; background: #2563eb; border-color: #2563eb; }
     #phase { margin-top: 8px; font-size: 12px; color: #6b7280; min-height: 16px; }
     #banner { margin-top: 10px; padding: 10px 12px; border-radius: 8px;
               font-size: 13px; display: none; }
     #banner.ok { display: block; background: #dcfce7; color: #166534; }
     #banner.err { display: block; background: #fee2e2; color: #991b1b; }
+    #banner.warn { display: block; background: #fef3c7; color: #92400e; }
+    #banner.info { display: block; background: #eff6ff; color: #1e3a8a; }
+    .loaderr { margin-top: 6px; padding: 8px 10px; border-radius: 8px; font-size: 12px;
+               background: #fee2e2; color: #991b1b; }
+    .loading { color: #6b7280; font-size: 12px; padding: 4px 0; }
     #panel {
       width: 380px; overflow-y: auto; padding: 18px 20px;
       background: #fff; border-left: 1px solid #d5d9de;
@@ -57,8 +67,13 @@
       color: #fff; background: #2563eb; border: 0; border-radius: 8px; cursor: pointer;
     }
     button#go:disabled { background: #93a4bd; cursor: default; }
+    button#cancel { width: 100%; margin-top: 8px; padding: 8px; font: inherit; font-weight: 600;
+                    color: #b91c1c; background: #fff; border: 1px solid #fecaca; border-radius: 8px; cursor: pointer; }
+    button#cancel:disabled { opacity: .6; cursor: progress; }
     #est { margin-top: 10px; padding: 10px; background: #f6f8fa; border-radius: 8px; }
+    #est .over { color: #b91c1c; }
     #state { margin-top: 12px; font-weight: 600; }
+    #logmeta { font-size: 11px; color: #6b7280; margin-top: 6px; }
     #log {
       margin-top: 8px; max-height: 220px; overflow-y: auto; padding: 8px;
       background: #101418; color: #b7f5c8; border-radius: 8px;
@@ -74,7 +89,8 @@
     .maprow .cb { font-size: 11px; color: #6b7280; white-space: nowrap; }
     #areas { width: 100%; padding: 6px 8px; border: 1px solid #d5d9de;
              border-radius: 6px; font: inherit; background: #fff; }
-    .btnrow { display: flex; gap: 8px; }
+    .btnrow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    #drawhint { font-size: 11px; color: #6b7280; margin-top: 6px; }
     .modes { display: flex; gap: 6px; margin: 0 0 12px; }
     .modes button { flex: 1; padding: 7px 8px; font: inherit; font-weight: 600; cursor: pointer;
                     border: 1px solid #d5d9de; border-radius: 8px; background: #fff; color: #374151; }
@@ -86,7 +102,7 @@
   <div id="wrap">
     <div id="mapwrap">
       <div id="map"></div>
-      <div id="busy">
+      <div id="busy" role="status" aria-live="polite">
         <div class="spinner"></div>
         <div id="busytext">working…</div>
       </div>
@@ -97,8 +113,8 @@
         <button id="mode-imagery" type="button" data-mode="imagery">Imagery</button>
       </div>
       <h1 id="title">Fetch elevation data</h1>
-      <p class="sub" id="subtitle">Drag on the map to select the area. The platform downloads source DEM
-        tiles and builds the local terrain pyramids.</p>
+      <p class="sub" id="subtitle">Shift+drag on the map (or use “Draw box”) to select the area. The platform downloads
+        source DEM tiles and builds the local terrain pyramids.</p>
 
       <div class="maprow">
         <select id="basemap" title="basemap provider">
@@ -112,7 +128,8 @@
       </div>
 
       <h2>0 · Saved areas</h2>
-      <select id="areas"><option value="">— saved areas —</option></select>
+      <select id="areas"><option value="">loading saved areas…</option></select>
+      <div id="areaserr"></div>
       <div class="btnrow">
         <button id="savearea" class="linkbtn" type="button">save current area</button>
         <button id="delarea" class="linkbtn danger" type="button">delete selected</button>
@@ -120,21 +137,25 @@
       <div class="note">Every fetch saves its area + dataset metadata in the platform
         catalog; pick one here to reload its bbox and settings.</div>
 
-      <h2>1 · Area (drag on map)</h2>
-      <div class="grid">
+      <h2>1 · Area</h2>
+      <div class="btnrow">
+        <button id="drawbox" class="linkbtn" type="button" aria-pressed="false">▭ Draw box</button>
+        <span id="drawhint">mode: pan — drag moves the map; Shift+drag draws a box</span>
+      </div>
+      <div class="grid" style="margin-top: 8px">
         <div><small>min longitude °E (− = °W)</small><input id="minlon" type="number" step="0.01"></div>
         <div><small>min latitude °N (− = °S)</small><input id="minlat" type="number" step="0.01"></div>
         <div><small>max longitude °E</small><input id="maxlon" type="number" step="0.01"></div>
         <div><small>max latitude °N</small><input id="maxlat" type="number" step="0.01"></div>
       </div>
-      <div id="selection" class="selection">no area selected yet — drag on the map</div>
+      <div id="selection" class="selection">no area selected yet — Shift+drag on the map</div>
       <div class="btnrow">
         <button id="zoomsel" class="linkbtn" type="button">zoom map to selection</button>
         <button id="world" class="linkbtn" type="button" title="−180…180°, ±85.05° (Web-Mercator limit)">whole world</button>
       </div>
 
       <h2>2 · Provider</h2>
-      <div id="providers"></div>
+      <div id="providers"><div class="loading">loading providers…</div></div>
       <div class="note" id="providernote">FABDEM is <b>non-commercial</b> (CC BY-NC-SA). Use Copernicus for
         commercial products.</div>
 
@@ -148,9 +169,11 @@
 
       <div id="est"></div>
       <button id="go">Fetch &amp; build</button>
+      <button id="cancel" type="button" style="display:none">Cancel job</button>
       <div id="state"></div>
       <div id="phase"></div>
-      <div id="banner"></div>
+      <div id="banner" role="status" aria-live="polite"></div>
+      <div id="logmeta"></div>
       <pre id="log"></pre>
       <a class="button" id="service" href="#" style="display:none">Open dataset service →</a>
       <a class="button" id="tilejson" href="/tiles/terrain.json">Terrain tilejson</a>
@@ -161,45 +184,91 @@
   <script src="/vendor/leaflet/dist/leaflet.js"></script>
   <script>
     const $ = (id) => document.getElementById(id);
-    const map = L.map("map", { zoomControl: true }).setView([45.8, 6.9], 8);
-    let nameDirty = false, lastName = null, currentJobId = null;
-    let areasCache = [], providers = [], demProviders = [], imageryProviders = [];
+
+    // ---- small helpers -------------------------------------------------------
+    // Server/user strings (names, labels, errors) only ever reach the page as
+    // text nodes: h() never parses HTML.
+    function h(tag, props = {}, ...children) {
+      const node = document.createElement(tag);
+      for (const [key, value] of Object.entries(props)) {
+        if (value == null || value === false) continue;
+        if (key === "className") node.className = value;
+        else if (key === "text") node.textContent = String(value);
+        else if (key.startsWith("on") && typeof value === "function") node.addEventListener(key.slice(2), value);
+        else node.setAttribute(key, value === true ? "" : String(value));
+      }
+      for (const child of children.flat()) {
+        if (child == null || child === false) continue;
+        node.append(child instanceof Node ? child : String(child));
+      }
+      return node;
+    }
+    // Poll retry delay after n consecutive failures: 1.5, 3, 6, 12, 24, 30 s…
+    function backoffDelay(attempt) { return Math.min(30000, 1500 * 2 ** Math.min(Math.max(0, attempt), 20)); }
+    function fmtSecs(ms) {
+      const s = Math.max(0, Math.round((Number(ms) || 0) / 1000));
+      return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`;
+    }
+    function fmtNum(v, digits) { const n = Number(v); return Number.isFinite(n) ? n.toFixed(digits) : "?"; }
+    function bboxOk(b) {
+      return Array.isArray(b) && b.length >= 4
+        && b.slice(0, 4).every((v) => v !== null && v !== "" && Number.isFinite(Number(v)));
+    }
+    function setBanner(kind, text, action) {
+      const b = $("banner");
+      b.className = text ? kind : "";
+      b.replaceChildren();
+      if (!text) return;
+      b.append(text);
+      if (action) b.append(" ", h("button", { className: "linkbtn", type: "button", text: action.label, onclick: action.run }));
+    }
+    function loadError(container, message, retry) {
+      container.replaceChildren(h("div", { className: "loaderr" }, message, " ",
+        h("button", { className: "linkbtn", type: "button", text: "retry", onclick: retry })));
+    }
+
+    const map = L.map("map", { zoomControl: true, boxZoom: false }).setView([45.8, 6.9], 8);
+    let nameDirty = false, lastName = null;
+    let areasCache = [], providers = [];
+    const providerLists = { elevation: [], imagery: [] };
+    const providerErrors = { elevation: "", imagery: "" };
     let mode = "elevation";
     let imageryUnavailable = "";   // set when the running server has no imagery API
+    let jobBusy = false;
     const MODE_TEXT = {
       elevation: {
         title: "Fetch elevation data",
-        sub: "Drag on the map to select the area. The platform downloads source DEM tiles and builds the local terrain pyramids.",
+        sub: "Shift+drag on the map (or use “Draw box”) to select the area. The platform downloads source DEM tiles and builds the local terrain pyramids.",
         note: "FABDEM is <b>non-commercial</b> (CC BY-NC-SA). Use Copernicus for commercial products.",
         namehint: "dataset name (kept as its own service; picked up by the 3D viewer)",
         go: "Fetch & build", zooms: [0, 13], maxzoomMin: 6, maxzoomMax: 16,
       },
       imagery: {
         title: "Fetch imagery",
-        sub: "Drag on the map (or use “whole world”) to select the area. The platform downloads open XYZ imagery tiles into a local tile set served to all three viewers.",
+        sub: "Shift+drag on the map, use “Draw box”, or “whole world” to select the area. The platform downloads open XYZ imagery tiles into a local tile set served to all three viewers.",
         note: "Sentinel-2 cloudless 2016 is CC BY 4.0; NASA Blue Marble is public domain. Tiles are stored as delivered (JPEG), no re-encoding.",
-        namehint: "imagery set name (served at /tiles/imagery-sets/&lt;name&gt;; picked up by the viewers)",
+        namehint: "imagery set name (served at /tiles/imagery-sets/<name>; picked up by the viewers)",
         go: "Fetch imagery", zooms: [0, 1], maxzoomMin: 0, maxzoomMax: 15,
       },
     };
+    function goBlocked() { return mode === "imagery" && imageryUnavailable; }
     function setMode(next, keepFields) {
       mode = next;
       const t = MODE_TEXT[mode];
       document.querySelectorAll(".modes button").forEach((b) => b.classList.toggle("on", b.dataset.mode === mode));
       $("title").textContent = t.title;
       $("subtitle").textContent = t.sub;
-      $("providernote").innerHTML = t.note;
-      $("namehint").innerHTML = t.namehint;
+      $("providernote").innerHTML = t.note;   // static constant above, never server data
+      $("namehint").textContent = t.namehint;
       $("go").textContent = t.go;
       $("maxzoom").min = t.maxzoomMin; $("maxzoom").max = t.maxzoomMax;
       if (!keepFields) { $("minzoom").value = t.zooms[0]; $("maxzoom").value = t.zooms[1]; nameDirty = false; }
-      providers = mode === "imagery" ? imageryProviders : demProviders;
+      providers = providerLists[mode];
       renderProviders();
       updateEst();
-      const blocked = mode === "imagery" && imageryUnavailable;
-      $("go").disabled = Boolean(blocked);
-      $("banner").className = blocked ? "err" : "";
-      $("banner").textContent = blocked ? imageryUnavailable : "";
+      $("go").disabled = jobBusy || Boolean(goBlocked());
+      if (goBlocked()) setBanner("err", imageryUnavailable);
+      else if (imageryUnavailable && $("banner").textContent === imageryUnavailable) setBanner("", "");
     }
     document.querySelectorAll(".modes button").forEach((b) =>
       b.addEventListener("click", () => { if (b.dataset.mode !== mode) setMode(b.dataset.mode); }));
@@ -265,56 +334,121 @@
     setBase("esri_img");
 
     // ---- rectangle selection ----
-    let rect = null, dragging = false, startLL = null;
+    // Plain drag pans the map. A box is drawn only with Shift held or while
+    // the "Draw box" toggle is on (it switches back to pan after one box).
+    let rect = null, dragging = false, startLL = null, drawMode = false, dragBox = null;
     function setBBox(b) {
-      ["minlon", "minlat", "maxlon", "maxlat"].forEach((k, i) => ($(k).value = b[i].toFixed(4)));
+      ["minlon", "minlat", "maxlon", "maxlat"].forEach((k, i) => ($(k).value = fmtNum(b[i], 4)));
       updateEst();
     }
     function getBBox() {
-      return [+$("minlon").value, +$("minlat").value, +$("maxlon").value, +$("maxlat").value];
+      return ["minlon", "minlat", "maxlon", "maxlat"].map((k) => { const v = $(k).value; return v === "" ? NaN : +v; });
     }
     function drawRect(b) {
+      if (!b.every(Number.isFinite)) return;
       const bounds = [[b[1], b[0]], [b[3], b[2]]];
       if (rect) rect.setBounds(bounds);
       else rect = L.rectangle(bounds, { color: "#2563eb", weight: 2, fillOpacity: 0.12 }).addTo(map);
     }
+    function setDrawMode(on) {
+      drawMode = on;
+      const btn = $("drawbox");
+      btn.classList.toggle("on", on);
+      btn.setAttribute("aria-pressed", String(on));
+      btn.textContent = on ? "▭ Draw box (on)" : "▭ Draw box";
+      $("map").classList.toggle("drawing", on);
+      $("drawhint").textContent = on
+        ? "mode: draw — drag on the map to draw the area box"
+        : "mode: pan — drag moves the map; Shift+drag draws a box";
+      if (on) map.dragging.disable(); else if (!dragging) map.dragging.enable();
+    }
+    $("drawbox").addEventListener("click", () => setDrawMode(!drawMode));
     map.on("mousedown", (e) => {
+      const ev = e.originalEvent || {};
+      if (jobBusy || (ev.button != null && ev.button !== 0)) return;
+      if (!drawMode && !ev.shiftKey) return;     // plain drag: let Leaflet pan
       dragging = true; startLL = e.latlng; map.dragging.disable();
-      setBBox([startLL.lng, startLL.lat, startLL.lng, startLL.lat]);
+      dragBox = [startLL.lng, startLL.lat, startLL.lng, startLL.lat];
+      setBBox(dragBox);
     });
     map.on("mousemove", (e) => {
       if (!dragging) return;
-      const b = [Math.min(startLL.lng, e.latlng.lng), Math.min(startLL.lat, e.latlng.lat),
+      dragBox = [Math.min(startLL.lng, e.latlng.lng), Math.min(startLL.lat, e.latlng.lat),
                  Math.max(startLL.lng, e.latlng.lng), Math.max(startLL.lat, e.latlng.lat)];
-      setBBox(b); drawRect(b);
+      setBBox(dragBox); drawRect(dragBox);
     });
-    map.on("mouseup", (e) => {
-      dragging = false; map.dragging.enable();
-      const b = getBBox();
-      if (b[2] - b[0] < 0.01 || b[3] - b[1] < 0.01)
-        setBBox([e.latlng.lng - 0.1, e.latlng.lat - 0.1, e.latlng.lng + 0.1, e.latlng.lat + 0.1]);
-      drawRect(getBBox()); updateEst();
-    });
+    function endDrag() {
+      if (!dragging) return;                     // mouseup without our mousedown
+      dragging = false;
+      let b = dragBox || getBBox();
+      if (b[2] - b[0] < 0.01 || b[3] - b[1] < 0.01) {
+        // A click (no real drag): a 0.2° box around the point.
+        b = [startLL.lng - 0.1, startLL.lat - 0.1, startLL.lng + 0.1, startLL.lat + 0.1];
+      }
+      setBBox(b); drawRect(getBBox()); updateEst();
+      dragBox = null; startLL = null;
+      setDrawMode(false);                        // back to panning; re-enables dragging
+    }
+    map.on("mouseup", endDrag);
+    // A drag released outside the map never reaches Leaflet's mouseup.
+    document.addEventListener("mouseup", endDrag);
     ["minlon", "minlat", "maxlon", "maxlat"].forEach((id) =>
       $(id).addEventListener("change", () => { drawRect(getBBox()); updateEst(); }));
 
     // ---- providers (FABDEM is only offered when the engine can serve it) ----
     function renderProviders(selected) {
+      const box = $("providers");
+      if (providerErrors[mode]) {
+        loadError(box, `✗ could not load ${mode} providers: ${providerErrors[mode]}`, () => loadProviders(mode));
+        return;
+      }
+      if (!providers.length) {
+        box.replaceChildren(h("div", { className: "loading",
+          text: mode === "imagery" && imageryUnavailable ? "imagery is unavailable on this server" : "no providers reported by the server" }));
+        return;
+      }
       const firstAvailable = (providers.find((p) => p.available) || {}).id;
       const sel = (selected && providers.some((p) => p.id === selected)) ? selected
         : (firstAvailable || (mode === "imagery" ? "s2cloudless" : "copernicus"));
-      $("providers").innerHTML = providers.map((p) => `
-        <label class="radio ${p.id === sel ? "sel" : ""} ${p.available ? "" : "off"}">
-          <input type="radio" name="provider" value="${p.id}" ${p.id === sel ? "checked" : ""} ${p.available ? "" : "disabled"}>
-          <b>${p.label}</b><small>${p.license}${p.maxzoom != null ? ` · up to z${p.maxzoom}` : ""}</small>
-          ${p.available ? "" : `<small class="warn">unavailable — ${p.reason || "not installed"}</small>`}
-        </label>`).join("");
-      document.querySelectorAll("input[name=provider]").forEach((r) =>
-        r.addEventListener("change", () => { renderProviders(r.value); updateEst(); }));
+      box.replaceChildren(...providers.map((p) => {
+        const input = h("input", { type: "radio", name: "provider", value: p.id });
+        input.checked = p.id === sel;
+        input.disabled = !p.available || jobBusy;
+        input.addEventListener("change", () => { renderProviders(input.value); updateEst(); });
+        return h("label", { className: `radio ${p.id === sel ? "sel" : ""} ${p.available ? "" : "off"}` },
+          input,
+          h("b", { text: p.label ?? p.id }),
+          h("small", { text: `${p.license ?? ""}${p.maxzoom != null ? ` · up to z${p.maxzoom}` : ""}` }),
+          p.available ? null : h("small", { className: "warn", text: `unavailable — ${p.reason || "not installed"}` }));
+      }));
     }
     function selectedProvider() {
       const el = document.querySelector("input[name=provider]:checked");
       return el ? el.value : (mode === "imagery" ? "s2cloudless" : "copernicus");
+    }
+    async function loadProviders(kind) {
+      const path = kind === "imagery" ? "/api/imagery/providers" : "/api/fetch/providers";
+      if (kind === mode) $("providers").replaceChildren(h("div", { className: "loading", text: "loading providers…" }));
+      try {
+        const info = await api(path);
+        providerLists[kind] = Array.isArray(info.providers) ? info.providers : [];
+        providerErrors[kind] = "";
+        if (kind === "imagery") imageryUnavailable = "";
+      } catch (e) {
+        providerLists[kind] = [];
+        if (kind === "imagery" && e.status === 404) {
+          // The page is read from disk per request, but API routes load at
+          // server start: a server started before imagery support serves this
+          // page without the imagery endpoints.
+          providerErrors[kind] = "";
+          imageryUnavailable = `✗ imagery is unavailable on this server (${location.host}): `
+            + `it was started before imagery support was added. Stop it and start `
+            + `gis-data-platform/Run.bat again, then reload this page.`;
+        } else {
+          providerErrors[kind] = e.message;
+        }
+      }
+      if (kind === mode) setMode(mode, true);   // re-render providers, estimate and Go state
     }
 
     // ---- estimates ----
@@ -342,13 +476,13 @@
     }
     function updateSelection(b) {
       const el = $("selection");
-      const valid = b.every(isFinite) && b[2] > b[0] && b[3] > b[1]
+      const valid = b.every(Number.isFinite) && b[2] > b[0] && b[3] > b[1]
         && b[0] >= -180 && b[2] <= 180 && b[1] >= -90 && b[3] <= 90;
       if (!valid) {
         el.className = "selection bad";
-        el.textContent = b.every(isFinite)
+        el.textContent = b.every(Number.isFinite)
           ? "invalid area — check that min < max and lon is −180…180 / lat is −90…90"
-          : "no area selected yet — drag on the map or type coordinates";
+          : "no area selected yet — Shift+drag on the map or type coordinates";
         return false;
       }
       const [kmx, kmy] = kmSpan(b);
@@ -361,23 +495,30 @@
     }
     function updateEst() {
       const b = getBBox();
-      if (!updateSelection(b)) { $("est").textContent = ""; return; }
+      const est = $("est");
+      if (!updateSelection(b)) { est.replaceChildren(); return; }
       if (!nameDirty) $("name").value = autoName(b);
       const zmin = +$("minzoom").value, zmax = +$("maxzoom").value;
-      const deg = (Math.floor(b[2]) - Math.floor(b[0]) + 1) * (Math.floor(b[3]) - Math.floor(b[1]) + 1);
-      const tiles = tileCount(b, zmin, zmax);
-      if (mode === "imagery") {
-        const prov = providers.find((p) => p.id === selectedProvider());
-        const over = prov && zmax > prov.maxzoom ? `<br><span style="color:#b91c1c">max zoom exceeds provider limit z${prov.maxzoom}</span>` : "";
-        $("est").innerHTML = `<b>estimate</b><br>imagery tiles to download: ${tiles} (z${zmin}–${zmax})<br>`
-          + `download size: ~${Math.max(0.1, tiles * 0.02).toFixed(1)} MB (≈20 KB/tile JPEG)`
-          + (tiles > 50000 ? `<br><span style="color:#b91c1c">over the 50,000 tiles/job limit</span>` : "") + over;
+      if (!Number.isInteger(zmin) || !Number.isInteger(zmax) || zmin < 0 || zmax < zmin || zmax > 22) {
+        est.replaceChildren(h("span", { className: "over", text: "check the zoom range (whole numbers, min ≤ max)" }));
         return;
       }
-      $("est").innerHTML =
-        `<b>estimate</b><br>source tiles to download: ${deg} (1°×1°)<br>` +
-        `map tiles to build: ${tiles} ×2 pyramids ≈ ${((tiles * 0.22) ).toFixed(0)} MB<br>` +
-        `download size: ~${deg * 35} MB (Copernicus) / ~${deg * 30} MB (FABDEM)`;
+      const deg = (Math.floor(b[2]) - Math.floor(b[0]) + 1) * (Math.floor(b[3]) - Math.floor(b[1]) + 1);
+      const tiles = tileCount(b, zmin, zmax);
+      const lines = [h("b", { text: "estimate" })];
+      const line = (text, cls) => lines.push(h("br"), cls ? h("span", { className: cls, text }) : text);
+      if (mode === "imagery") {
+        const prov = providers.find((p) => p.id === selectedProvider());
+        line(`imagery tiles to download: ${tiles} (z${zmin}–${zmax})`);
+        line(`download size: ~${Math.max(0.1, tiles * 0.02).toFixed(1)} MB (≈20 KB/tile JPEG)`);
+        if (tiles > 50000) line("over the 50,000 tiles/job limit", "over");
+        if (prov && prov.maxzoom != null && zmax > prov.maxzoom) line(`max zoom exceeds provider limit z${prov.maxzoom}`, "over");
+      } else {
+        line(`source tiles to download: ${deg} (1°×1°)`);
+        line(`map tiles to build: ${tiles} ×2 pyramids ≈ ${(tiles * 0.22).toFixed(0)} MB`);
+        line(`download size: ~${deg * 35} MB (Copernicus) / ~${deg * 30} MB (FABDEM)`);
+      }
+      est.replaceChildren(...lines);
     }
     $("minzoom").addEventListener("change", updateEst);
     $("maxzoom").addEventListener("change", updateEst);
@@ -407,148 +548,323 @@
 
     // ---- saved areas (persisted in the platform catalog) ----
     async function loadAreas(selectId) {
+      const select = $("areas");
+      if (!areasCache.length) select.replaceChildren(new Option("loading saved areas…", ""));
       try {
         const data = await api("/api/areas");
-        areasCache = data.areas || [];
-        $("areas").innerHTML = `<option value="">— saved areas —</option>` + areasCache.map((a) =>
-          `<option value="${a.id}">${a.kind === "imagery" ? "🛰 " : "⛰ "}${a.name} · ${a.bbox.map((v) => v.toFixed(2)).join(", ")}</option>`).join("");
-        if (selectId) $("areas").value = selectId;
-      } catch (e) { /* non-fatal */ }
+        areasCache = Array.isArray(data.areas) ? data.areas : [];
+        $("areaserr").replaceChildren();
+        select.replaceChildren(new Option(areasCache.length ? "— saved areas —" : "— no saved areas yet —", ""),
+          ...areasCache.map((a) => {
+            const bbox = bboxOk(a.bbox) ? a.bbox.slice(0, 4).map((v) => fmtNum(v, 2)).join(", ") : "no valid bbox";
+            return new Option(`${a.kind === "imagery" ? "🛰 " : "⛰ "}${a.name ?? a.id} · ${bbox}`, a.id);
+          }));
+        if (selectId) select.value = selectId;
+      } catch (e) {
+        select.replaceChildren(new Option("— saved areas unavailable —", ""));
+        loadError($("areaserr"), `✗ could not load saved areas: ${e.message}`, () => loadAreas(selectId));
+      }
     }
     $("areas").addEventListener("change", () => {
       const area = areasCache.find((a) => a.id === $("areas").value);
       if (!area) return;
+      if (!bboxOk(area.bbox)) {
+        setBanner("err", `✗ saved area “${area.name ?? area.id}” has no valid bbox — it cannot be loaded`);
+        return;
+      }
+      const bbox = area.bbox.slice(0, 4).map(Number);
       const areaMode = area.kind === "imagery" ? "imagery" : "elevation";
       if (areaMode !== mode) setMode(areaMode, true);
       nameDirty = true;
-      $("name").value = area.name;
-      $("minzoom").value = area.minzoom;
-      $("maxzoom").value = area.maxzoom;
-      const radio = document.querySelector(`input[name=provider][value="${area.provider}"]`);
+      $("name").value = area.name ?? "";
+      if (area.minzoom != null) $("minzoom").value = area.minzoom;
+      if (area.maxzoom != null) $("maxzoom").value = area.maxzoom;
+      const radio = [...document.querySelectorAll("input[name=provider]")].find((r) => r.value === area.provider);
       if (radio && !radio.disabled) renderProviders(area.provider);
-      setBBox(area.bbox); drawRect(area.bbox);
-      map.fitBounds([[area.bbox[1], area.bbox[0]], [area.bbox[3], area.bbox[2]]], { padding: [30, 30] });
+      setBBox(bbox); drawRect(bbox);
+      map.fitBounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]], { padding: [30, 30] });
     });
+    async function withButtonBusy(btn, busyText, task) {
+      const label = btn.textContent;
+      btn.disabled = true; btn.textContent = busyText;
+      try { return await task(); } finally { btn.textContent = label; btn.disabled = btn.id === "delarea" && jobBusy; }
+    }
     $("savearea").addEventListener("click", async () => {
       const b = getBBox();
-      if (!updateSelection(b)) return;
-      try {
-        const area = await api("/api/areas", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            name: sanitizeName($("name").value), bbox: b,
-            provider: selectedProvider(),
-            minzoom: +$("minzoom").value, maxzoom: +$("maxzoom").value,
-          }),
-        });
-        await loadAreas(area.id);
-        $("banner").className = "ok";
-        $("banner").textContent = `✓ saved area “${area.name}” in the catalog`;
-      } catch (e) {
-        $("banner").className = "err";
-        $("banner").textContent = `✗ could not save: ${e.message}`;
-      }
+      if (!updateSelection(b)) { setBanner("err", "✗ select a valid area before saving"); return; }
+      const name = sanitizeName($("name").value);
+      setBanner("info", `saving area “${name}”…`);
+      await withButtonBusy($("savearea"), "saving…", async () => {
+        try {
+          const area = await api("/api/areas", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              name, bbox: b,
+              provider: selectedProvider(),
+              minzoom: +$("minzoom").value, maxzoom: +$("maxzoom").value,
+            }),
+          });
+          await loadAreas(area.id);
+          setBanner("ok", `✓ saved area “${area.name ?? name}” in the catalog`);
+        } catch (e) {
+          setBanner("err", `✗ could not save: ${e.message}`);
+        }
+      });
     });
     $("delarea").addEventListener("click", async () => {
       const id = $("areas").value;
-      if (!id) return;
-      try {
-        await api(`/api/areas/${id}`, { method: "DELETE" });
-        await loadAreas();
-        $("banner").className = "ok";
-        $("banner").textContent = "✓ area deleted";
-      } catch (e) {
-        $("banner").className = "err";
-        $("banner").textContent = `✗ could not delete: ${e.message}`;
-      }
+      if (!id) { setBanner("err", "✗ pick a saved area to delete first"); return; }
+      const area = areasCache.find((a) => a.id === id);
+      const label = (area && area.name) || id;
+      if (!confirm(`Delete saved area “${label}” from the catalog?`)) return;
+      setBanner("info", `deleting area “${label}”…`);
+      await withButtonBusy($("delarea"), "deleting…", async () => {
+        try {
+          await api(`/api/areas/${encodeURIComponent(id)}`, { method: "DELETE" });
+          await loadAreas();
+          setBanner("ok", `✓ area “${label}” deleted`);
+        } catch (e) {
+          setBanner("err", `✗ could not delete: ${e.message}`);
+        }
+      });
     });
 
-    // ---- job control ----
+    // ---- busy overlay ----
     function setBusy(on, text) {
+      jobBusy = on;
       $("busy").classList.toggle("on", on);
       if (text) $("busytext").textContent = text;
-      ["minlon", "minlat", "maxlon", "maxlat", "minzoom", "maxzoom",
-       "name", "basemap", "mode-elevation", "mode-imagery", "world"].forEach((id) => { const el = $(id); if (el) el.disabled = on; });
-      document.querySelectorAll("input[name=provider]").forEach((el) => { el.disabled = on; });
+      ["minlon", "minlat", "maxlon", "maxlat", "minzoom", "maxzoom", "name", "basemap",
+       "mode-elevation", "mode-imagery", "world", "drawbox", "areas", "delarea"].forEach((id) => { const el = $(id); if (el) el.disabled = on; });
+      document.querySelectorAll("input[name=provider]").forEach((el) => {
+        el.disabled = on || !(providers.find((p) => p.id === el.value) || {}).available;
+      });
+      if (on && drawMode) setDrawMode(false);
+      $("cancel").style.display = on && tracker.id ? "block" : "none";
     }
 
     function sanitizeName(s) {
       const n = (s || "").trim().replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "");
       return n || "local30m";
     }
-    async function api(path, opts) {
-      const r = await fetch(path, opts);
+    async function api(path, opts = {}, timeoutMs = 15000) {
+      const signal = typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(timeoutMs) : undefined;
+      let r;
+      try {
+        r = await fetch(path, { ...opts, signal });
+      } catch (e) {
+        const timedOut = e && (e.name === "TimeoutError" || e.name === "AbortError");
+        const err = new Error(timedOut ? `${path}: no answer after ${Math.round(timeoutMs / 1000)} s`
+                                       : `${path}: server unreachable (${e && e.message ? e.message : e})`);
+        err.network = true;
+        throw err;
+      }
       if (!r.ok) {
         let detail = `${path}: ${r.status}`;
-        try { const j = await r.json(); if (j.detail) detail = `${path}: ${j.detail}`; } catch (e) {}
-        throw new Error(detail);
+        try {
+          const j = await r.json();
+          if (j && j.detail) detail = `${path}: ${typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail)}`;
+        } catch (e) {}
+        const err = new Error(detail);
+        err.status = r.status;
+        throw err;
       }
       return r.json();
     }
+
+    // ---- job tracking: never gives up on a transient failure ----
+    const ACTIVE = new Set(["queued", "running"]);
+    const STATE_LABEL = {
+      queued: "queued…", running: "working…", done: "done ✓", error: "failed ✗",
+      cancelled: "cancelled ■", interrupted: "interrupted ⚠",
+    };
+    const tracker = { id: null, name: null, kind: "elevation", last: null, lastOkAt: 0,
+                      failures: 0, retryAt: 0, timer: null, ticker: null, cancelling: false };
+
+    function jobElapsedMs() {
+      const snap = tracker.last;
+      if (!snap) return 0;
+      const base = (Number(snap.elapsed) || 0) * 1000;
+      // Count on locally between polls so the timer never looks frozen.
+      return snap.state === "running" && tracker.lastOkAt ? base + (Date.now() - tracker.lastOkAt) : base;
+    }
+    function phaseText() {
+      const snap = tracker.last;
+      if (!snap) return "starting…";
+      const log = Array.isArray(snap.log) ? snap.log : [];
+      const last = log.length ? String(log[log.length - 1]) : "";
+      if (snap.state === "queued") return `queued — waiting to start · ${fmtSecs(jobElapsedMs())}`;
+      return `step: ${snap.step || "starting"}` + (last ? ` · ${last}` : "") + ` · ${fmtSecs(jobElapsedMs())}`;
+    }
+    function renderLive() {
+      if (!tracker.id) return;
+      const verb = tracker.kind === "imagery" ? "Fetching imagery" : "Fetching & building";
+      const lines = [`${verb}${tracker.name ? ` “${tracker.name}”` : ""}…`];
+      if (tracker.cancelling) lines.push("cancelling…");
+      lines.push(phaseText());
+      const box = $("busytext");
+      box.replaceChildren(lines.join("\n"));
+      if (tracker.failures) {
+        const since = tracker.lastOkAt ? `last update ${fmtSecs(Date.now() - tracker.lastOkAt)} ago` : "no update received yet";
+        const next = Math.max(0, tracker.retryAt - Date.now());
+        box.append("\n", h("span", { className: "lost",
+          text: `connection lost — retrying (${tracker.failures})… ${since} · next try in ${fmtSecs(next)}` }));
+        $("state").textContent = "connection lost — retrying";
+      }
+      $("phase").textContent = phaseText();
+    }
+    function stopTracking() {
+      clearTimeout(tracker.timer); clearInterval(tracker.ticker);
+      tracker.timer = null; tracker.ticker = null;
+      tracker.id = null; tracker.cancelling = false; tracker.failures = 0;
+      const btn = $("cancel");
+      btn.disabled = false; btn.textContent = "Cancel job"; btn.style.display = "none";
+    }
+    function startTracking(jobId, name, kind, snapshot) {
+      stopTracking();
+      tracker.id = jobId; tracker.name = name || null; tracker.kind = kind || "elevation";
+      tracker.last = snapshot || null; tracker.lastOkAt = snapshot ? Date.now() : 0;
+      setBusy(true);
+      $("go").disabled = true;
+      if (snapshot) renderJob(snapshot);
+      renderLive();
+      tracker.ticker = setInterval(renderLive, 1000);
+      pollJob(jobId);
+    }
     function renderJob(job) {
-      const label = { running: "working…", done: "done ✓", error: "failed ✗" }[job.state] || job.state;
-      $("state").textContent = label;
-      const last = (job.log || [])[job.log.length - 1] || "";
-      $("phase").textContent = job.state === "running"
-        ? `step: ${job.step || ""}` + (last ? ` · ${last}` : "") + ` · ${Math.round(job.elapsed || 0)}s`
-        : (job.state === "done"
-            ? `steps: ${(job.steps || []).map((s) => s.name).join(" → ")} · ${Math.round(job.elapsed || 0)}s`
-            : "");
-      $("log").textContent = (job.log || []).slice(-30).join("\n");
+      const log = Array.isArray(job.log) ? job.log : [];
+      $("state").textContent = STATE_LABEL[job.state] || String(job.state || "unknown");
+      const steps = Array.isArray(job.steps) ? job.steps.map((s) => s && s.name).filter(Boolean) : [];
+      if (!ACTIVE.has(job.state)) {
+        $("phase").textContent = (steps.length ? `steps: ${steps.join(" → ")} · ` : "") + fmtSecs((Number(job.elapsed) || 0) * 1000);
+      }
+      $("log").textContent = log.slice(-30).join("\n");
       $("log").scrollTop = $("log").scrollHeight;
-      $("go").disabled = job.state === "running";
-      const isImagery = job.kind === "imagery";
-      setBusy(job.state === "running", `${isImagery ? "Fetching imagery" : "Fetching & building"} ${lastName ? "“" + lastName + "”" : ""}…`);
-      if (job.state === "done" && isImagery) {
-        const r = job.result || {};
-        $("banner").className = "ok";
-        $("banner").textContent = `✓ done — ${r.tiles} imagery tiles (${((r.bytes || 0) / 1e6).toFixed(2)} MB; `
-          + `${r.downloaded} downloaded, ${r.skipped} kept) · set “${job.name}” is ready in the viewers`;
-        $("service").textContent = "Open imagery TileJSON →";
-        $("service").href = `/tiles/imagery-sets/${encodeURIComponent(job.name)}.json`;
+      const total = Number(job.log_total);
+      $("logmeta").textContent = Number.isFinite(total) && total > log.length
+        ? `log: last ${log.length} of ${total} lines` : "";
+    }
+    function finishJob(job) {
+      const trackedName = tracker.name;
+      stopTracking();
+      setBusy(false);
+      $("go").disabled = Boolean(goBlocked());
+      renderJob(job);
+      const r = job.result || {};
+      const name = job.name || trackedName || "";
+      $("service").style.display = "none";
+      if (job.state === "done") {
+        let text;
+        if (job.kind === "imagery") {
+          text = `done — ${r.tiles ?? "?"} imagery tiles (${fmtNum((Number(r.bytes) || 0) / 1e6, 2)} MB; `
+            + `${r.downloaded ?? "?"} downloaded, ${r.skipped ?? "?"} kept) · set “${name}” is ready in the viewers`;
+          $("service").textContent = "Open imagery TileJSON →";
+          $("service").href = `/tiles/imagery-sets/${encodeURIComponent(name)}.json`;
+        } else {
+          text = `done — ${r.tilesBuilt != null ? r.tilesBuilt + " tiles built" : "build finished"}`
+            + `${r.verified === true ? " · verified" : ""} · dataset “${name}” is ready`;
+          $("service").textContent = "Open dataset service →";
+          $("service").href = `/arcgis/rest/services/${encodeURIComponent(name)}/ImageServer`;
+        }
         $("service").style.display = "inline-block";
-      } else if (job.state === "done") {
-        const r = job.result || {};
-        const b = $("banner");
-        $("service").textContent = "Open dataset service →";
-        b.className = "ok";
-        b.textContent = `✓ done — ${r.tilesBuilt != null ? r.tilesBuilt + " tiles built" : "build finished"}`
-          + `${r.verified ? " · verified" : ""} · dataset “${job.name}” is ready`;
-        $("service").href = `/arcgis/rest/services/${encodeURIComponent(job.name)}/ImageServer`;
-        $("service").style.display = "inline-block";
+        if (job.warning || r.verified === false) {
+          setBanner("warn", `⚠ ${text} — with a warning: ${job.warning || "the verify step failed; the build is kept"}`);
+        } else {
+          setBanner("ok", `✓ ${text}`);
+        }
+      } else if (job.state === "error") {
+        setBanner("err", `✗ failed — ${job.error || "see log below"}`);
+      } else if (job.state === "cancelled") {
+        setBanner("warn", `■ cancelled — “${name}” was stopped. Tiles already written are kept; `
+          + `start the same area again to resume.`);
+      } else if (job.state === "interrupted") {
+        setBanner("warn", `⚠ interrupted — ${job.error || "the server restarted while this job was running. Start the same area again to resume."}`);
+      } else {
+        setBanner("warn", `job ended in state “${job.state}”`);
       }
-      if (job.state === "error") {
-        const b = $("banner");
-        b.className = "err";
-        b.textContent = `✗ failed — ${job.error || "see log below"}`;
-        $("service").style.display = "none";
-      }
+      if (job.areaId) loadAreas(job.areaId);
+    }
+    function jobLost() {
+      const name = tracker.name;
+      stopTracking();
+      setBusy(false);
+      $("go").disabled = Boolean(goBlocked());
+      $("state").textContent = "job state lost";
+      $("phase").textContent = "";
+      setBanner("err", `✗ job state lost (server restarted?) — the server no longer knows this job`
+        + `${name ? ` (“${name}”)` : ""}. Start the same area again to resume from the tiles already built.`);
     }
     async function pollJob(jobId) {
+      clearTimeout(tracker.timer);
+      if (tracker.id !== jobId) return;
       try {
-        const job = await api(`/api/jobs/${jobId}`);
-        renderJob(job);
-        if (job.state === "running") {
-          setTimeout(() => pollJob(jobId), 1500);
+        const job = await api(`/api/jobs/${encodeURIComponent(jobId)}?tail=30`);
+        if (tracker.id !== jobId) return;           // finished/superseded meanwhile
+        tracker.failures = 0; tracker.lastOkAt = Date.now(); tracker.last = job;
+        if (job.name) tracker.name = job.name;
+        if (job.kind) tracker.kind = job.kind;
+        if (ACTIVE.has(job.state)) {
+          renderJob(job); renderLive();
+          tracker.timer = setTimeout(() => pollJob(jobId), 1500);
         } else {
-          setBusy(false);
-          $("go").disabled = false;
-          if (job.areaId) loadAreas(job.areaId);
+          finishJob(job);
         }
       } catch (e) {
-        $("state").textContent = "server unreachable";
-        setBusy(false);
+        if (tracker.id !== jobId) return;
+        if (e.status === 404) { jobLost(); return; }
+        tracker.failures += 1;
+        const delay = backoffDelay(tracker.failures - 1);
+        tracker.retryAt = Date.now() + delay;
+        renderLive();
+        tracker.timer = setTimeout(() => pollJob(jobId), delay);
       }
     }
+    $("cancel").addEventListener("click", async () => {
+      const jobId = tracker.id;
+      if (!jobId || tracker.cancelling) return;
+      if (!confirm(`Cancel the running job${tracker.name ? ` “${tracker.name}”` : ""}?\n\n`
+        + "Tiles already written are kept; starting the same area again resumes.")) return;
+      const btn = $("cancel");
+      tracker.cancelling = true; btn.disabled = true; btn.textContent = "cancelling…";
+      renderLive();
+      try {
+        const job = await api(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });
+        if (tracker.id !== jobId) return;
+        tracker.last = job; tracker.lastOkAt = Date.now();
+        if (ACTIVE.has(job.state)) pollJob(jobId); else finishJob(job);
+      } catch (e) {
+        if (tracker.id !== jobId) return;
+        if (e.status === 404) { jobLost(); return; }
+        if (e.status === 409) { pollJob(jobId); return; }   // already finished: the poll shows how
+        tracker.cancelling = false; btn.disabled = false; btn.textContent = "Cancel job";
+        setBanner("err", `✗ could not cancel: ${e.message}`);
+        renderLive();
+      }
+    });
+    async function attachCurrentJob({ quietIfNone = true } = {}) {
+      try {
+        const job = await api("/api/jobs/current?tail=30");
+        if (job.kind === "imagery" && mode !== "imagery") setMode("imagery");
+        lastName = job.name || null;
+        if (ACTIVE.has(job.state)) startTracking(job.id, job.name, job.kind, job);
+        else finishJob(job);                         // shows the last result
+        return true;
+      } catch (e) {
+        if (e.status === 404) {
+          if (!quietIfNone) setBanner("warn", "no job is running on the server");
+          return false;
+        }
+        setBanner("err", `✗ could not read the job status: ${e.message}`,
+          { label: "retry", run: () => attachCurrentJob({ quietIfNone }) });
+        return false;
+      }
+    }
+
     $("go").addEventListener("click", async () => {
       const b = getBBox();
-      if (!updateSelection(b)) return;
-      if (mode === "imagery" && imageryUnavailable) {
-        $("banner").className = "err";
-        $("banner").textContent = imageryUnavailable;
-        return;
-      }
+      if (!updateSelection(b)) { setBanner("err", "✗ select a valid area first (Shift+drag on the map or type coordinates)"); return; }
+      if (goBlocked()) { setBanner("err", imageryUnavailable); return; }
       const body = {
         provider: selectedProvider(),
         bbox: b,
@@ -559,58 +875,47 @@
       };
       lastName = body.name;
       $("name").value = body.name;
-      $("banner").className = "";
+      setBanner("info", `starting “${body.name}”…`);
       $("service").style.display = "none";
       $("go").disabled = true;
       $("state").textContent = "starting…";
+      $("phase").textContent = "";
+      $("log").textContent = ""; $("logmeta").textContent = "";
+      $("busy").classList.add("on"); $("busytext").textContent = `starting “${body.name}”…`;
       try {
         const job = await api(mode === "imagery" ? "/api/imagery/jobs" : "/api/jobs", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
-        currentJobId = job.id;
+        setBanner("", "");
         if (job.areaId) loadAreas(job.areaId);
-        pollJob(job.id);
+        startTracking(job.id, job.name || body.name, job.kind || mode, ACTIVE.has(job.state) ? job : null);
       } catch (e) {
-        $("banner").className = "err";
-        $("banner").textContent = `✗ could not start: ${e.message}`;
-        $("state").textContent = "error: " + e.message;
-        $("go").disabled = false;
-        setBusy(false);
+        $("busy").classList.remove("on");
+        $("state").textContent = "not started";
+        $("go").disabled = Boolean(goBlocked());
+        setBanner("err", `✗ could not start: ${e.message}`,
+          e.status === 409 ? { label: "show running job", run: () => attachCurrentJob({ quietIfNone: false }) } : null);
       }
     });
 
     // ---- init ----
     (async () => {
-      try {
-        const info = await api("/api/fetch/providers");
-        demProviders = info.providers || [];
-      } catch (e) { /* rendered as empty list */ }
-      try {
-        const info = await api("/api/imagery/providers");
-        imageryProviders = info.providers || [];
-      } catch (e) {
-        // The page is read from disk per request, but API routes load at
-        // server start: a server started before imagery support serves this
-        // page without the imagery endpoints.
-        imageryUnavailable = `✗ imagery is unavailable on this server (${location.host}): `
-          + `it was started before imagery support was added. Stop it and start `
-          + `gis-data-platform/Run.bat again, then reload this page.`;
-      }
-      providers = demProviders;
-      renderProviders();
-      await loadAreas();
+      const t0 = Date.now();
+      setBusy(true);
+      const tick = () => { $("busytext").textContent = `Loading providers, saved areas and job status… ${fmtSecs(Date.now() - t0)}`; };
+      tick();
+      const initTicker = setInterval(tick, 1000);
       setBBox([6.6, 45.6, 7.2, 46.0]); drawRect(getBBox());
       try {
-        const st = await api("/api/status");
-        if (st.jobId) {
-          lastName = st.name;
-          if (st.kind === "imagery") setMode("imagery");
-          currentJobId = st.jobId;
-          pollJob(st.jobId);          // resumes a running job, or shows the last result
-        }
-      } catch (e) { /* server unreachable — page stays usable */ }
+        await Promise.all([loadProviders("elevation"), loadProviders("imagery"), loadAreas()]);
+      } finally {
+        clearInterval(initTicker);
+        setBusy(false);
+        setMode(mode, true);
+      }
+      await attachCurrentJob();   // resumes a running job, or shows the last result
     })();
   </script>
 </body>

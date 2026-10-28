@@ -4,3 +4,20 @@
 # Windows batch files MUST keep CRLF or cmd.exe cannot parse them
 *.bat text eol=crlf
 *.cmd text eol=crlf
+
+# Files executed/parsed inside Linux containers or by sh MUST keep LF
+# (a CRLF shebang/heredoc breaks them): shell scripts, Dockerfiles, nginx conf.
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.Dockerfile text eol=lf
+*.conf text eol=lf
+.dockerignore text eol=lf
+docker-compose*.yml text eol=lf
+
+# Binary assets
+*.png binary
+*.jpg binary
+*.tif binary
+*.tiff binary
+*.lerc binary
+*.zip binary
