@@ -48,7 +48,7 @@ BLEND_METERS = 600.0    # raw edge -> smoothed edge transition distance
 EARTH_CIRCUMFERENCE = 40075016.686
 # Bump when the served tile content changes for the same build (part of the
 # URL version token, so clients refetch).
-ALGORITHM_REVISION = 4
+ALGORITHM_REVISION = 5
 DEFAULT_MAXZOOM = 13
 MAX_LAT = 85.05112878
 # Hard cap on pixels allocated for one local field window (3x3 tiles is
@@ -140,8 +140,20 @@ def parse_meta(data: Any, key: tuple = ("parsed",)) -> _Meta:
         key=key,
         bounds=_parse_bounds(data.get("bounds")),
         maxzoom=DEFAULT_MAXZOOM if degenerate else _parse_maxzoom(data.get("maxzoom", DEFAULT_MAXZOOM)),
-        base=stat_min if stat_min is not None else 0.0,
+        base=base_height(stat_min, _number(stats.get("max"))),
     )
+
+
+def base_height(stat_min: float | None, stat_max: float | None) -> float:
+    """Height used for no-data inside coverage (open sea: Copernicus has no
+    ocean tiles) and as the flat level the edges fade to: sea level when the
+    dataset spans it, else the dataset minimum (an inland area keeps a plateau
+    instead of a cliff down to 0 m). Mirrors engine publish_tiles.base_height."""
+    if stat_min is None:
+        return 0.0
+    if stat_max is not None and stat_min <= 0.0 <= stat_max:
+        return 0.0
+    return stat_min
 
 
 class _ByteLRU:

@@ -204,3 +204,54 @@ def test_fix_tile_permissions_once(tmp_path, monkeypatch):
     assert stat.S_IMODE(f.stat().st_mode) == 0o644
     os.chmod(f, 0o600)
     assert main.fix_tile_permissions(data) == 0  # marker: runs once per volume
+
+
+def test_base_is_sea_level_when_dataset_spans_it(tmp_path, monkeypatch):
+    """Open sea (no Copernicus tiles) and the outer fade sit at 0 m, not at
+    the dataset minimum (e.g. -427 m at the Dead Sea for a Saudi build)."""
+    main = _load(tmp_path, monkeypatch)
+    pt = _publish_module()
+    _make_pyramid(main.TILE_DIR, pt, "webp")
+    (main.TILE_DIR / "tilejson.json").write_text(json.dumps({
+        "bounds": BOUNDS, "minzoom": 0, "maxzoom": MAXZOOM,
+        "statistics": {"min": -427.0, "max": 900.0}}), encoding="utf-8")
+    assert pt.base_height(-427.0, 900.0) == 0.0 and pt.base_height(400.0, 900.0) == 400.0
+    assert main.TERRAIN.meta().base == 0.0
+    version = pt.publish(str(main.TILE_DIR), workers=1, log=lambda *a, **k: None)
+    flat = _decode(main.TILE_DIR / "published" / version / "flat.webp")
+    assert np.allclose(flat, 0.0, atol=0.01)
+    assert np.allclose(_decode(main.TERRAIN.tile_png(3, 0, 0)), 0.0, atol=0.01)
+
+
+def test_hillshade_clipped_to_terrarium_nodata(tmp_path, monkeypatch):
+    """Legacy L hillshade paints no-data grey; publish must make it
+    transparent wherever the Terrarium tile is no-data."""
+    main = _load(tmp_path, monkeypatch)
+    pt = _publish_module()
+    _make_pyramid(main.TILE_DIR, pt, "webp")
+    version = pt.publish(str(main.TILE_DIR), workers=1, log=lambda *a, **k: None)
+    out = main.TILE_DIR / "published" / version / "hillshade" / str(MAXZOOM)
+    west, south, east, north = BOUNDS
+    fx0, fy0 = pt.global_px(west, north, MAXZOOM)
+    x, y = int(fx0 // 256) + 1, int(fy0 // 256) + 1      # the tile with the hole
+    la = np.asarray(Image.open(out / str(x) / f"{y}.png"))
+    assert (la[100:110, 100:110, 1] == 0).all() and la[50, 50, 1] == 255
+
+
+def test_republish_hard_links_unchanged_tiles(tmp_path, monkeypatch):
+    """A republish of an unchanged build reuses the previous version's files
+    (hard links): no second copy of the pyramid on disk."""
+    main = _load(tmp_path, monkeypatch)
+    pt = _publish_module()
+    _make_pyramid(main.TILE_DIR, pt, "png")       # legacy PNG: every tile is re-encoded
+    v1 = pt.publish(str(main.TILE_DIR), workers=1, log=lambda *a, **k: None)
+    import time as _t
+    _t.sleep(1.1)
+    v2 = pt.publish(str(main.TILE_DIR), workers=1, log=lambda *a, **k: None)
+    pub = main.TILE_DIR / "published"
+    files = [p for p in (pub / v2).rglob("*") if p.is_file() and p.parent != pub / v2]
+    assert files
+    assert all(p.stat().st_nlink >= 2 for p in files)
+    assert json.loads((pub / v2 / "meta.json").read_text())["counts"]["reused"] == len(files)
+    for p in files:
+        assert p.read_bytes() == (pub / v1 / p.relative_to(pub / v2)).read_bytes()

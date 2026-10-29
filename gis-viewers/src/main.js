@@ -227,6 +227,13 @@ async function selectItem(item) {
   renderCatalog(allItems());
   renderDetails(item);
   setMapMessage("");
+  // MapLibre/Cesium show the CURRENT published terrain build only (ArcGIS has
+  // one ImageServer per dataset): say so instead of showing an empty map.
+  const b = itemBounds(item), t = terrainBounds();
+  const outside = item?.kind !== "imagery" && b && t && (b[2] < t[0] || b[0] > t[2] || b[3] < t[1] || b[1] > t[3]);
+  for (const view of ["maplibre", "cesium"]) {
+    setMapMessage(outside ? `${itemName(item)} is outside the current terrain build - MapLibre/Cesium show only the last built area. Rebuild it on the /fetch/ page to view it here; the ArcGIS view has it.` : "", view);
+  }
   setBusyStatus(`${itemName(item)} selected · moving viewers`);
   const outcome = await syncViews();
   if (token !== selectionToken) return;   // superseded by a newer selection
@@ -312,6 +319,8 @@ function applyMapLibreImagery() {
   if (maplibre.getSource("satellite")) maplibre.removeSource("satellite");
   const set = selectedImagery;
   const url = imageryTemplate(set, platform);
+  // An imagery set may cover more than the elevation area: don't mask it.
+  if (maplibre.getLayer("outside-mask")) maplibre.setLayoutProperty("outside-mask", "visibility", url ? "none" : "visible");
   if (!url) return;
   maplibre.addSource("satellite", {
     type: "raster", tiles: [url], tileSize: 256,
@@ -376,40 +385,97 @@ function setArcGISElevation(url, {force = false} = {}) {
 // ---- viewer construction (each isolated: one failing viewer never blocks
 // the others or masquerades as "platform unavailable") ----------------------
 
+// ---- MapLibre relief styling ------------------------------------------------
+// Hypsometric tint computed on the GPU from the DEM itself (no extra tiles).
+// Absolute metres, so it works for any area. 0 m is open sea / water (the
+// published tiles put no-data sea at sea level); land starts just above it.
+const COLOR_RELIEF_LAYER = {id: "color-relief", type: "color-relief", source: "relief", paint: {
+  "color-relief-opacity": 0.85,
+  "color-relief-color": ["interpolate", ["linear"], ["elevation"],
+    -500, "#5d8fb5", 0, "#a9c8dc", 0.5, "#b9cf9f", 150, "#cfd8a6", 400, "#e6dcae",
+    800, "#e2c48f", 1200, "#cfa271", 1800, "#b07f55", 2500, "#8f6a4f",
+    3500, "#9b8f86", 4500, "#dedad5", 6000, "#ffffff"],
+}};
+// Client-side multidirectional hillshade (sharper and lighter-weight than the
+// server hillshade drape, which MapLibre no longer loads).
+const HILLSHADE_LAYER = {id: "relief", type: "hillshade", source: "relief", paint: {
+  "hillshade-method": "multidirectional",
+  // Light from fixed map directions, so tones don't shift when rotating.
+  "hillshade-illumination-anchor": "map",
+  "hillshade-illumination-direction": [270, 315, 0, 45],
+  "hillshade-illumination-altitude": [30, 30, 30, 30],
+  "hillshade-highlight-color": ["#fffaf0", "#fffaf0", "#fffaf0", "#fffaf0"],
+  "hillshade-shadow-color": ["#3d3022", "#3d3022", "#5a4a36", "#5a4a36"],
+  "hillshade-exaggeration": ["interpolate", ["linear"], ["zoom"], 3, 0.25, 8, 0.45, 12, 0.6],
+}};
+
+// Colour + shading only inside the build's coverage: outside it the published
+// terrain is a flat base (kept for the 3D edge fade) that would otherwise be
+// painted as a huge plain of land/sea colour.
+function reliefSource(terrain, maxzoom) {
+  const bounds = terrainBounds();
+  return {type: "raster-dem", tiles: terrain, tileSize: state.terrain?.tileSize || 256,
+          encoding: state.terrain?.encoding || "terrarium", maxzoom, ...(bounds ? {bounds} : {})};
+}
+
+// Everything outside the coverage rectangle is painted with the page
+// background: MapLibre loads whole tiles, so without this mask the flat base
+// around the area shows as a large sea/plain apron at low zoom.
+const MAP_BACKGROUND = "#e9e2d3";
+function outsideMask() {
+  const b = terrainBounds();
+  const world = [[-180, -85.06], [180, -85.06], [180, 85.06], [-180, 85.06], [-180, -85.06]];
+  const rings = [world];
+  if (b) rings.push([[b[0], b[1]], [b[0], b[3]], [b[2], b[3]], [b[2], b[1]], [b[0], b[1]]]);
+  return {type: "Feature", properties: {}, geometry: {type: "Polygon", coordinates: rings}};
+}
+const OUTSIDE_LAYER = {id: "outside-mask", type: "fill", source: "outside",
+  paint: {"fill-color": MAP_BACKGROUND, "fill-opacity": 1, "fill-antialias": false}};
+
+function resetMapLibreRelief(terrain) {
+  for (const id of [HILLSHADE_LAYER.id, COLOR_RELIEF_LAYER.id]) if (maplibre.getLayer(id)) maplibre.removeLayer(id);
+  if (maplibre.getSource("relief")) maplibre.removeSource("relief");
+  maplibre.addSource("relief", reliefSource(terrain, terrainMaxzoom()));
+  maplibre.addLayer(COLOR_RELIEF_LAYER, maplibre.getLayer("satellite") ? "satellite" : undefined);
+  maplibre.addLayer(HILLSHADE_LAYER, OUTSIDE_LAYER.id);
+  maplibre.getSource("outside")?.setData(outsideMask());
+}
+
 function createMapLibre() {
   const terrain = terrainTemplates();
-  const imagery = imageryTemplates();
   const maxzoom = terrainMaxzoom();
   const demSource = () => ({type: "raster-dem", tiles: terrain, tileSize: state.terrain?.tileSize || 256, encoding: state.terrain?.encoding || "terrarium", maxzoom});
   maplibre = new maplibregl.Map({
     container: "maplibre",
-    center: itemCenter(selectedItem), zoom: itemZoom(selectedItem), pitch: 42,
+    center: itemCenter(selectedItem), zoom: itemZoom(selectedItem), pitch: 55, maxPitch: 80,
+    // Sharper on HiDPI screens without over-fetching on 1x displays.
+    pixelRatio: Math.min(window.devicePixelRatio || 1, 2),
     style: {version: 8, sources: {
       terrain: demSource(),
-      // Separate DEM source for shading (MapLibre recommends not sharing the
-      // terrain source with a hillshade layer).
-      relief: demSource(),
-      imagery: {type: "raster", tiles: imagery, tileSize: 256, maxzoom},
-    }, layers: [
-      {id: "background", type: "background", paint: {"background-color": "#d9d2c3"}},
-      // Client-side hillshade only where it means something. Below ~z6 the
-      // DEM is one flat fill per tile, and MapLibre shades each tile against
-      // its own back-filled borders, so the whole world shows a patchwork grid
-      // of tones with banding. Fade it in from z6 to z8 instead.
-      {id: "relief", type: "hillshade", source: "relief", minzoom: 6, paint: {
-        "hillshade-exaggeration": ["interpolate", ["linear"], ["zoom"], 6, 0, 8, 0.6],
-        "hillshade-shadow-color": "#473b2b",
-        "hillshade-highlight-color": "#fffaf0", "hillshade-accent-color": "#8a7a62",
-        // Light from a fixed map direction, so tones don't shift when rotating.
-        "hillshade-illumination-anchor": "map",
-      }},
-      {id: "imagery", type: "raster", source: "imagery", paint: {"raster-opacity": 0.28}},
+      // Separate DEM source for shading/colour (MapLibre recommends not
+      // sharing the 3D terrain source with hillshade/colour-relief layers).
+      relief: reliefSource(terrain, maxzoom),
+      outside: {type: "geojson", data: outsideMask()},
+    },
+    // Atmosphere for pitched 3D views: horizon haze instead of a hard edge.
+    sky: {
+      "sky-color": "#9cc3e4", "horizon-color": "#e9e2d3", "fog-color": "#e9e2d3",
+      "sky-horizon-blend": 0.6, "horizon-fog-blend": 0.7,
+      "fog-ground-blend": ["interpolate", ["linear"], ["zoom"], 6, 0.9, 12, 0.3],
+      "atmosphere-blend": ["interpolate", ["linear"], ["zoom"], 3, 1, 9, 0],
+    },
+    layers: [
+      {id: "background", type: "background", paint: {"background-color": MAP_BACKGROUND}},
+      COLOR_RELIEF_LAYER,
+      HILLSHADE_LAYER,
+      OUTSIDE_LAYER,
     ]},
   });
   maplibre.addControl(new maplibregl.NavigationControl(), "top-right");
   if (import.meta.env.DEV) window.__viewers = Object.assign(window.__viewers || {}, {maplibre});
   maplibre.on("load", () => {
-    maplibre.setTerrain({source: "terrain", exaggeration: 1});
+    // Gentle vertical exaggeration: most of the data is low-relief desert.
+    maplibre.setTerrain({source: "terrain", exaggeration: 1.4});
     mapLibreReady = true;
     applyMapLibreImagery();
   });
@@ -566,9 +632,12 @@ function refreshTileSources() {
     try {
       if (terrainChanged) {
         maplibre.getSource("terrain")?.setTiles(terrain);
-        maplibre.getSource("relief")?.setTiles(terrain);
+        // New build/publish: tiles AND coverage bounds change (bounds can't
+        // be updated in place).
+        if (mapLibreReady) resetMapLibreRelief(terrain);
       }
-      if (imageryChanged) maplibre.getSource("imagery")?.setTiles(imagery);
+      // (MapLibre shades on the client; the server hillshade drape is only
+      // used by Cesium/ArcGIS.)
     } catch (error) {
       setMapMessage(`MapLibre could not refresh tile sources: ${formatError(error)}`, "maplibre");
     }

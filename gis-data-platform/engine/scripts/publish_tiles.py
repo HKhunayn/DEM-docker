@@ -52,7 +52,7 @@ EARTH_CIRCUMFERENCE = 40075016.686
 MAX_LAT = 85.05112878
 MAX_BLUR_RADIUS = 64
 FILL_MAX_PX = TILE - MAX_BLUR_RADIUS
-PUBLISH_REVISION = 1          # bump when published bytes change for the same build
+PUBLISH_REVISION = 2          # bump when published bytes change for the same build
 WEBP_KW = dict(format="WEBP", lossless=True, exact=True, method=1, quality=25)
 PROGRESS_EVERY = 4096
 FIELD_CACHE = 64
@@ -161,8 +161,14 @@ def read_meta(root: str) -> dict:
     maxzoom = data.get("maxzoom", 13)
     if isinstance(maxzoom, bool) or not isinstance(maxzoom, int) or not 0 <= maxzoom <= 24:
         raise ValueError(f"invalid maxzoom in tilejson: {maxzoom}")
-    return {"bounds": (west, south, east, north), "maxzoom": maxzoom, "base": base,
+    return {"bounds": (west, south, east, north), "maxzoom": maxzoom, "base": base_height(base, top),
             "minzoom": int(data.get("minzoom", 0) or 0), "statistics": {"min": base, "max": top}}
+
+
+def base_height(stat_min: float, stat_max: float) -> float:
+    """Sea level when the dataset spans it (open sea has no Copernicus
+    tiles), else the dataset minimum. Mirrors app/terrain.py base_height."""
+    return 0.0 if stat_min <= 0.0 <= stat_max else stat_min
 
 
 def coverage_rect(meta: dict, z: int) -> tuple[int, int, int, int]:
@@ -330,8 +336,29 @@ def link_or_copy(src: str, dst: str) -> None:
 _W: dict = {}
 
 
-def _init(root, out, meta):
-    _W.update(root=root, out=out, meta=meta, seam=Seamless(root, meta))
+def _init(root, out, meta, prev=None):
+    _W.update(root=root, out=out, meta=meta, seam=Seamless(root, meta), prev=prev, reused=0)
+
+
+def emit(dst: str, data: bytes) -> None:
+    """Write a published file - or hard-link the previous version's file when
+    it is byte-identical (republishing an unchanged area then costs almost no
+    disk: only tiles that really changed take new space)."""
+    prev = _W.get("prev")
+    if prev:
+        old = os.path.join(prev, os.path.relpath(dst, _W["out"]))
+        try:
+            if os.path.getsize(old) == len(data):
+                with open(old, "rb") as f:
+                    same = f.read() == data
+                if same:
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    os.link(old, dst)
+                    _W["reused"] += 1
+                    return
+        except OSError:
+            pass
+    write_file(dst, data)
 
 
 def _terrain_job(task):
@@ -340,6 +367,7 @@ def _terrain_job(task):
     root, out, meta, seam = _W["root"], _W["out"], _W["meta"], _W["seam"]
     gx0, gy0, gx1, gy1 = coverage_rect(meta, z)
     counts = {"linked": 0, "computed": 0, "flat": 0}
+    _W["reused"] = 0
     for x in range(x0, x1):
         dst = os.path.join(out, "terrain", str(z), str(x), f"{y}.webp")
         inside = (x * TILE >= gx0 and (x + 1) * TILE <= gx1 and y * TILE >= gy0 and (y + 1) * TILE <= gy1)
@@ -354,15 +382,16 @@ def _terrain_job(task):
                     link_or_copy(path, dst)
                     counts["linked"] += 1
                 else:
-                    write_file(dst, webp_bytes(Image.fromarray(np.ascontiguousarray(rgba[..., :3]), "RGB")))
+                    emit(dst, webp_bytes(Image.fromarray(np.ascontiguousarray(rgba[..., :3]), "RGB")))
                     counts["computed"] += 1
                 continue
         h = seam.heights(z, x, y)
         if h is None:
             counts["flat"] += 1  # nginx serves flat.webp
             continue
-        write_file(dst, webp_bytes(Image.fromarray(terrarium_rgb(h), "RGB")))
+        emit(dst, webp_bytes(Image.fromarray(terrarium_rgb(h), "RGB")))
         counts["computed"] += 1
+    counts["reused"] = _W["reused"]
     return counts
 
 
@@ -370,12 +399,20 @@ def _hillshade_job(task):
     z, y, x0, x1 = task
     root, out, meta = _W["root"], _W["out"], _W["meta"]
     n = 0
+    _W["reused"] = 0
     for x in range(x0, x1):
         src = os.path.join(root, "hillshade", str(z), str(x), f"{y}.png")
         if not os.path.exists(src):
             continue
         dst = os.path.join(out, "hillshade", str(z), str(x), f"{y}.png")
         alpha = coverage_alpha(meta, z, x, y)
+        # Clip to real data too: legacy (L) hillshade paints no-data (open
+        # sea, voids) opaque mid-grey, which drapes as grey blocks.
+        raw, _ = raw_tile_path(root, z, x, y)
+        rgba = load_rgba(raw) if raw else None
+        if rgba is None:
+            continue
+        alpha = np.minimum(alpha, rgba[..., 3])
         try:
             with Image.open(src) as im:
                 mode = im.mode
@@ -393,9 +430,9 @@ def _hillshade_job(task):
             continue
         buf = io.BytesIO()
         Image.fromarray(la, "LA").save(buf, format="PNG", compress_level=1)
-        write_file(dst, buf.getvalue())
+        emit(dst, buf.getvalue())
         n += 1
-    return {"hillshade": n}
+    return {"hillshade": n, "reused": _W["reused"]}
 
 
 def zoom_tasks(meta: dict, z: int, pad_px: float) -> list:
@@ -437,9 +474,18 @@ def publish(root: str, workers: int | None = None, keep: int = 2, log=print) -> 
 
     workers = workers or _default_workers()
     t0 = time.monotonic()
-    totals = {"linked": 0, "computed": 0, "flat": 0, "hillshade": 0}
+    totals = {"linked": 0, "computed": 0, "flat": 0, "hillshade": 0, "reused": 0}
+    prev = None
+    try:
+        with open(os.path.join(pub, "current.json"), encoding="utf-8") as f:
+            cand = os.path.join(pub, str(json.load(f).get("version", "")))
+        if os.path.isfile(os.path.join(cand, "meta.json")):
+            prev = cand
+            log(f"  dedupe against previous version {os.path.basename(prev)}", flush=True)
+    except (OSError, ValueError):
+        pass
     ctx = mp.get_context("fork") if hasattr(os, "fork") else mp.get_context()
-    with ctx.Pool(workers, initializer=_init, initargs=(root, staging, meta), maxtasksperchild=2000) as pool:
+    with ctx.Pool(workers, initializer=_init, initargs=(root, staging, meta, prev), maxtasksperchild=2000) as pool:
         for z in range(0, meta["maxzoom"] + 1):
             pad = FADE_METERS / meters_per_px(meta, z)
             tasks = zoom_tasks(meta, z, pad)
@@ -453,6 +499,7 @@ def publish(root: str, workers: int | None = None, keep: int = 2, log=print) -> 
                         f"({time.monotonic() - t0:.0f}s)", flush=True)
             for c in pool.imap_unordered(_hillshade_job, zoom_tasks(meta, z, 0), chunksize=4):
                 totals["hillshade"] += c["hillshade"]
+                totals["reused"] += c["reused"]
             log(f"  publish z{z} done: linked={totals['linked']} computed={totals['computed']} "
                 f"flat={totals['flat']} hillshade={totals['hillshade']} "
                 f"({time.monotonic() - t0:.0f}s)", flush=True)
