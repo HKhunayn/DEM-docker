@@ -6,9 +6,10 @@ already on disk are skipped unless --force is given (or the service dir's
 build_manifest.json does not match this engine/sources/params), and encoding
 runs in a memory-safe process pool (--workers).
 
-build_tiles.py --lerc-out writes the same pyramid in the same pass as the
-Terrarium/hillshade tiles (one reprojection per tile); this script is the
-standalone LERC-only builder.
+build_tiles.py --lerc-out writes the pyramid in the same pass as the
+Terrarium tiles (one reprojection per tile, on a grid with a 1-px apron that
+is cropped: build_tiles.REPROJECT_BUFFER); this script is the standalone
+LERC-only builder (no apron, so decimated low zooms can differ slightly).
 
 Output layout (served by scripts/serve.py):
   <out>/arcgis/rest/services/<name>/ImageServer.json      <- service metadata

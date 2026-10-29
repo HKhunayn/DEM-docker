@@ -1,8 +1,8 @@
 """Convert Copernicus/FABDEM DEM GeoTIFFs (1-degree COG tiles) into a
 Web-Mercator XYZ pyramid of Terrarium-encoded elevation tiles (lossless
-WebP by default, PNG with --terrain-format png) (plus, optionally, a
-hillshade pyramid and the ArcGIS LERC pyramid — all
-three from ONE reprojection per tile).
+WebP by default, PNG with --terrain-format png) (plus, optionally, the
+ArcGIS LERC pyramid — both from ONE reprojection per tile). No hillshade is
+built: MapLibre and Cesium shade the elevation tiles in the browser.
 
 WINDOWED, RESUMABLE, PARALLEL:
   * each output tile reads only its own footprint from the source COGs
@@ -18,7 +18,7 @@ WINDOWED, RESUMABLE, PARALLEL:
   * Terrarium tiles are LOSSLESS WebP ({z}/{x}/{y}.webp; exact=True keeps
     the RGB under transparent pixels): ~30% smaller and ~3x faster to encode
     than PNG level 6. Lossy WebP would corrupt the packed heights — never.
-  * PNGs (hillshade, --terrain-format png) use zlib level 1 and no
+  * PNGs (--terrain-format png) use zlib level 1 and no
     optimize=True: level 6 costs ~5x CPU for ~10% size, optimize ~10x CPU
     for ~3%.
   * every file is written atomically and world-readable (0644) so a
@@ -30,13 +30,10 @@ No-data pixels are transparent (alpha = 0) and decoded as noDataValue. Their
 RGB carries the nearest valid height, so clients that ignore alpha do not
 draw cliffs down to 0 m.
 
-Hillshade tiles are greyscale+alpha PNGs ('LA'): alpha 0 where the source
-has no data, 255 elsewhere.
-
 Usage:
   python build_tiles.py --src ../data/dem/*.tif \\
       --bbox 34.5 16.3 55.7 32.2 --minzoom 0 --maxzoom 13 --out ../tiles/terrarium \\
-      [--hillshade-out ../tiles/hillshade] [--lerc-out ../tiles --lerc-name local30m]
+      [--lerc-out ../tiles --lerc-name local30m]
 """
 
 import argparse
@@ -72,7 +69,10 @@ from pool_runner import PoolAborted, default_workers, describe_limits, run_pool 
 #       seamless hillshade, filled RGB under transparent pixels.
 #   3 = Terrarium as lossless WebP (default), hillshade 'LA' with transparent
 #       no-data, PNG zlib level 1, files written 0644.
-ENGINE_VERSION = 3
+#   4 = no hillshade pyramid any more (browsers shade the elevation tiles).
+#       Terrarium + Lerc pixels are unchanged: the 1-px reprojection apron
+#       the hillshade needed is kept (REPROJECT_BUFFER).
+ENGINE_VERSION = 4
 MANIFEST_NAME = "build_manifest.json"
 TERRAIN_FORMATS = ("webp", "png")
 DEFAULT_TERRAIN_FORMAT = "webp"
@@ -94,8 +94,11 @@ WGS84 = CRS.from_epsg(4326)
 READ_CAP = 1024           # max source pixels read per source per tile
 EDGE_PAD = 2.0 / TILE_PX  # fraction of tile extent read extra so bilinear
                           # resampling never hits the edge of a source window
-HS_BUFFER = 1             # extra pixels around a tile for seamless hillshade
-HS_AZIMUTH, HS_ALTITUDE = 315.0, 45.0
+# Every tile is reprojected on a grid extended by 1 px per side and then
+# cropped. It used to feed the (removed) hillshade gradient; it is kept so the
+# Terrarium and ArcGIS Lerc1 pixels stay byte-identical to engine v3 builds
+# (the apron widens the source read window, which changes decimated reads).
+REPROJECT_BUFFER = 1
 PART_MAX_AGE_S = 60       # *.part files older than this are leftovers
 
 
@@ -339,55 +342,6 @@ def fill_nodata(arr: np.ndarray) -> np.ndarray:
     return filled
 
 
-def _row_latitudes(y: int, z: int, rows: int, buffer: int) -> np.ndarray:
-    """Latitude (radians) of each pixel-row centre of a (buffered) tile."""
-    n = 2**z * TILE_PX
-    gy = y * TILE_PX - buffer + np.arange(rows) + 0.5
-    return 2 * np.arctan(np.exp(np.pi * (1 - 2 * gy / n))) - np.pi / 2
-
-
-def hillshade(arr: np.ndarray, cell_m, buffer: int = 0) -> Image.Image:
-    """ESRI-style hillshade (azimuth 315°, altitude 45°) -> 'LA' image
-    (grey + alpha).
-
-    cell_m is the GROUND cell size in metres: a scalar, or one value per row
-    (Web Mercator cell * cos(lat)). NODATA pixels are filled from the nearest
-    valid height before the gradient (no cliffs to 0 m), drawn mid-gray and
-    made transparent (alpha 0; alpha 255 elsewhere).
-    `buffer` pixels on each side feed the gradient and are then cropped, so
-    adjacent tiles shade seamlessly."""
-    valid = arr > NODATA + 1.0
-    z = fill_nodata(arr).astype(np.float64) if valid.any() else np.zeros(arr.shape)
-    cell = np.asarray(cell_m, np.float64)
-    if cell.ndim:
-        cell = cell.reshape(-1, 1)
-    gy, gx = np.gradient(z)
-    zx, zy = gx / cell, gy / cell
-    slope = np.arctan(np.hypot(zx, zy))
-    aspect = np.arctan2(-zx, zy)
-    zenith = np.radians(90.0 - HS_ALTITUDE)
-    az = np.radians(HS_AZIMUTH)
-    hs = (np.cos(zenith) * np.cos(slope)
-          + np.sin(zenith) * np.sin(slope) * np.cos(az - aspect))
-    hs = np.clip(hs, 0.0, 1.0)
-    out = (hs * 255).astype(np.uint8)
-    out[~valid] = 128
-    alpha = np.where(valid, 255, 0).astype(np.uint8)
-    if buffer:
-        out = out[buffer:-buffer, buffer:-buffer]
-        alpha = alpha[buffer:-buffer, buffer:-buffer]
-    return Image.merge("LA", (Image.fromarray(np.ascontiguousarray(out)),
-                              Image.fromarray(np.ascontiguousarray(alpha))))
-
-
-def tile_hillshade(dst: np.ndarray, x: int, y: int, z: int, buffer: int) -> Image.Image:
-    """Hillshade of a (buffered) build_tile() array with per-row ground cells."""
-    minx, _, maxx, _ = tile_merc_bounds(x, y, z)
-    merc_cell = (maxx - minx) / TILE_PX
-    lat = _row_latitudes(y, z, dst.shape[0], buffer)
-    return hillshade(dst, merc_cell * np.cos(lat), buffer)
-
-
 def encode_terrarium(arr: np.ndarray) -> Image.Image:
     h, w = arr.shape
     valid = arr > NODATA + 1.0
@@ -600,8 +554,6 @@ def terrarium_params(fmt: str = DEFAULT_TERRAIN_FORMAT) -> dict:
 
 
 TERRARIUM_PARAMS = terrarium_params(DEFAULT_TERRAIN_FORMAT)
-HILLSHADE_PARAMS = {"azimuth": HS_AZIMUTH, "altitude": HS_ALTITUDE,
-                    "cell": "ground", "buffer": HS_BUFFER, "mode": "LA"}
 
 
 def lerc_params(flavor: str, maxzerr: float) -> dict:
@@ -627,31 +579,28 @@ def lerc_tile_path(tile_root, z, x, y):
 
 
 def _tile_job(task):
-    """One tile -> Terrarium WebP/PNG (+ hillshade PNG + LERC blob) from a
-    single reprojection. task = (z, x, y, out_root, hs_root, force[, lerc[,
-    terrain_format]]); force is a bool or a (terrarium, hillshade, lerc)
-    tuple; lerc is None or (tile_root, flavor, maxzerr). Only a tile in the
-    requested terrain format counts as done (a legacy .png does not satisfy a
-    webp build)."""
-    z, x, y, out_root, hs_root, force = task[:6]
-    lerc = task[6] if len(task) > 6 else None
-    fmt = task[7] if len(task) > 7 else DEFAULT_TERRAIN_FORMAT
-    f_ter, f_hs, f_lerc = force if isinstance(force, tuple) else (force,) * 3
+    """One tile -> Terrarium WebP/PNG (+ LERC blob) from a single
+    reprojection. task = (z, x, y, out_root, force[, lerc[, terrain_format]]);
+    force is a bool or a (terrarium, lerc) tuple; lerc is None or (tile_root,
+    flavor, maxzerr). Only a tile in the requested terrain format counts as
+    done (a legacy .png does not satisfy a webp build)."""
+    z, x, y, out_root, force = task[:5]
+    lerc = task[5] if len(task) > 5 else None
+    fmt = task[6] if len(task) > 6 else DEFAULT_TERRAIN_FORMAT
+    f_ter, f_lerc = force if isinstance(force, tuple) else (force,) * 2
     terr_path = terrarium_tile_path(out_root, z, x, y, fmt)
-    hs_path = os.path.join(hs_root, str(z), str(x), f"{y}.png") if hs_root else None
     lerc_path = lerc_tile_path(lerc[0], z, x, y) if lerc else None
     need_ter = f_ter or not os.path.exists(terr_path)
-    need_hs = hs_path is not None and (f_hs or not os.path.exists(hs_path))
     need_lerc = lerc_path is not None and (
         f_lerc or not (os.path.exists(lerc_path) and os.path.getsize(lerc_path) > 0))
 
-    if not need_ter and not need_hs and not need_lerc:
+    if not need_ter and not need_lerc:
         heights = decode_terrarium(terr_path)
         if heights is not None:
             return "skip", _tile_stats(heights), 0
         need_ter = True  # truncated/corrupt tile -> rebuild it
 
-    buffer = HS_BUFFER if need_hs else 0
+    buffer = REPROJECT_BUFFER
     dst = build_tile(_IDX, x, y, z, buffer=buffer)
     if dst is None:
         return "empty", None, 0
@@ -659,8 +608,6 @@ def _tile_job(task):
     st = _tile_stats(inner)
     if need_ter:
         _write_terrarium(encode_terrarium(inner), terr_path, fmt)
-    if need_hs:
-        _write_png(tile_hillshade(dst, x, y, z, buffer), hs_path)
     if need_lerc:
         import build_lerc  # lazy: build_lerc imports this module
         blob = build_lerc.encode_blob(np.ascontiguousarray(inner), lerc[1], lerc[2])
@@ -701,8 +648,6 @@ def parse_args(argv=None):
                     default=DEFAULT_TERRAIN_FORMAT,
                     help="Terrarium tile format: lossless WebP {z}/{x}/{y}.webp "
                          "(default) or PNG {z}/{x}/{y}.png")
-    ap.add_argument("--hillshade-out", default=None,
-                    help="also write a grayscale hillshade pyramid, e.g. public/hillshade")
     ap.add_argument("--lerc-out", default=None,
                     help="also write the ArcGIS LERC ImageServer pyramid in the same "
                          "pass (like build_lerc.py --out), e.g. public")
@@ -752,10 +697,6 @@ def main(argv=None) -> int:
     products = {"ter": BuildManifest(args.out, "terrarium",
                                      terrarium_params(args.terrain_format), **common)}
     roots = [args.out]
-    if args.hillshade_out:
-        products["hs"] = BuildManifest(args.hillshade_out, "hillshade",
-                                       HILLSHADE_PARAMS, **common)
-        roots.append(args.hillshade_out)
     lerc = svc_root = None
     if args.lerc_out:
         import build_lerc
@@ -779,8 +720,8 @@ def main(argv=None) -> int:
         x0, y0, x1, y1 = tile_range(args.bbox, z)
         span = (x1 - x0 + 1) * (y1 - y0 + 1)
         force = tuple(products[k].force_zoom(z) if k in products else False
-                      for k in ("ter", "hs", "lerc"))
-        tasks = [(z, x, y, args.out, args.hillshade_out, force, lerc, args.terrain_format)
+                      for k in ("ter", "lerc"))
+        tasks = [(z, x, y, args.out, force, lerc, args.terrain_format)
                  for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
         c = {"w": 0, "s": 0, "e": 0, "f": 0, "l": 0, "min": gmin, "max": gmax}
 

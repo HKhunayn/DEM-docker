@@ -122,9 +122,7 @@
           <option value="esri_topo">Esri Topographic</option>
           <option value="osm">OpenStreetMap</option>
           <option value="opentopo">OpenTopoMap</option>
-          <option value="hillshade">Local hillshade (offline)</option>
         </select>
-        <label class="cb"><input type="checkbox" id="hsoverlay" checked> hillshade overlay</label>
       </div>
 
       <h2>0 · Saved areas</h2>
@@ -273,7 +271,7 @@
     document.querySelectorAll(".modes button").forEach((b) =>
       b.addEventListener("click", () => { if (b.dataset.mode !== mode) setMode(b.dataset.mode); }));
 
-    // ---- basemaps: online providers need internet; hillshade works offline ----
+    // ---- basemaps (online providers: need internet) ----
     const BASEMAPS = {
       esri_img: {
         label: "Esri World Imagery (satellite)",
@@ -299,38 +297,16 @@
         url: "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
         maxZoom: 17,
       },
-      hillshade: {
-        label: "Local hillshade (offline)",
-        attribution: "local DEM",
-        url: "/tiles/imagery/{z}/{x}/{y}.png",
-        maxZoom: 13,
-      },
     };
-    let baseLayer = null, hsLayer = null;
+    let baseLayer = null;
 
-    function addHsOverlay(on) {
-      if (hsLayer) { map.removeLayer(hsLayer); hsLayer = null; }
-      if (on) {
-        hsLayer = L.tileLayer("/tiles/imagery/{z}/{x}/{y}.png",
-          { maxZoom: 13, opacity: 0.5, attribution: "local DEM" });
-        hsLayer.addTo(map);
-      }
-    }
     function setBase(id) {
       if (baseLayer) map.removeLayer(baseLayer);
       const b = BASEMAPS[id];
       baseLayer = L.tileLayer(b.url, { maxZoom: b.maxZoom, attribution: b.attribution });
       baseLayer.addTo(map);
-      const cb = document.getElementById("hsoverlay");
-      if (id === "hillshade") {           // don't stack hillshade on hillshade
-        cb.checked = false;
-        addHsOverlay(false);
-      } else {
-        addHsOverlay(cb.checked);         // re-add so the overlay stays on top
-      }
     }
     document.getElementById("basemap").addEventListener("change", (e) => setBase(e.target.value));
-    document.getElementById("hsoverlay").addEventListener("change", (e) => addHsOverlay(e.target.checked));
     setBase("esri_img");
 
     // ---- rectangle selection ----

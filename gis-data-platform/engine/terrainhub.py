@@ -3,11 +3,14 @@ any ArcGIS client (plus MapLibre/deck.gl/QGIS via the Terrarium pyramid).
 
 Subcommands (all local, all open source):
   fetch    download Copernicus DEM COG tiles for a bbox (ESA open data)
-  build    DEM -> terrarium PNG pyramid + ArcGIS LERC ImageServer pyramid
+  build    DEM -> Terrarium (lossless WebP) pyramid + ArcGIS LERC ImageServer
+           pyramid (no hillshade: browsers shade the elevation tiles)
   verify   encoder round-trip + ground-truth checks
   serve    local server: ArcGIS REST elevation service + terrarium tiles
   publish  bake the current build into a static, seamless tile set
-           (data/tiles/published/<version>/) that nginx serves directly
+           (data/tiles/published/<version>/) that nginx serves directly. The
+           raw Terrarium tiles MOVE into it (single copy on disk; --keep-raw
+           keeps them) and only the new version is kept
   all      fetch + build + verify + publish in one go
 
 Examples:
@@ -136,6 +139,11 @@ def main() -> int:
         if c in ("build", "all"):
             sp.add_argument("--force", action="store_true",
                             help="rebuild tiles even when they already exist on disk")
+        if c in ("publish", "all"):
+            sp.add_argument("--keep-raw", action="store_true",
+                            help="keep the raw terrarium/ pyramid after publishing "
+                                 "(dev/tests; default: deleted, the published set "
+                                 "is the only copy)")
 
     sub.add_parser("status", parents=[common],
                    help="alias for `fetch --check`: show what is already downloaded")
@@ -199,11 +207,10 @@ def main() -> int:
         argv = ["--src", *srcs, "--bbox", *map(str, bb),
                 "--minzoom", str(args.minzoom), "--maxzoom", str(args.maxzoom)]
         force = ["--force"] if getattr(args, "force", False) else []
-        # one pass: each tile is reprojected once for Terrarium, hillshade
-        # and LERC (ImageServer.json written at the end, as build_lerc does)
+        # one pass: each tile is reprojected once for Terrarium and LERC
+        # (ImageServer.json written at the end, as build_lerc does)
         return run(build_tiles.main, argv + force + [
             "--out", f"{args.root}/terrarium",
-            "--hillshade-out", f"{args.root}/hillshade",
             "--lerc-out", args.root, "--lerc-name", args.name,
             "--provider", provider])
 
@@ -215,7 +222,8 @@ def main() -> int:
                                        "--maxzoom", str(args.maxzoom)])
 
     def publish():
-        return run(publish_tiles.main, ["--root", args.root])
+        keep = ["--keep-raw"] if getattr(args, "keep_raw", False) else []
+        return run(publish_tiles.main, ["--root", args.root] + keep)
 
     if args.cmd == "status":
         args.check = True

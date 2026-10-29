@@ -50,7 +50,7 @@ JOB = {
 }
 JOB_LOCK = threading.Lock()
 
-TILE_PREFIXES = ("/terrarium/", "/hillshade/", "/arcgis/", "/tilejson")
+TILE_PREFIXES = ("/terrarium/", "/arcgis/", "/tilejson")
 TILE_CACHE_CONTROL = "public, max-age=86400"
 
 
@@ -317,8 +317,7 @@ def make_handler(root: str, tiles_root: str | None = None):
             # Cache only successful tile responses, and not forever: tiles get
             # rebuilt. Errors/404s must never be cached (data may appear later).
             if self._status == 200 and (
-                    "/tile/" in self.path or "/terrarium/" in self.path
-                    or "/hillshade/" in self.path):
+                    "/tile/" in self.path or "/terrarium/" in self.path):
                 self.send_header("Cache-Control", TILE_CACHE_CONTROL)
             super().end_headers()
 
