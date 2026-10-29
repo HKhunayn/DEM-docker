@@ -24,9 +24,9 @@ viewer via `npm run dev`).
 
 Open:
 
-- viewer: `http://127.0.0.1:5173/`
-- fetch page: `http://127.0.0.1:5173/fetch/`
-- API docs: `http://127.0.0.1:8787/docs`
+- viewer: `http://127.0.0.1:3100/`
+- fetch page: `http://127.0.0.1:3100/fetch/`
+- API docs: `http://127.0.0.1:5000/docs`
 
 Useful commands are `./Run.sh down`, `./Run.sh logs`, and `./Run.sh build`
 (or the corresponding `Run.bat` command). Set `GIS_PLATFORM_PORT` and

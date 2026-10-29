@@ -25,8 +25,8 @@ env_value() {
   fi
   [ -n "$value" ] && printf '%s' "$value" || printf '%s' "$2"
 }
-API_PORT=$(env_value GIS_PLATFORM_PORT 8787)
-VIEWER_PORT=$(env_value GIS_VIEWER_PORT 5173)
+API_PORT=$(env_value GIS_PLATFORM_PORT 5000)
+VIEWER_PORT=$(env_value GIS_VIEWER_PORT 3100)
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "[ERROR] Docker with Compose was not found on PATH." >&2

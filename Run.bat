@@ -26,8 +26,8 @@ if not exist ".env" if exist ".env.example" copy /y ".env.example" ".env" >nul &
 
 rem --- host ports from .env (compose reads the same file). Resolved here, at
 rem     top level: %VAR% set inside a ( ) block is not visible in that block.
-set "API_PORT=8787"
-set "VIEWER_PORT=5173"
+set "API_PORT=5000"
+set "VIEWER_PORT=3100"
 if exist ".env" for /f "tokens=2 delims== " %%p in ('findstr /b /c:"GIS_PLATFORM_PORT=" .env 2^>nul') do set "API_PORT=%%p"
 if exist ".env" for /f "tokens=2 delims== " %%p in ('findstr /b /c:"GIS_VIEWER_PORT=" .env 2^>nul') do set "VIEWER_PORT=%%p"
 

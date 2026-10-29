@@ -41,7 +41,7 @@ services:
     expose:
       - "8787"
     ports:
-      - "${GIS_PLATFORM_PORT:-8787}:8787"
+      - "${GIS_PLATFORM_PORT:-5000}:8787"
     # Internal name used by the viewer's nginx reverse proxy.
     networks:
       - gis
@@ -69,7 +69,7 @@ services:
     volumes:
       - gis-data:/data:ro
     ports:
-      - "${GIS_VIEWER_PORT:-5173}:80"
+      - "${GIS_VIEWER_PORT:-3100}:80"
     networks:
       - gis
 
