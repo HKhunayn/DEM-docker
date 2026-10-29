@@ -46,6 +46,9 @@ from .config import (  # noqa: F401  (re-exported)
 log = logging.getLogger(__name__)
 
 STEPS = ("fetch", "build", "verify", "publish")
+# Rebuild only an area's ArcGIS LERC service: verify/publish work on the shared
+# Terrarium set, which a LERC-only build does not touch.
+LERC_ONLY_STEPS = ("fetch", "build")
 HISTORY_LIMIT = 20
 LOG_TAIL_LIMIT = 5000          # lines kept in memory per job (full log is on disk)
 DEFAULT_TAIL = 200
@@ -433,7 +436,13 @@ def start_job(
     minzoom: int = 0,
     maxzoom: int = 13,
     save_area: bool = True,
+    lerc_only: bool = False,
+    origin: str = "user",
 ) -> dict[str, Any]:
+    """Start fetch -> build -> verify -> publish for an area. ``lerc_only``
+    rebuilds just the area's ArcGIS LERC service (the published Terrarium set,
+    which holds a single area, stays as it is). ``origin`` records who asked
+    ("user" or "autobuild")."""
     global _CURRENT_ID
     catalog.check_area_provider(name, provider, kind="elevation")
     with _LOCK:
@@ -459,13 +468,15 @@ def start_job(
                 },
             )
         job = _new_job("elevation", name, provider, bbox, minzoom, maxzoom,
-                       area["id"] if area else None, STEPS)
+                       area["id"] if area else None, LERC_ONLY_STEPS if lerc_only else STEPS)
+        job["lercOnly"] = lerc_only
+        job["origin"] = origin
         _register(job)
         _CURRENT_ID = job["id"]
         snap = _snapshot(job)
         thread = threading.Thread(
             target=_run_job,
-            args=(job["id"], name, list(bbox), provider, minzoom, maxzoom),
+            args=(job["id"], name, list(bbox), provider, minzoom, maxzoom, lerc_only),
             daemon=True,
             name=f"job-{job['id'][:8]}",
         )
@@ -512,6 +523,7 @@ def _run_job(
     provider: str,
     minzoom: int,
     maxzoom: int,
+    lerc_only: bool = False,
 ) -> None:
     global _CURRENT_ID
     job = _JOBS[job_id]
@@ -532,7 +544,8 @@ def _run_job(
         threading.Thread(target=_watchdog, args=(job,), daemon=True).start()
         # Preserve the previous tilejson so a failed build doesn't corrupt it.
         tilejson_backup = tilejson_path.read_bytes() if tilejson_path.exists() else None
-        for entry, step in zip(job["steps"], STEPS):
+        for entry in job["steps"]:
+            step = entry["name"]
             if job["_abort"]:
                 break
             with _LOCK:
@@ -542,6 +555,8 @@ def _run_job(
             if step == "build":
                 build_started = True
             cmd = build_command(step, bbox, provider, minzoom, maxzoom, name)
+            if lerc_only and step == "build":
+                cmd.append("--lerc-only")
             proc = subprocess.Popen(
                 cmd,
                 cwd=str(ENGINE_ROOT),
@@ -619,6 +634,8 @@ def _run_job(
             warning = f"{note}; {warning}" if warning else note
         if outcome == "done":
             result = {**matches, "verified": verified_pass and verify_failed_rc is None}
+            if lerc_only:
+                result["lercOnly"] = True
     except BaseException as exc:  # noqa: BLE001
         outcome, result = "error", None
         error = f"{job.get('step')} step failed ({exc})"

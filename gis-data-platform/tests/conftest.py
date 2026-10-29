@@ -45,7 +45,7 @@ STUB_TERRAINHUB = textwrap.dedent(
 )
 
 # Modules that capture DATA_ROOT / ENGINE_ROOT at import time.
-PLATFORM_MODULES = ["app.config", "app.catalog", "app.imagery", "app.jobs", "app.fetch_api", "app.imagery_api"]
+PLATFORM_MODULES = ["app.config", "app.catalog", "app.imagery", "app.jobs", "app.autobuild", "app.fetch_api", "app.imagery_api"]
 
 
 @pytest.fixture()
@@ -78,6 +78,8 @@ def isolated_platform(tmp_path, monkeypatch, stub_engine):
     jobs, provider cache or lock file.
     """
     monkeypatch.setenv("GIS_DATA_ROOT", str(tmp_path / "data"))
+    # No automatic rebuild on app start-up in tests (test_autobuild drives it).
+    monkeypatch.setenv("GIS_AUTOBUILD", "0")
     monkeypatch.setenv("LEGACY_HEIGHTMAP_ROOT", str(tmp_path / "legacy"))
     monkeypatch.setenv("HEIGHTMAP_ENGINE_ROOT", str(stub_engine))
     monkeypatch.setenv("HEIGHTMAP_PYTHON", sys.executable)

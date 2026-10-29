@@ -127,3 +127,21 @@ How it works:
   publish a build that still has its raw tiles:
   `docker compose exec data-platform python /opt/heightmap-30m/terrainhub.py publish --bbox 0 0 1 1 --root /app/data/tiles`
   (bbox is ignored by publish; the build's tilejson defines the area).
+
+## Moving the data to another machine (automatic tiling)
+
+`docker-volume-tool.bat` exports a **TRUTH** backup (DEMs + catalog + jobs, no
+tiles) or a FULL one. After an import, just start the stack: on every start the
+platform compares the saved areas with the tiles on disk and builds whatever is
+missing or was made by an older engine, one job at a time:
+
+- the area of the published elevation set (the one MapLibre/Cesium show) gets a
+  full fetch/build/verify/publish when nothing valid is published;
+- every other area gets a LERC-only build of its ArcGIS ImageServer
+  (`terrainhub.py build --lerc-only`), which never replaces the published set.
+
+The DEMs are already in the volume, so nothing is downloaded. Progress: a banner
+in the viewer, the job list on `/fetch/`, or `GET /api/tiles/status`.
+`POST /api/tiles/rebuild-missing` runs the check again. Builds stop when the
+data disk has less than `GIS_AUTOBUILD_MIN_FREE_GB` (default 10) free;
+`GIS_AUTOBUILD=0` turns the start-up check off.

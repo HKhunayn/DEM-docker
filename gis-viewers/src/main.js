@@ -15,6 +15,7 @@ import {makePlatformTerrainProvider} from "./cesiumTerrain.js";
 import {ReliefImageryProvider} from "./cesiumRelief.js";
 import {COLOR_RELIEF_OPACITY, HILLSHADE, MAP_BACKGROUND, colorReliefExpression, hillshadeExaggerationExpression} from "./relief.js";
 import {formatElapsed, isAbortError, templatesKey, withTimeout} from "./uiHelpers.js";
+import {describeTiles, pollDelay, tilesSignature} from "./tilesStatus.js";
 import {GOTO_HINT, findCatalogItem, formatLatLon, normalizeText, parseCoordinates, parsePlaces, placeLabel, searchPlaces, zoomForPopulation} from "./goto.js";
 import {cleanCamera, fromArcgisZoom, fromCesiumPitch, parseCameraHash, rangeForZoom, throttle, toArcgisZoom, toCesiumPitch, verticalFov, withCameraHash, zoomForRange} from "./camera.js";
 
@@ -58,6 +59,7 @@ app.innerHTML = `
       <div id="arcgis" class="viewer hidden"></div>
       <div id="cesium" class="viewer hidden"></div>
       <div id="map-message" class="map-message hidden" role="alert"></div>
+      <div id="tiles-banner" class="tiles-banner hidden" role="status"></div>
       <button id="coords" class="coords hidden" type="button" title="Cursor position (lat, lon) - click to copy"></button>
     </section>
   </main>`;
@@ -1162,6 +1164,31 @@ async function loadPlatformState() {
   }
 }
 
+// ---- tile status: the platform builds missing tiles by itself (e.g. after a
+// volume import that carried only the DEMs); say so instead of an empty map,
+// and reload the viewers when new tiles go live.
+const tilesBanner = document.querySelector("#tiles-banner");
+let tilesSeen = null;
+let tilesTimer = null;
+
+async function pollTiles() {
+  clearTimeout(tilesTimer);
+  let status = null;
+  try {
+    status = await api.getJson("/api/tiles/status", "Tile status");
+  } catch { /* older platform or offline: no banner */ }
+  const banner = describeTiles(status);
+  tilesBanner.textContent = banner?.text || "";
+  tilesBanner.className = `tiles-banner ${banner?.kind || ""}${banner ? "" : " hidden"}`;
+  if (status) {
+    const signature = tilesSignature(status);
+    if (tilesSeen !== null && signature !== tilesSeen && !loading) loadPlatformState();
+    tilesSeen = signature;
+  }
+  tilesTimer = setTimeout(pollTiles, pollDelay(status));
+}
+
 document.querySelectorAll("header nav button").forEach((button) => button.addEventListener("click", () => setViewer(button.dataset.view)));
 reloadButton.addEventListener("click", loadPlatformState);
 await loadPlatformState();
+pollTiles();

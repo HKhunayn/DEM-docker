@@ -9,8 +9,8 @@ REM                docker-volume-tool.bat export full  VOLUME OUTDIR
 REM                docker-volume-tool.bat import FILE VOLUME [keeptiles]
 REM
 REM  TRUTH = everything in the volume EXCEPT tiles/  (DEM COGs, catalog,
-REM          sources, imagery, incoming, jobs). tiles/ is derived data and
-REM          is rebuilt from the DEMs, so it does not need to be copied.
+REM          sources, imagery, incoming, jobs). tiles/ is derived data: the
+REM          platform rebuilds it from the DEMs by itself on the next start.
 REM  FULL  = the whole volume including tiles/ (huge, millions of files).
 REM
 REM  Archives are plain .tar (no gzip): COGs and PNG tiles are already
@@ -195,7 +195,8 @@ if errorlevel 1 (
 )
 echo [OK] Export complete: %OUTDIR%\%FILE%
 if /i "%SCOPE%"=="truth" (
-    echo      tiles/ was not included - rebuild them on the target from the DEMs.
+    echo      tiles/ was not included - the platform rebuilds them from the DEMs
+    echo      by itself when the stack starts on the target machine.
 )
 goto DONE
 
@@ -315,13 +316,13 @@ if errorlevel 1 (
     goto FAIL
 )
 echo [OK] Import complete. Volume "%TARGET%" is ready.
-if /i "%BSCOPE%"=="truth" (
-    echo.
-    echo NEXT: tiles are not part of a TRUTH backup. Start the stack
-    echo       ^(docker compose up -d^) and re-run the area builds from the fetch
-    echo       page with the same bbox/zooms. The DEMs are already in the volume,
-    echo       so the fetch step skips the downloads and only the build runs.
-)
+echo.
+echo NEXT: start the stack ^(docker compose up -d, or Run.bat^). On start-up the
+echo       platform checks every saved area and builds the tiles that are
+echo       missing or were made by an older engine ^(a TRUTH backup has none^).
+echo       The DEMs are in the volume, so nothing is downloaded again.
+echo       Progress: the viewer shows a banner; details on the fetch page ^(/fetch/^)
+echo       or GET /api/tiles/status. A whole country takes about an hour.
 goto DONE
 
 

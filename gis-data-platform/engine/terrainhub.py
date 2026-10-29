@@ -139,6 +139,10 @@ def main() -> int:
         if c in ("build", "all"):
             sp.add_argument("--force", action="store_true",
                             help="rebuild tiles even when they already exist on disk")
+        if c == "build":
+            sp.add_argument("--lerc-only", action="store_true",
+                            help="rebuild only the ArcGIS LERC service of this area; the "
+                                 "published Terrarium set is left alone")
         if c in ("publish", "all"):
             sp.add_argument("--keep-raw", action="store_true",
                             help="keep the raw terrarium/ pyramid after publishing "
@@ -207,6 +211,8 @@ def main() -> int:
         argv = ["--src", *srcs, "--bbox", *map(str, bb),
                 "--minzoom", str(args.minzoom), "--maxzoom", str(args.maxzoom)]
         force = ["--force"] if getattr(args, "force", False) else []
+        if getattr(args, "lerc_only", False):
+            force.append("--no-terrarium")
         # one pass: each tile is reprojected once for Terrarium and LERC
         # (ImageServer.json written at the end, as build_lerc does)
         return run(build_tiles.main, argv + force + [

@@ -461,10 +461,16 @@ def sweep_parts(root: str, max_age_s: float = PART_MAX_AGE_S) -> int:
 # ---- build manifests (resume fingerprint) ----------------------------------
 
 def _has_tiles(out_dir: str) -> bool:
-    try:
-        return any(e.is_dir() and e.name.isdigit() for e in os.scandir(out_dir))
-    except OSError:
-        return False
+    """Tiles under out_dir: Terrarium keeps <z>/ in out_dir itself, an ArcGIS
+    service keeps them in out_dir/tile/<z>/ (missing that let LERC tiles from
+    an older engine survive every rebuild)."""
+    for root in (out_dir, os.path.join(out_dir, "tile")):
+        try:
+            if any(e.is_dir() and e.name.isdigit() for e in os.scandir(root)):
+                return True
+        except OSError:
+            pass
+    return False
 
 
 class BuildManifest:
@@ -583,18 +589,21 @@ def _tile_job(task):
     reprojection. task = (z, x, y, out_root, force[, lerc[, terrain_format]]);
     force is a bool or a (terrarium, lerc) tuple; lerc is None or (tile_root,
     flavor, maxzerr). Only a tile in the requested terrain format counts as
-    done (a legacy .png does not satisfy a webp build)."""
+    done (a legacy .png does not satisfy a webp build). out_root None = LERC
+    only (no Terrarium written or read)."""
     z, x, y, out_root, force = task[:5]
     lerc = task[5] if len(task) > 5 else None
     fmt = task[6] if len(task) > 6 else DEFAULT_TERRAIN_FORMAT
     f_ter, f_lerc = force if isinstance(force, tuple) else (force,) * 2
-    terr_path = terrarium_tile_path(out_root, z, x, y, fmt)
+    terr_path = terrarium_tile_path(out_root, z, x, y, fmt) if out_root else None
     lerc_path = lerc_tile_path(lerc[0], z, x, y) if lerc else None
-    need_ter = f_ter or not os.path.exists(terr_path)
+    need_ter = terr_path is not None and (f_ter or not os.path.exists(terr_path))
     need_lerc = lerc_path is not None and (
         f_lerc or not (os.path.exists(lerc_path) and os.path.getsize(lerc_path) > 0))
 
     if not need_ter and not need_lerc:
+        if terr_path is None:      # LERC-only: existing LERC tile kept
+            return "skip", None, 0
         heights = decode_terrarium(terr_path)
         if heights is not None:
             return "skip", _tile_stats(heights), 0
@@ -663,6 +672,9 @@ def parse_args(argv=None):
                     help="rebuild tiles even when they already exist on disk")
     ap.add_argument("--workers", type=int, default=0,
                     help="build processes (default: sized from memory)")
+    ap.add_argument("--no-terrarium", action="store_true",
+                    help="write only the LERC ImageServer pyramid (needs --lerc-out); "
+                         "the Terrarium pyramid and tilejson.json are left untouched")
     args = ap.parse_args(argv)
     try:
         args.bbox = list(validate_bbox(args.bbox))
@@ -670,6 +682,8 @@ def parse_args(argv=None):
         ap.error(str(e))
     if args.minzoom > args.maxzoom:
         ap.error(f"--minzoom {args.minzoom} > --maxzoom {args.maxzoom}")
+    if args.no_terrarium and not args.lerc_out:
+        ap.error("--no-terrarium needs --lerc-out")
     return args
 
 
@@ -694,9 +708,15 @@ def main(argv=None) -> int:
 
     common = dict(source_hash=src_hash, bbox=args.bbox, minzoom=args.minzoom,
                   maxzoom=args.maxzoom, user_force=args.force, log=_log)
-    products = {"ter": BuildManifest(args.out, "terrarium",
-                                     terrarium_params(args.terrain_format), **common)}
-    roots = [args.out]
+    terr_out = None if args.no_terrarium else args.out
+    products = {}
+    roots = []
+    if terr_out:
+        products["ter"] = BuildManifest(terr_out, "terrarium",
+                                        terrarium_params(args.terrain_format), **common)
+        roots.append(terr_out)
+    else:
+        _log("LERC only: the Terrarium pyramid is not touched")
     lerc = svc_root = None
     if args.lerc_out:
         import build_lerc
@@ -721,7 +741,7 @@ def main(argv=None) -> int:
         span = (x1 - x0 + 1) * (y1 - y0 + 1)
         force = tuple(products[k].force_zoom(z) if k in products else False
                       for k in ("ter", "lerc"))
-        tasks = [(z, x, y, args.out, force, lerc, args.terrain_format)
+        tasks = [(z, x, y, terr_out, force, lerc, args.terrain_format)
                  for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
         c = {"w": 0, "s": 0, "e": 0, "f": 0, "l": 0, "min": gmin, "max": gmax}
 
@@ -760,13 +780,17 @@ def main(argv=None) -> int:
         return 1
     # TileJSON metadata for the client (counts include resumed tiles)
     total = written_total + skipped_total
+    if not terr_out and overview and not (math.isfinite(gmin) and math.isfinite(gmax)):
+        # LERC-only resume that skipped every tile: range from the sources
+        gmin, gmax = overview["min"], overview["max"]
     if total == 0 or not (math.isfinite(gmin) and math.isfinite(gmax)):
         _log(f"ERROR: wrote {total} tiles, elevation range {gmin}..{gmax}. "
              f"The bbox probably does not intersect the source DEM footprint. "
              f"No tilejson.json written.")
         return 1
-    write_json_atomic(os.path.join(os.path.dirname(args.out.rstrip("/\\")), "tilejson.json"),
-                      _tilejson(args, gmin, gmax))
+    if terr_out:
+        write_json_atomic(os.path.join(os.path.dirname(args.out.rstrip("/\\")), "tilejson.json"),
+                          _tilejson(args, gmin, gmax))
     if lerc:
         import build_lerc
         # rounded like tilejson statistics (what build_lerc.py reads back)

@@ -328,3 +328,48 @@ def test_terrainhub_publish_keep_raw(tmp_path, capsys, sources, monkeypatch):
                                       "--root", root, "--keep-raw"])
     assert terrainhub.main() == 0
     assert sorted(str(p) for p in (tmp_path / "tiles" / "terrarium").rglob("*")) == raw
+
+
+def test_lerc_only_build_leaves_terrarium_alone(tmp_path, capsys, sources):
+    """--no-terrarium (terrainhub build --lerc-only) rebuilds an area's ArcGIS
+    service without touching the Terrarium pyramid / tilejson.json, so a
+    secondary area never replaces the published set."""
+    root = str(tmp_path)
+    rc, out = run_build(capsys, sources, root, "--lerc-out", root, "--lerc-name", "svc",
+                        "--flavor", "lerc2", "--no-terrarium")
+    assert rc == 0, out
+    assert "LERC only" in out
+    assert not os.path.exists(os.path.join(root, "terrarium"))
+    assert not os.path.exists(os.path.join(root, "tilejson.json"))
+    svc = build_lerc.service_root(root, "svc")
+    manifest = json.load(open(os.path.join(svc, bt.MANIFEST_NAME)))
+    assert manifest["complete"] and manifest["engine_version"] == bt.ENGINE_VERSION
+    meta = json.load(open(os.path.join(svc, "ImageServer.json")))
+    assert meta["minValues"][0] < meta["maxValues"][0]
+    n = sum(len(f) for _, _, f in os.walk(os.path.join(svc, "tile")))
+    assert n > 0
+    # resume: nothing left to write, stats come from the sources
+    rc, out = run_build(capsys, sources, root, "--lerc-out", root, "--lerc-name", "svc",
+                        "--flavor", "lerc2", "--no-terrarium")
+    assert rc == 0, out
+    assert "WROTE 0 LERC tiles" in out
+
+
+def test_no_terrarium_needs_lerc_out(sources, tmp_path):
+    with pytest.raises(SystemExit):
+        bt.parse_args(["--src", *sources, "--bbox", *BBOX, "--no-terrarium"])
+
+
+def test_lerc_tiles_without_manifest_are_rebuilt(tmp_path, capsys, sources):
+    """An ArcGIS service keeps its tiles in <svc>/tile/<z>/: tiles there from an
+    older engine (no build_manifest.json) must be rebuilt, not trusted."""
+    root = str(tmp_path)
+    args = ("--lerc-out", root, "--lerc-name", "svc", "--flavor", "lerc2", "--no-terrarium")
+    rc, out = run_build(capsys, sources, root, *args)
+    assert rc == 0, out
+    svc = build_lerc.service_root(root, "svc")
+    os.remove(os.path.join(svc, bt.MANIFEST_NAME))
+    rc, out = run_build(capsys, sources, root, *args)
+    assert rc == 0, out
+    assert "lerc: REBUILDING" in out and "no build_manifest.json" in out
+    assert "WROTE 0 LERC tiles" not in out

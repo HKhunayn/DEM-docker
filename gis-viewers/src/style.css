@@ -61,3 +61,9 @@ button:disabled, button:disabled:hover { opacity: .55; cursor: progress; backgro
 .coords { position: absolute; left: .6rem; bottom: .6rem; z-index: 15; padding: .25rem .55rem; border-radius: .35rem; border: 0; background: rgba(17, 28, 47, .82); color: #e8eef9; font: 600 .75rem/1.4 ui-monospace, SFMono-Regular, Consolas, monospace; cursor: copy; }
 .coords.hidden { display: none; }
 .attribution-note { font-size: .7rem; color: #8ea0bd; margin-top: .8rem; }
+
+/* automatic tile build banner (bottom of the map, above the cursor readout) */
+.tiles-banner { position: absolute; left: 1rem; right: 1rem; bottom: 2.6rem; z-index: 19; padding: .6rem .85rem; border-radius: .45rem; font-size: .82rem; line-height: 1.4; }
+.tiles-banner.info { background: rgba(14, 32, 58, .93); border: 1px solid #4f8cff; color: #dce8ff; }
+.tiles-banner.warning { background: rgba(48, 36, 10, .93); border: 1px solid #c99a2e; color: #ffe7b0; }
+.tiles-banner.hidden { display: none; }

@@ -62,7 +62,13 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     if os.environ.get("GIS_FIX_TILE_PERMS", "1") == "1":
         threading.Thread(target=fix_tile_permissions, args=(TILE_ROOT.parent,),
                          name="fix-tile-perms", daemon=True).start()
+    # Build whatever saved area has no (or stale) tiles, e.g. after importing
+    # a TRUTH backup that carries only the DEMs + catalog.
+    from . import autobuild
+    if autobuild.enabled():
+        autobuild.start(delay=float(os.environ.get("GIS_AUTOBUILD_DELAY_S", "5")))
     yield
+    autobuild.stop()
     # Terminate running engine subprocesses on shutdown, if the jobs module
     # provides a hook (getattr: older jobs modules don't have one).
     try:
@@ -152,6 +158,25 @@ def _tile_file(relative: str) -> Path | None:
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {"status": "ok", "service": "gis-data-platform", "version": app.version}
+
+
+@app.get("/api/tiles/status")
+def tiles_status() -> JSONResponse:
+    """Are the saved areas tiled? (published Terrarium set + each area's
+    ArcGIS LERC service) and the automatic rebuild's progress."""
+    from . import autobuild
+    response = JSONResponse(_finite(autobuild.status()))
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.post("/api/tiles/rebuild-missing", status_code=202)
+def tiles_rebuild_missing() -> dict[str, Any]:
+    """Queue builds for every saved area whose tiles are missing or stale."""
+    from . import autobuild
+    if not autobuild.start():
+        raise HTTPException(status_code=409, detail="the automatic rebuild is already running")
+    return {"started": True}
 
 
 @app.get("/api/catalog")
