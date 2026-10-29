@@ -24,9 +24,17 @@ viewer via `npm run dev`).
 
 Open:
 
-- viewer: `http://127.0.0.1:3100/`
-- fetch page: `http://127.0.0.1:3100/fetch/`
-- API docs: `http://127.0.0.1:5000/docs`
+- **platform (point your apps here): `http://<server-ip>:5000`**
+  - ArcGIS elevation: `http://<server-ip>:5000/arcgis/rest/services/<area>/ImageServer`
+  - Terrarium WebP TileJSON (MapLibre/Cesium/deck.gl): `http://<server-ip>:5000/tiles/terrain.json`
+  - API docs: `http://<server-ip>:5000/docs`, fetch page: `http://<server-ip>:5000/fetch/`
+- optional web viewer: `http://<server-ip>:3100/`
+
+Port 5000 is an nginx **gateway** in front of FastAPI: every tile file is sent
+by nginx straight from the data volume, everything else (REST API, ImageServer
+metadata/tilemap, jobs, fetch page, tiles not on disk) is proxied to FastAPI,
+which is no longer published on the host. The tile rules live once in
+`nginx/gis-tiles.conf` and are shared by the gateway and the viewer.
 
 Useful commands are `./Run.sh down`, `./Run.sh logs`, and `./Run.sh build`
 (or the corresponding `Run.bat` command). Set `GIS_PLATFORM_PORT` and
@@ -83,9 +91,12 @@ For production, put the API behind a reverse proxy and replace the local filesys
 
 ## Tile serving (static, nginx)
 
-Tiles are served by the viewer's **nginx straight from the data volume**
-(mounted read-only at `/data`); FastAPI only answers metadata, jobs and
-fallbacks. Measured on this host (oha, 50 concurrent, same 3,492 Riyadh tiles):
+Tiles are served by **nginx straight from the data volume** (mounted read-only
+at `/data`) on both the platform gateway (:5000) and the viewer (:3100);
+FastAPI only answers metadata, jobs and fallbacks. Through the :5000 gateway
+(oha, 50 concurrent, 3,000 z12 Saudi tiles): ArcGIS Lerc **149,659 req/s, p50
+0.22 ms**, WebP **149,444 req/s** - versus 631 req/s, p50 80 ms when FastAPI
+answered :5000 directly. Measured on this host (oha, 50 concurrent, same 3,492 Riyadh tiles):
 
 | Tile type | Before (FastAPI) | After (nginx static) |
 |---|---:|---:|
