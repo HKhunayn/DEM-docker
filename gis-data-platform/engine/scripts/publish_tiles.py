@@ -4,25 +4,33 @@ directly (no Python per request).
 Input  (<root> = data/tiles):
   tilejson.json                      bounds / maxzoom / statistics of the build
   terrarium/{z}/{x}/{y}.webp|.png    raw Terrarium pyramid (.webp preferred)
-  hillshade/{z}/{x}/{y}.png          hillshade (LA = baked alpha, or legacy L)
 
 Output (<root>/published/<version>/, swapped in atomically):
   terrain/{z}/{x}/{y}.webp   seamless Terrarium (lossless WebP): real heights
                              inside coverage, edge heights eased to a flat
                              base outside (no cliffs) - the exact algorithm
                              of app/terrain.py TerrainSource, baked once
-  hillshade/{z}/{x}/{y}.png  hillshade clipped to coverage with real alpha
   flat.webp                  base-height tile: nginx's fallback for every
                              terrain tile not written (beyond the fade)
-  transparent.png            nginx's fallback for missing hillshade tiles
   meta.json                  version, bounds, maxzoom, base
 and <root>/published/current.json -> the live version (written last).
+No hillshade: MapLibre and Cesium shade the elevation tiles in the browser.
 
-Interior tiles whose raw tile is already WebP with no transparent pixels are
-hard-linked (zero copy); everything else is computed. Older versions are
-deleted (keeping --keep, default 2, so open clients finish their session).
+SINGLE COPY ON DISK. Interior tiles whose raw tile is already WebP with no
+transparent pixels are hard-linked into the new version (zero copy);
+everything else is computed. Only after current.json points at the new
+version are
+  * all older published versions (and leftover .staging-* dirs) deleted
+    (--keep, default 1 = only the live version), and
+  * the raw pyramid deleted: terrarium/<z>/ dirs + terrarium/build_manifest.json
+    (so the next build is a clean full build) and any legacy hillshade/
+    pyramid. tilejson.json is kept (the API and publish meta read it).
+--keep-raw skips the raw deletion (dev/tests). A failed publish deletes
+nothing but its own staging dir. Publishing needs the raw pyramid: without it
+the script exits 2 and changes nothing (the live version keeps serving) -
+rebuild first.
 
-usage: publish_tiles.py --root data/tiles [--workers N] [--keep 2]
+usage: publish_tiles.py --root data/tiles [--workers N] [--keep 1] [--keep-raw]
 """
 from __future__ import annotations
 
@@ -52,7 +60,7 @@ EARTH_CIRCUMFERENCE = 40075016.686
 MAX_LAT = 85.05112878
 MAX_BLUR_RADIUS = 64
 FILL_MAX_PX = TILE - MAX_BLUR_RADIUS
-PUBLISH_REVISION = 2          # bump when published bytes change for the same build
+PUBLISH_REVISION = 3          # bump when published bytes change for the same build
 WEBP_KW = dict(format="WEBP", lossless=True, exact=True, method=1, quality=25)
 PROGRESS_EVERY = 4096
 FIELD_CACHE = 64
@@ -291,17 +299,6 @@ class Seamless:
         return (edge + (meta["base"] - edge) * ease).astype(np.float32)
 
 
-def coverage_alpha(meta: dict, z: int, x: int, y: int, inset_px: float = 3.0) -> np.ndarray:
-    west, south, east, north = meta["bounds"]
-    fx0, fy0 = global_px(west, north, z)
-    fx1, fy1 = global_px(east, south, z)
-    gx = x * TILE + np.arange(TILE) + 0.5
-    gy = y * TILE + np.arange(TILE) + 0.5
-    ix = (gx >= fx0 + inset_px) & (gx <= fx1 - inset_px)
-    iy = (gy >= fy0 + inset_px) & (gy <= fy1 - inset_px)
-    return np.where(iy[:, None] & ix[None, :], 255, 0).astype(np.uint8)
-
-
 # ---- file output -------------------------------------------------------------
 def write_file(path: str, data: bytes) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -395,46 +392,6 @@ def _terrain_job(task):
     return counts
 
 
-def _hillshade_job(task):
-    z, y, x0, x1 = task
-    root, out, meta = _W["root"], _W["out"], _W["meta"]
-    n = 0
-    _W["reused"] = 0
-    for x in range(x0, x1):
-        src = os.path.join(root, "hillshade", str(z), str(x), f"{y}.png")
-        if not os.path.exists(src):
-            continue
-        dst = os.path.join(out, "hillshade", str(z), str(x), f"{y}.png")
-        alpha = coverage_alpha(meta, z, x, y)
-        # Clip to real data too: legacy (L) hillshade paints no-data (open
-        # sea, voids) opaque mid-grey, which drapes as grey blocks.
-        raw, _ = raw_tile_path(root, z, x, y)
-        rgba = load_rgba(raw) if raw else None
-        if rgba is None:
-            continue
-        alpha = np.minimum(alpha, rgba[..., 3])
-        try:
-            with Image.open(src) as im:
-                mode = im.mode
-                if mode == "LA" and alpha.all():
-                    link_or_copy(src, dst)
-                    n += 1
-                    continue
-                la = np.asarray(im.convert("LA")).copy()
-        except (OSError, ValueError, SyntaxError):
-            continue
-        if mode != "LA":
-            la[..., 1] = 255
-        la[..., 1] = np.minimum(la[..., 1], alpha)
-        if not la[..., 1].any():
-            continue
-        buf = io.BytesIO()
-        Image.fromarray(la, "LA").save(buf, format="PNG", compress_level=1)
-        emit(dst, buf.getvalue())
-        n += 1
-    return {"hillshade": n, "reused": _W["reused"]}
-
-
 def zoom_tasks(meta: dict, z: int, pad_px: float) -> list:
     gx0, gy0, gx1, gy1 = coverage_rect(meta, z)
     n = 2 ** z
@@ -454,8 +411,69 @@ def _default_workers() -> int:
     return max(1, min(8, cpus))
 
 
-def publish(root: str, workers: int | None = None, keep: int = 2, log=print) -> str:
+class NoRawPyramid(ValueError):
+    """The raw Terrarium pyramid is absent (already published = moved into
+    published/, or never built): there is nothing to (re)publish."""
+
+
+def has_raw_pyramid(root: str) -> bool:
+    """True when <root>/terrarium holds at least one raw tile."""
+    raw = os.path.join(root, "terrarium")
+    try:
+        zooms = [e.path for e in os.scandir(raw) if e.is_dir() and e.name.isdigit()]
+    except OSError:
+        return False
+    for zdir in zooms:
+        for _dirpath, _dirs, files in os.walk(zdir):
+            if any(f.endswith((".webp", ".png")) for f in files):
+                return True
+    return False
+
+
+def _rmtree(path: str, log) -> None:
+    def report(_func, p, exc):
+        exc = exc[1] if isinstance(exc, tuple) else exc
+        log(f"  WARNING: could not delete {p}: {exc}", flush=True)
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=report)
+    else:
+        shutil.rmtree(path, onerror=report)
+
+
+def delete_raw(root: str, log=print) -> None:
+    """Drop the raw pyramid once its tiles live on in the published version:
+    the zoom dirs, the build resume manifest (it must not claim tiles that
+    are gone, so the next build is a clean full build) and leftover *.part
+    files - plus any legacy hillshade/ pyramid. tilejson.json stays."""
+    raw = os.path.join(root, "terrarium")
+    try:
+        entries = list(os.scandir(raw))
+    except OSError:
+        entries = []
+    for e in entries:
+        if e.is_dir(follow_symlinks=False) and e.name.isdigit():
+            _rmtree(e.path, log)
+        elif e.name == "build_manifest.json" or e.name.endswith(".part"):
+            try:
+                os.unlink(e.path)
+            except OSError as exc:
+                log(f"  WARNING: could not delete {e.path}: {exc}", flush=True)
+    legacy_hs = os.path.join(root, "hillshade")
+    if os.path.isdir(legacy_hs):
+        _rmtree(legacy_hs, log)
+        log("removed legacy hillshade/ pyramid (no longer built or served)", flush=True)
+    log(f"removed raw Terrarium pyramid {raw} (the published version is the only copy)",
+        flush=True)
+
+
+def publish(root: str, workers: int | None = None, keep: int = 1, log=print,
+            keep_raw: bool = False) -> str:
     meta = read_meta(root)
+    if not has_raw_pyramid(root):
+        raise NoRawPyramid(
+            f"no raw Terrarium pyramid under {os.path.join(root, 'terrarium')}: it was "
+            f"already published (moved into published/) or never built. Run a build "
+            f"first. Nothing was changed; the current published version keeps serving.")
     pub = os.path.join(root, "published")
     os.makedirs(pub, exist_ok=True)
     with open(os.path.join(root, "tilejson.json"), "rb") as f:
@@ -465,16 +483,48 @@ def publish(root: str, workers: int | None = None, keep: int = 2, log=print) -> 
     shutil.rmtree(staging, ignore_errors=True)
     os.makedirs(staging)
     os.chmod(staging, 0o755)
+    t0 = time.monotonic()
+    try:
+        totals = _publish_into(root, pub, staging, meta, workers, log)
+        info = {"version": version, "created": datetime.now(timezone.utc).isoformat(),
+                "bounds": list(meta["bounds"]), "minzoom": 0, "maxzoom": meta["maxzoom"],
+                "base": meta["base"], "statistics": meta["statistics"], "terrainFormat": "webp",
+                "encoding": "terrarium", "revision": PUBLISH_REVISION, "counts": totals}
+        write_file(os.path.join(staging, "meta.json"), json.dumps(info, indent=2).encode())
+        final = os.path.join(pub, version)
+        os.replace(staging, final)
+    except BaseException:
+        # failed publish: drop only our own partial output, delete nothing else
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    write_file(os.path.join(pub, "current.json"), json.dumps(info, indent=2).encode())
+    log(f"published {version}: {totals} in {time.monotonic() - t0:.0f}s -> {final}", flush=True)
 
+    # ---- only after the switch: retention + single copy of the elevation ----
+    keep = max(1, keep)
+    versions = sorted(d for d in os.listdir(pub)
+                      if os.path.isdir(os.path.join(pub, d)) and not d.startswith("."))
+    for old in versions[:-keep]:
+        if old != version:
+            _rmtree(os.path.join(pub, old), log)
+            log(f"removed old published version {old}", flush=True)
+    for d in os.listdir(pub):  # interrupted earlier publishes
+        if d.startswith(".staging-"):
+            _rmtree(os.path.join(pub, d), log)
+    if keep_raw:
+        log("--keep-raw: raw Terrarium pyramid kept", flush=True)
+    else:
+        delete_raw(root, log)
+    return version
+
+
+def _publish_into(root: str, pub: str, staging: str, meta: dict, workers, log) -> dict:
     flat = np.full((TILE, TILE), meta["base"], dtype=np.float32)
     write_file(os.path.join(staging, "flat.webp"), webp_bytes(Image.fromarray(terrarium_rgb(flat), "RGB")))
-    buf = io.BytesIO()
-    Image.new("LA", (TILE, TILE), (0, 0)).save(buf, format="PNG")
-    write_file(os.path.join(staging, "transparent.png"), buf.getvalue())
 
     workers = workers or _default_workers()
     t0 = time.monotonic()
-    totals = {"linked": 0, "computed": 0, "flat": 0, "hillshade": 0, "reused": 0}
+    totals = {"linked": 0, "computed": 0, "flat": 0, "reused": 0}
     prev = None
     try:
         with open(os.path.join(pub, "current.json"), encoding="utf-8") as f:
@@ -497,44 +547,25 @@ def publish(root: str, workers: int | None = None, keep: int = 2, log=print) -> 
                 if done % max(1, PROGRESS_EVERY // 64) == 0:
                     log(f"  publish z{z} terrain {done}/{len(tasks)} row-segments "
                         f"({time.monotonic() - t0:.0f}s)", flush=True)
-            for c in pool.imap_unordered(_hillshade_job, zoom_tasks(meta, z, 0), chunksize=4):
-                totals["hillshade"] += c["hillshade"]
-                totals["reused"] += c["reused"]
             log(f"  publish z{z} done: linked={totals['linked']} computed={totals['computed']} "
-                f"flat={totals['flat']} hillshade={totals['hillshade']} "
-                f"({time.monotonic() - t0:.0f}s)", flush=True)
-
-    info = {"version": version, "created": datetime.now(timezone.utc).isoformat(),
-            "bounds": list(meta["bounds"]), "minzoom": 0, "maxzoom": meta["maxzoom"],
-            "base": meta["base"], "statistics": meta["statistics"], "terrainFormat": "webp",
-            "encoding": "terrarium", "revision": PUBLISH_REVISION, "counts": totals}
-    write_file(os.path.join(staging, "meta.json"), json.dumps(info, indent=2).encode())
-    final = os.path.join(pub, version)
-    os.replace(staging, final)
-    write_file(os.path.join(pub, "current.json"), json.dumps(info, indent=2).encode())
-    log(f"published {version}: {totals} in {time.monotonic() - t0:.0f}s -> {final}", flush=True)
-
-    # retention: newest `keep` versions (by name = timestamp) incl. current
-    versions = sorted(d for d in os.listdir(pub)
-                      if os.path.isdir(os.path.join(pub, d)) and not d.startswith("."))
-    for old in versions[:-keep] if keep > 0 else []:
-        if old != version:
-            shutil.rmtree(os.path.join(pub, old), ignore_errors=True)
-            log(f"removed old published version {old}", flush=True)
-    for d in os.listdir(pub):  # interrupted earlier publishes
-        if d.startswith(".staging-") and d != f".staging-{version}":
-            shutil.rmtree(os.path.join(pub, d), ignore_errors=True)
-    return version
+                f"flat={totals['flat']} ({time.monotonic() - t0:.0f}s)", flush=True)
+    return totals
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", required=True, help="tile root (data/tiles)")
     ap.add_argument("--workers", type=int, default=None)
-    ap.add_argument("--keep", type=int, default=2, help="published versions to keep (>=1)")
+    ap.add_argument("--keep", type=int, default=1,
+                    help="published versions to keep (>=1; default 1 = only the live one)")
+    ap.add_argument("--keep-raw", action="store_true",
+                    help="do not delete the raw terrarium/ pyramid after publishing (dev/tests)")
     args = ap.parse_args(argv)
     try:
-        publish(args.root, args.workers, max(1, args.keep))
+        publish(args.root, args.workers, max(1, args.keep), keep_raw=args.keep_raw)
+    except NoRawPyramid as e:
+        print(f"publish REFUSED: {e}", file=sys.stderr)
+        return 2
     except (OSError, ValueError) as e:
         print(f"publish FAILED: {e}", file=sys.stderr)
         return 1

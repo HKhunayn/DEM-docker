@@ -112,20 +112,6 @@ def test_terrain_tiles_are_seamless_and_fade_to_base(tmp_path, monkeypatch):
     assert client.get("/tiles/terrain/11/0/0.png").status_code == 404  # above maxzoom -> over-zoom
 
 
-def test_hillshade_is_clipped_to_coverage_with_alpha(tmp_path, monkeypatch):
-    from PIL import Image
-    client, (x0, y0, x1, y1) = _legacy_terrain(tmp_path, monkeypatch, [10.0, 10.0, 10.2, 10.2], maxzoom=10)
-    import app.main as main
-    tx, ty = int(x0 // 256), int(y0 // 256)
-    tile_dir = main.TILE_DIR / "hillshade" / "10" / str(tx)
-    tile_dir.mkdir(parents=True, exist_ok=True)
-    Image.new("L", (256, 256), 0).save(tile_dir / f"{ty}.png")  # opaque greyscale, like the legacy build
-    rgba, _ = _decode_terrarium(client.get(f"/tiles/imagery/10/{tx}/{ty}.png").content)
-    cx, cy = int(x0 - tx * 256), int(y0 - ty * 256)
-    assert rgba[cy + 5, cx + 5, 3] == 255      # inside coverage: opaque
-    assert rgba[max(cy - 3, 0), max(cx - 3, 0), 3] == 0  # outside: transparent, not black
-
-
 def test_tilejson_urls_are_versioned_per_build(tmp_path, monkeypatch):
     import os
     import time
@@ -134,7 +120,7 @@ def test_tilejson_urls_are_versioned_per_build(tmp_path, monkeypatch):
     first = client.get("/tiles/terrain.json")
     assert first.headers["cache-control"] == "no-store"
     data = first.json()
-    assert "?v=" in data["tiles"][0] and "?v=" in data["imagery"][0]
+    assert "?v=" in data["tiles"][0] and "imagery" not in data
     meta = main.TILE_DIR / "tilejson.json"
     later = time.time() + 5
     os.utime(meta, (later, later))  # a new build rewrites tilejson.json
@@ -142,17 +128,13 @@ def test_tilejson_urls_are_versioned_per_build(tmp_path, monkeypatch):
     assert client.get(data["tiles"][0].replace("{z}/{x}/{y}", "10/0/0")).status_code == 200
 
 
-def test_imagery_ignores_tiles_outside_current_build(tmp_path, monkeypatch):
-    from PIL import Image
+def test_no_server_hillshade_routes(tmp_path, monkeypatch):
+    """Hillshade is computed in the browser now: no imagery key, no routes."""
     client, _ = _legacy_terrain(tmp_path, monkeypatch, [10.0, 10.0, 10.2, 10.2], maxzoom=10)
-    import app.main as main
-    stale = main.TILE_DIR / "hillshade" / "5" / "0"
-    stale.mkdir(parents=True, exist_ok=True)
-    Image.new("RGBA", (256, 256), (255, 0, 0, 255)).save(stale / "0.png")
-    response = client.get("/tiles/imagery/5/0/0.png")
-    assert response.status_code == 200
-    rgba, _ = _decode_terrarium(response.content)
-    assert rgba[..., 3].max() == 0 and rgba.shape[:2] == (256, 256)
+    data = client.get("/tiles/terrain.json").json()
+    assert "imagery" not in data and "hillshade" not in str(data)
+    assert client.get("/tiles/imagery/5/0/0.png").status_code == 404
+    assert client.get("/tiles/published/20260101T000000-0123abcd/hillshade/0/0/0.png").status_code == 404
 
 
 def test_repeated_fetch_refreshes_area_instead_of_duplicating(tmp_path, monkeypatch):

@@ -1,5 +1,5 @@
 """build_tiles core: multi-source merge, decimated-read placement, tile math,
-encoders, hillshade, atomic writes."""
+encoders, atomic writes (no hillshade any more)."""
 
 import io
 import os
@@ -158,42 +158,11 @@ def test_terrarium_all_nodata_tile_encodes():
     assert (np.asarray(im)[..., 3] == 0).all()
 
 
-def test_hillshade_buffer_is_seamless():
-    # a curved surface: one-sided edge gradients would differ from central ones
-    yy, xx = np.mgrid[0:262, 0:262].astype(np.float32)
-    surf = (0.02 * (xx - 100) ** 2 + 0.03 * (yy - 50) ** 2).astype(np.float32)
-    big = np.asarray(bt.hillshade(surf, 30.0))
-    tile = np.asarray(bt.hillshade(surf[2:260, 2:260], 30.0, buffer=1))
-    assert tile.shape == (256, 256, 2)          # 'LA': grey + alpha
-    assert np.array_equal(tile, big[3:259, 3:259])
-
-
-def test_hillshade_nodata_not_a_cliff():
-    arr = np.full((50, 50), 800.0, np.float32)
-    arr[20:30, 20:30] = bt.NODATA
-    im = bt.hillshade(arr, 30.0)
-    assert im.mode == "LA"
-    out = np.asarray(im)
-    flat = int(np.cos(np.radians(45.0)) * 255)
-    valid = arr > bt.NODATA + 1
-    assert (out[..., 0][valid] == flat).all()  # flat ground stays flat at the hole edge
-    assert (out[..., 0][~valid] == 128).all()
-    assert (out[..., 1][~valid] == 0).all() and (out[..., 1][valid] == 255).all()
-
-
-def test_hillshade_uses_ground_cell_size():
-    # at 60N the ground cell is half the Mercator cell: the same pixel steps
-    # must shade as twice the slope
-    z, y = 10, 300                               # some tile around 60-61N
-    lat = bt._row_latitudes(y, z, 258, 1)
-    assert 59 < np.degrees(lat).mean() < 62
-    merc_cell = 2 * bt.ORIGIN_SHIFT / 2**z / 256
-    ramp = np.tile(np.arange(258, dtype=np.float32) * 10.0, (258, 1))
-    got = np.asarray(bt.tile_hillshade(ramp, 0, y, z, 1)).astype(int)
-    ground = np.asarray(bt.hillshade(ramp, merc_cell * np.cos(lat), 1)).astype(int)
-    merc = np.asarray(bt.hillshade(ramp, merc_cell, 1)).astype(int)
-    assert np.array_equal(got, ground)
-    assert not np.array_equal(got, merc)
+def test_no_hillshade_left_in_engine():
+    assert not hasattr(bt, "hillshade") and not hasattr(bt, "tile_hillshade")
+    assert not hasattr(bt, "HILLSHADE_PARAMS")
+    assert "--hillshade-out" not in open(bt.__file__, encoding="utf-8").read()
+    assert bt.ENGINE_VERSION >= 4 and bt.REPROJECT_BUFFER == 1
 
 
 def test_build_tile_buffer_matches_unbuffered(pair):

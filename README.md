@@ -91,7 +91,6 @@ fallbacks. Measured on this host (oha, 50 concurrent, same 3,492 Riyadh tiles):
 |---|---:|---:|
 | Terrain (MapLibre/Cesium) | 82 req/s, p50 775 ms (dynamic PNG) | **134,301 req/s, p50 0.25 ms** (WebP) |
 | ArcGIS Lerc (ArcGIS/Cesium) | 646 req/s, p50 79 ms | **141,353 req/s, p50 0.24 ms** |
-| Hillshade drape | dynamic | **178,053 req/s** |
 
 How it works:
 
@@ -99,10 +98,21 @@ How it works:
   `publish` (`engine/scripts/publish_tiles.py`, also `terrainhub.py publish`)
   bakes the seamless edge fade that `/tiles/terrain` used to compute per
   request into `data/tiles/published/<version>/` (lossless WebP Terrarium +
-  coverage-clipped hillshade + `flat.webp`/`transparent.png` fallbacks) and
-  switches `published/current.json` atomically; the last 2 versions are kept.
+  `flat.webp` fallback) and switches `published/current.json` atomically.
+* **No server-side hillshade.** MapLibre and Cesium compute shading in the
+  browser from the elevation tiles; the build writes no hillshade pyramid and
+  the API has no hillshade routes / `imagery` key in `/tiles/terrain.json`.
+* **One copy of the elevation on disk.** Publish hard-links every fully-valid
+  raw tile into the new version and computes only the edge/no-data tiles.
+  After `current.json` points at the new version it deletes the raw pyramid
+  (`data/tiles/terrarium/<z>/` + `build_manifest.json`, so the next build is a
+  clean full build), every older published version (only ONE version is
+  kept) and any legacy `data/tiles/hillshade/`. `data/tiles/tilejson.json`
+  and the ArcGIS Lerc pyramid are kept. A failed publish deletes nothing;
+  `--keep-raw` keeps the raw pyramid (dev/tests).
 * `/tiles/terrain.json` advertises the published, versioned (immutable) URLs
-  when a published version exists, else the legacy dynamic route.
+  when a published version exists, else the legacy dynamic route. Clients
+  must re-read it after a new publish: the previous version's URLs are gone.
 * nginx serves `/tiles/published/...`, `/arcgis/rest/services/<name>/ImageServer/tile/...`
   and `/tiles/imagery-sets/...` from disk (`sendfile`), falling back to the API
   only for metadata, tilemaps, imagery over-zoom and misses.
@@ -111,6 +121,9 @@ How it works:
   non-root nginx can read it. On first start the API makes older 0600 tiles
   world-readable once (marker `data/.perms-world-readable-v1`;
   `GIS_FIX_TILE_PERMS=0` disables).
-* To (re)publish existing data without a rebuild:
+* Publishing consumes the raw pyramid, so a re-publish needs a rebuild
+  first: `terrainhub.py publish` without raw tiles exits non-zero with a
+  clear message and changes nothing (the live version keeps serving). To
+  publish a build that still has its raw tiles:
   `docker compose exec data-platform python /opt/heightmap-30m/terrainhub.py publish --bbox 0 0 1 1 --root /app/data/tiles`
   (bbox is ignored by publish; the build's tilejson defines the area).

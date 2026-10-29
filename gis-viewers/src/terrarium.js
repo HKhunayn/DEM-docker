@@ -1,4 +1,5 @@
 // Pure Terrarium decoding + a tiny LRU cache (no Cesium import, unit-tested).
+import {terrariumHeight} from "./relief.js";
 
 /**
  * Decode Terrarium RGBA pixels into heights (metres).
@@ -15,7 +16,7 @@ export function decodeTerrarium(rgba, count = rgba.length / 4, fallback = 0) {
   for (let i = 0; i < count; i += 1) {
     const p = i * 4;
     if (rgba[p + 3] === 0) { values[i] = Number.NaN; missing += 1; continue; }
-    const height = rgba[p] * 256 + rgba[p + 1] + rgba[p + 2] / 256 - 32768;
+    const height = terrariumHeight(rgba[p], rgba[p + 1], rgba[p + 2]);
     values[i] = height; sum += height; valid += 1;
   }
   if (missing) {

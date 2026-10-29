@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -27,7 +28,6 @@ def sources(tmp_path_factory):
 def run_build(capsys, sources, root, *extra, zooms=("8", "10")):
     rc = bt.main(["--src", *sources, "--bbox", *BBOX, "--minzoom", zooms[0],
                   "--maxzoom", zooms[1], "--out", os.path.join(root, "terrarium"),
-                  "--hillshade-out", os.path.join(root, "hillshade"),
                   "--workers", "1", *extra])
     return rc, capsys.readouterr().out
 
@@ -41,7 +41,7 @@ def test_build_writes_manifest_and_resumes(tmp_path, capsys, sources):
     rc, out = run_build(capsys, sources, root)
     assert rc == 0, out
     assert "written=0" not in zline(out, 10)
-    for d in ("terrarium", "hillshade"):
+    for d in ("terrarium",):
         m = json.load(open(os.path.join(root, d, bt.MANIFEST_NAME)))
         assert m["engine_version"] == bt.ENGINE_VERSION and m["complete"] is True
         assert m["source_hash"] == bt.source_fingerprint(sources)
@@ -49,6 +49,8 @@ def test_build_writes_manifest_and_resumes(tmp_path, capsys, sources):
     tj = json.load(open(os.path.join(root, "tilejson.json")))
     assert tj["bounds"] == [float(v) for v in BBOX]
     assert not list(tmp_path.rglob("*.part"))
+    assert not os.path.exists(os.path.join(root, "hillshade"))      # no hillshade output
+    assert not [p for p in tmp_path.rglob("*") if "hillshade" in p.name]
 
     # second run: everything resumed
     rc, out = run_build(capsys, sources, root)
@@ -62,7 +64,6 @@ def test_build_writes_manifest_and_resumes(tmp_path, capsys, sources):
     json.dump(m, open(mp, "w"))
     rc, out = run_build(capsys, sources, root)
     assert rc == 0 and "terrarium: REBUILDING" in out and "engine version" in out
-    assert "hillshade: REBUILDING" not in out
     assert "written=0" not in zline(out, 10)
     assert json.load(open(mp))["engine_version"] == bt.ENGINE_VERSION
 
@@ -91,7 +92,7 @@ def test_tiles_without_manifest_are_stale(tmp_path, capsys, sources):
 def test_interrupted_forced_rebuild_resumes_by_zoom(tmp_path, capsys, sources):
     root = str(tmp_path)
     assert run_build(capsys, sources, root)[0] == 0
-    for d in ("terrarium", "hillshade"):
+    for d in ("terrarium",):
         mp = os.path.join(root, d, bt.MANIFEST_NAME)
         m = json.load(open(mp))
         m["complete"] = False
@@ -108,8 +109,9 @@ def test_interrupted_forced_rebuild_resumes_by_zoom(tmp_path, capsys, sources):
 
 def test_single_pass_lerc_matches_standalone(tmp_path, capsys, sources):
     a, b = str(tmp_path / "a"), str(tmp_path / "b")
-    # no hillshade here: then the single pass reprojects exactly like the
-    # standalone builder (no 1-px buffer) and the blobs must be identical
+    # the single pass keeps the 1-px reprojection apron of engine v3 (it fed
+    # the removed hillshade), so its blobs are byte-identical to the v3
+    # production builds; the standalone builder reprojects without apron
     rc = bt.main(["--src", *sources, "--bbox", *BBOX, "--minzoom", "8", "--maxzoom", "10",
                   "--out", os.path.join(a, "terrarium"), "--workers", "1",
                   "--lerc-out", a, "--lerc-name", "svc", "--flavor", "lerc2"])
@@ -138,9 +140,17 @@ def test_single_pass_lerc_matches_standalone(tmp_path, capsys, sources):
     tb = sorted(p.relative_to(build_lerc.service_root(b, "svc"))
                 for p in (tmp_path / "b").rglob("tile/*/*/*"))
     assert ta == tb and ta
-    for rel in ta:
-        assert (open(os.path.join(svc, rel), "rb").read()
-                == open(os.path.join(build_lerc.service_root(b, "svc"), rel), "rb").read())
+    # every blob == encode(crop(reproject with 1-px apron)): the exact v3
+    # (hillshade-enabled) single-pass formula -> Lerc output unchanged
+    idx = bt.SourceIndex(sources)
+    try:
+        for rel in ta:
+            z, row, col = (int(v) for v in rel.parts[-3:])
+            dst = bt.build_tile(idx, col, row, z, buffer=1)
+            want = build_lerc.encode_blob(np.ascontiguousarray(dst[1:-1, 1:-1]), "lerc2", 0.01)
+            assert open(os.path.join(svc, rel), "rb").read() == want, rel
+    finally:
+        idx.close()
 
 
 def _lerc1enc_runs():
@@ -183,15 +193,15 @@ def test_lerc1_blob_errors_include_stderr_and_time_out(tmp_path, monkeypatch):
 
 
 def test_failing_tile_reported_and_exit_nonzero(tmp_path, capsys, sources, monkeypatch):
-    # make the tile's hillshade write fail: the build must finish, list the
+    # make the tile's Terrarium write fail: the build must finish, list the
     # failure, write no tilejson and return 1
     root = str(tmp_path)
     rc, out = run_build(capsys, sources, root, "--workers", "1", zooms=("8", "8"))
     assert rc == 0
     os.remove(os.path.join(root, "tilejson.json"))
-    hs8 = os.path.join(root, "hillshade", "8")
-    shutil.rmtree(hs8)
-    with open(hs8, "w") as f:      # a FILE where the zoom dir should be
+    t8 = os.path.join(root, "terrarium", "8")
+    shutil.rmtree(t8)
+    with open(t8, "w") as f:       # a FILE where the zoom dir should be
         f.write("x")
     rc, out = run_build(capsys, sources, root, zooms=("8", "8"))
     assert rc == 1
@@ -268,3 +278,53 @@ def test_files_in_bbox_keeps_low_zoom_neighbours():
     assert terrainhub.files_in_bbox(files, terrainhub.build_cover(bb, 10)) == files[:1]
     # a z0 build touches the whole world: keep everything
     assert terrainhub.files_in_bbox(files, terrainhub.build_cover(bb, 0)) == files
+
+
+def test_build_then_publish_single_copy_no_hillshade(tmp_path, capsys, sources, monkeypatch):
+    """terrainhub build -> publish: no hillshade anywhere, the raw Terrarium
+    pyramid + its manifest move into the (single) published version, the
+    ArcGIS Lerc pyramid is untouched, tilejson.json stays; a second publish
+    without a raw pyramid exits non-zero and changes nothing."""
+    import publish_tiles
+    import terrainhub
+    root = str(tmp_path / "tiles")
+    rc, out = run_build(capsys, sources, root, "--lerc-out", root, "--lerc-name", "svc",
+                        "--flavor", "lerc2", zooms=("8", "10"))
+    assert rc == 0, out
+    svc = build_lerc.service_root(root, "svc")
+    lerc_before = {p: p.read_bytes() for p in Path(svc).rglob("*") if p.is_file()}
+    assert lerc_before
+    monkeypatch.setattr(sys, "argv", ["terrainhub.py", "publish", "--bbox", *BBOX, "--root", root])
+    assert terrainhub.main() == 0
+    tiles = tmp_path / "tiles"
+    assert not [p for p in tiles.rglob("*") if "hillshade" in p.name or p.name == "transparent.png"]
+    assert [p.name for p in (tiles / "terrarium").iterdir()] == []   # raw tiles + manifest gone
+    assert (tiles / "tilejson.json").is_file()
+    pub = tiles / "published"
+    versions = [p.name for p in pub.iterdir() if p.is_dir()]
+    assert len(versions) == 1
+    webps = list((pub / versions[0] / "terrain").rglob("*.webp"))
+    assert webps and all(p.stat().st_nlink == 1 for p in webps)        # one copy each
+    lerc_after = {p: p.read_bytes() for p in Path(svc).rglob("*") if p.is_file()}
+    assert lerc_after == lerc_before                                   # Lerc untouched
+    assert os.path.isfile(os.path.join(svc, bt.MANIFEST_NAME))
+    # no raw pyramid: refuse, change nothing
+    snap = sorted(str(p) for p in tiles.rglob("*"))
+    assert terrainhub.main() == 2
+    assert "no raw Terrarium pyramid" in capsys.readouterr().err
+    assert sorted(str(p) for p in tiles.rglob("*")) == snap
+    # the next build is a clean full build (no stale manifest claiming tiles)
+    rc, out = run_build(capsys, sources, root, zooms=("8", "10"))
+    assert rc == 0 and "REBUILDING" not in out and "written=0" not in zline(out, 10)
+    assert publish_tiles.has_raw_pyramid(root)
+
+
+def test_terrainhub_publish_keep_raw(tmp_path, capsys, sources, monkeypatch):
+    import terrainhub
+    root = str(tmp_path / "tiles")
+    assert run_build(capsys, sources, root, zooms=("8", "9"))[0] == 0
+    raw = sorted(str(p) for p in (tmp_path / "tiles" / "terrarium").rglob("*"))
+    monkeypatch.setattr(sys, "argv", ["terrainhub.py", "publish", "--bbox", *BBOX,
+                                      "--root", root, "--keep-raw"])
+    assert terrainhub.main() == 0
+    assert sorted(str(p) for p in (tmp_path / "tiles" / "terrarium").rglob("*")) == raw

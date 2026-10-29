@@ -220,26 +220,8 @@ def services(request: Request) -> dict[str, Any]:
     return {"services": result}
 
 
-def _png_bytes(image: Any) -> bytes:
-    import io
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG", optimize=False)
-    return buffer.getvalue()
-
-
-_TRANSPARENT_TILE: bytes | None = None
-
-
-def _transparent_tile() -> bytes:
-    global _TRANSPARENT_TILE
-    if _TRANSPARENT_TILE is None:
-        from PIL import Image
-        _TRANSPARENT_TILE = _png_bytes(Image.new("RGBA", (256, 256), (0, 0, 0, 0)))
-    return _TRANSPARENT_TILE
-
-
 # Tiles change whenever a new build runs ("last build wins"): never
-# `immutable`. Terrain/imagery URLs carry a per-build ?v= token, so a day is
+# `immutable`. Dynamic terrain URLs carry a per-build ?v= token, so a day is
 # safe; ArcGIS tile URLs are unversioned, so they get a shorter max-age (the
 # FileResponse ETag/Last-Modified make revalidation cheap). Errors: no-store.
 _TILE_CACHE = "public, max-age=86400"
@@ -265,10 +247,13 @@ def terrain(z: int, x: int, y: int) -> Response:
 
 # ---- published (static, nginx-served) tile sets ---------------------------
 # The engine's publish step bakes the current build into
-# data/tiles/published/<version>/ (seamless Terrarium WebP + clipped
-# hillshade + flat/transparent fallbacks) and points current.json at it. In the
-# composed deployment nginx serves those files directly; the routes below are
-# the same contract for clients that talk to the API port directly.
+# data/tiles/published/<version>/ (seamless Terrarium WebP + flat.webp
+# fallback) and points current.json at it. In the composed deployment nginx
+# serves those files directly; the route below is the same contract for
+# clients that talk to the API port directly. There is no server hillshade:
+# MapLibre and Cesium shade the elevation tiles in the browser. After a
+# publish the raw terrarium/ pyramid is gone (single copy on disk), so the
+# dynamic /tiles/terrain route only matters when nothing is published.
 _PUBLISHED = TILE_DIR / "published"
 _VERSION_NAME = re.compile(r"^[0-9]{8}T[0-9]{6}-[0-9a-f]{8}$")
 _IMMUTABLE = "public, max-age=31536000, immutable"
@@ -287,28 +272,21 @@ def published_current() -> dict[str, Any] | None:
     return data
 
 
-def _published_file(version: str, layer: str, z: int, x: int, y: int, ext: str) -> Path:
+def _published_file(version: str, z: int, x: int, y: int) -> Path:
     if not _VERSION_NAME.match(version) or z < 0 or z > 24 or not (0 <= x < 2 ** z and 0 <= y < 2 ** z):
         raise HTTPException(status_code=404, detail="tile not found", headers=_NO_STORE)
     root = _PUBLISHED / version
     if not (root / "meta.json").is_file():
         raise HTTPException(status_code=404, detail="published version not found", headers=_NO_STORE)
-    path = root / layer / str(z) / str(x) / f"{y}.{ext}"
+    path = root / "terrain" / str(z) / str(x) / f"{y}.webp"
     if path.is_file():
         return path
-    return root / ("flat.webp" if layer == "terrain" else "transparent.png")
+    return root / "flat.webp"
 
 
 @app.get("/tiles/published/{version}/terrain/{z}/{x}/{y}.webp")
 def published_terrain(version: str, z: int, x: int, y: int) -> FileResponse:
-    response = FileResponse(_published_file(version, "terrain", z, x, y, "webp"), media_type="image/webp")
-    response.headers["Cache-Control"] = _IMMUTABLE
-    return response
-
-
-@app.get("/tiles/published/{version}/hillshade/{z}/{x}/{y}.png")
-def published_hillshade(version: str, z: int, x: int, y: int) -> FileResponse:
-    response = FileResponse(_published_file(version, "hillshade", z, x, y, "png"), media_type="image/png")
+    response = FileResponse(_published_file(version, z, x, y), media_type="image/webp")
     response.headers["Cache-Control"] = _IMMUTABLE
     return response
 
@@ -343,7 +321,6 @@ def terrain_tilejson(request: Request) -> JSONResponse:
         # Static, versioned tile set (nginx-served; immutable URLs).
         ver = published["version"]
         data["tiles"] = [f"{_base(request)}/tiles/published/{ver}/terrain/{{z}}/{{x}}/{{y}}.webp"]
-        data["imagery"] = [f"{_base(request)}/tiles/published/{ver}/hillshade/{{z}}/{{x}}/{{y}}.png"]
         data["maxzoom"] = published.get("maxzoom", data.get("maxzoom"))
         if isinstance(published.get("bounds"), list):
             data["bounds"] = published["bounds"]
@@ -354,29 +331,9 @@ def terrain_tilejson(request: Request) -> JSONResponse:
         return response
     version = TERRAIN.version()
     data["tiles"] = [f"{_base(request)}/tiles/terrain/{{z}}/{{x}}/{{y}}.png?v={version}"]
-    data["imagery"] = [f"{_base(request)}/tiles/imagery/{{z}}/{{x}}/{{y}}.png?v={version}"]
+    data["format"] = "png"
     response = JSONResponse(_finite(data))
     response.headers["Cache-Control"] = "no-store"
-    return response
-
-
-@app.get("/tiles/imagery/{z}/{x}/{y}.png")
-def imagery(z: int, x: int, y: int) -> Response:
-    # Hillshade drape for the current build only. Tiles from older builds
-    # outside the current bounds (or above maxzoom) are not served: they would
-    # float over unrelated terrain. Empty coverage is a 256x256 transparent
-    # PNG (a 1x1 image is not a usable web-mercator tile for CesiumJS).
-    if z < 0 or z > 24 or not (0 <= x < 2 ** z) or not (0 <= y < 2 ** z):
-        raise HTTPException(status_code=404, detail="imagery tile not found", headers=_NO_STORE)
-    path = _tile_file(f"hillshade/{z}/{x}/{y}.png") if TERRAIN.tile_in_coverage(z, x, y) else None
-    payload = None
-    if path:
-        try:
-            payload = TERRAIN.hillshade_png(path, z, x, y)
-        except (OSError, ValueError, SyntaxError):
-            payload = None  # tile being rewritten by a running build
-    response: Response = Response(content=payload or _transparent_tile(), media_type="image/png")
-    response.headers["Cache-Control"] = _TILE_CACHE if payload else "no-cache"
     return response
 
 

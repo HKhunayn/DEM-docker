@@ -21,7 +21,9 @@ data/
 ├── sources/<uuid>/        ingested files (original bytes preserved)
 ├── dem/                   source DEM GeoTIFFs + manifest.json
 ├── imagery/<name>/        fetched imagery sets: {z}/{x}/{y}.jpg + imagery.json
-└── tiles/                 derived: terrarium/, hillshade/, arcgis/, tilejson.json
+└── tiles/                 derived: published/<version>/ (served terrain, the only
+                           copy), arcgis/ (Lerc ImageServer), tilejson.json;
+                           terrarium/ only between build and publish
 ```
 
 The `heightmap-30m` project is only the build engine (`terrainhub.py` + `scripts/`); it no longer owns storage. This is intentionally replaceable: for production, use object storage/COGs for large rasters and PostgreSQL/PostGIS for catalog, permissions, vector data, and jobs. Do not put every large DEM pixel into a relational database unless raster SQL is required.
@@ -61,7 +63,21 @@ installs). For the test suite install the dev extras as well:
 .venv/Scripts/python -m pytest
 ```
 
-The existing elevation pyramid is served through `/tiles/terrain.json`, `/tiles/terrain/{z}/{x}/{y}.png`, and `/arcgis/rest/services/<name>/ImageServer`, read from `data/tiles/`.
+The elevation is served through `/tiles/terrain.json` (keys: TileJSON fields +
+`tiles` = `/tiles/published/<version>/terrain/{z}/{x}/{y}.webp`, `format`
+`webp`, `published` = version; without a published version the dynamic
+`/tiles/terrain/{z}/{x}/{y}.png?v=` route and `format` `png`) and
+`/arcgis/rest/services/<name>/ImageServer`, read from `data/tiles/`. There is
+no server hillshade (no `imagery` key, no `/tiles/imagery/...` or
+`/tiles/published/<v>/hillshade/...` routes): MapLibre and Cesium shade the
+elevation tiles in the browser.
+
+Jobs run `fetch → build → verify → publish`. Publish moves the raw Terrarium
+tiles into `data/tiles/published/<version>/` (hard links + computed edge
+tiles), switches `current.json`, then deletes the raw `terrarium/` pyramid,
+its `build_manifest.json` and every older published version: one copy of the
+elevation on disk, one published version. `publish_tiles.py --keep-raw` /
+`terrainhub.py publish --keep-raw` keep the raw pyramid (dev/tests).
 
 ## Ingest
 
@@ -81,7 +97,7 @@ pick a provider (Copernicus DEM GLO-30, or FABDEM when the engine can serve it),
 pick a dataset name, then **Fetch & build**. The page shows the current step,
 elapsed time, live log, and the build result.
 
-Jobs run the existing `heightmap-30m` CLI (`terrainhub.py fetch|build|verify`)
+Jobs run the existing `heightmap-30m` CLI (`terrainhub.py fetch|build|verify|publish`)
 as background subprocesses — the platform adds scheduling, status, and catalog
 records; it does not reimplement DEM download logic.
 

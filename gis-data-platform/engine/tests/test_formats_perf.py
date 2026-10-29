@@ -1,5 +1,5 @@
 """Tile formats + build performance changes: lossless WebP Terrarium (and the
---terrain-format png fallback), 'LA' hillshade with transparent no-data,
+--terrain-format png fallback), no hillshade output,
 0644 files, in-process Lerc1 (ctypes) == CLI bytes, parallel DEM fetch."""
 
 import io
@@ -43,7 +43,6 @@ def holey(tmp_path_factory):
 def build(capsys, srcs, root, *extra, zooms=("8", "10"), bbox=BBOX):
     rc = bt.main(["--src", *srcs, "--bbox", *bbox, "--minzoom", zooms[0],
                   "--maxzoom", zooms[1], "--out", os.path.join(root, "terrarium"),
-                  "--hillshade-out", os.path.join(root, "hillshade"),
                   "--workers", "1", *extra])
     return rc, capsys.readouterr().out
 
@@ -100,7 +99,7 @@ def test_default_build_writes_webp_and_tilejson(tmp_path, capsys, sources):
     assert rc == 0, out
     assert tiles_with_ext(os.path.join(root, "terrarium"), ".webp")
     assert not tiles_with_ext(os.path.join(root, "terrarium"), ".png")
-    assert tiles_with_ext(os.path.join(root, "hillshade"), ".png")
+    assert not os.path.exists(os.path.join(root, "hillshade"))
     tj = json.load(open(os.path.join(root, "tilejson.json")))
     assert tj["tiles"] == ["/terrarium/{z}/{x}/{y}.webp"] and tj["format"] == "webp"
     for k in ("bounds", "minzoom", "maxzoom", "statistics"):
@@ -135,7 +134,6 @@ def test_terrain_format_png_keeps_old_layout(tmp_path, capsys, sources):
     assert all("written=0" in line for line in out.splitlines() if line.startswith("z"))
     rc, out = build(capsys, sources, root)
     assert rc == 0 and "terrarium: REBUILDING" in out and "encoding params changed" in out
-    assert "hillshade: REBUILDING" not in out
 
 
 def test_resume_treats_legacy_png_as_not_done_in_webp_mode(tmp_path, sources):
@@ -148,40 +146,18 @@ def test_resume_treats_legacy_png_as_not_done_in_webp_mode(tmp_path, sources):
     bt._init_worker(list(sources))
     try:
         # png mode: the existing .png is a finished tile
-        assert bt._tile_job((z, x, y, out_root, None, False, None, "png"))[0] == "skip"
+        assert bt._tile_job((z, x, y, out_root, False, None, "png"))[0] == "skip"
         # webp mode: a legacy .png does not count -> built as .webp
-        status, st, _ = bt._tile_job((z, x, y, out_root, None, False, None, "webp"))
+        status, st, _ = bt._tile_job((z, x, y, out_root, False, None, "webp"))
         assert status == "write" and st[0] > 100      # real heights, not the 5 m dummy
         webp = bt.terrarium_tile_path(out_root, z, x, y, "webp")
         assert os.path.exists(webp) and os.path.exists(legacy)
         # and now the .webp resumes
-        assert bt._tile_job((z, x, y, out_root, None, False, None, "webp"))[0] == "skip"
+        assert bt._tile_job((z, x, y, out_root, False, None, "webp"))[0] == "skip"
         # old 6-tuple tasks default to webp
-        assert bt._tile_job((z, x, y, out_root, None, False))[0] == "skip"
+        assert bt._tile_job((z, x, y, out_root, False))[0] == "skip"
     finally:
         bt._IDX.close()
-
-
-# ---- hillshade LA ----------------------------------------------------------------
-
-def test_hillshade_tiles_are_LA_with_transparent_nodata(tmp_path, capsys, holey):
-    root = str(tmp_path)
-    bbox = ["46.4", "24.4", "46.6", "24.6"]
-    rc, out = build(capsys, holey, root, zooms=("11", "11"), bbox=bbox)
-    assert rc == 0, out
-    x, y = bt.lonlat_to_tile(46.5, 24.5, 11)
-    hs = os.path.join(root, "hillshade", "11", str(x), f"{y}.png")
-    with Image.open(hs) as im:
-        assert im.format == "PNG" and im.mode == "LA"
-        la = np.asarray(im)
-    ter = np.asarray(Image.open(bt.terrarium_tile_path(
-        os.path.join(root, "terrarium"), 11, x, y)).convert("RGBA"))
-    nod = ter[..., 3] == 0
-    assert nod.any() and (~nod).any()
-    assert np.array_equal(la[..., 1] == 0, nod)        # same no-data mask
-    assert (la[..., 1][~nod] == 255).all()
-    m = json.load(open(os.path.join(root, "hillshade", bt.MANIFEST_NAME)))
-    assert m["params"]["mode"] == "LA"
 
 
 # ---- file permissions -------------------------------------------------------------
@@ -200,7 +176,7 @@ def test_written_files_are_0644(tmp_path, capsys, sources):
         os.umask(old)
     files = [os.path.join(d, f) for d, _, fs in os.walk(root) for f in fs]
     kinds = {os.path.splitext(f)[1] for f in files}
-    assert {".webp", ".png", ".json"} <= kinds
+    assert {".webp", ".json"} <= kinds and ".png" not in kinds   # no hillshade PNGs
     bad = [(f, oct(stat.S_IMODE(os.stat(f).st_mode))) for f in files
            if stat.S_IMODE(os.stat(f).st_mode) != 0o644]
     assert not bad, bad[:5]

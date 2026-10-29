@@ -22,8 +22,6 @@ def srv(tmp_path):
     (root / "index.html").write_text("<h1>ui</h1>")
     (tiles / "terrarium" / "0" / "0").mkdir(parents=True)
     (tiles / "terrarium" / "0" / "0" / "0.png").write_bytes(b"\x89PNG tile")
-    (tiles / "hillshade" / "0" / "0").mkdir(parents=True)
-    (tiles / "hillshade" / "0" / "0" / "0.png").write_bytes(b"\x89PNG hs")
     svc = tiles / "arcgis" / "rest" / "services" / "dem"
     (svc / "tile" / "0" / "0").mkdir(parents=True)
     (svc / "tile" / "0" / "0" / "0").write_bytes(b"CntZImage blob")
@@ -65,7 +63,6 @@ def get(port, raw_path, method="GET"):
 
 @pytest.mark.parametrize("path", [
     "/terrarium/0/0/0.png",
-    "/hillshade/0/0/0.png",
     "/arcgis/rest/services/dem/ImageServer/tile/0/0/0",
 ])
 def test_tiles_200_with_bounded_cache(srv, path):
@@ -85,7 +82,6 @@ def test_head_tile(srv):
 
 @pytest.mark.parametrize("path", [
     "/terrarium/9/9/9.png",
-    "/hillshade/9/9/9.png",
     "/arcgis/rest/services/dem/ImageServer/tile/9/9/9",
     "/arcgis/rest/services/nope/ImageServer",
 ])
@@ -116,9 +112,9 @@ TRAVERSALS = [
     "/terrarium//etc/passwd",
     "/terrarium/%2fetc%2fpasswd",
     "/tilejson/..%2f..%2fsecret.txt",
-    "/hillshade/C:%5Cwindows%5Cwin.ini",
-    "/hillshade/C:/windows/win.ini",
-    "/hillshade/x%00.png",
+    "/terrarium/C:%5Cwindows%5Cwin.ini",
+    "/terrarium/C:/windows/win.ini",
+    "/terrarium/x%00.png",
     "/terrarium/evil/leak.png",  # symlink pointing outside the tiles root
     "/vendor/../../secret.txt",
     "/vendor/..%5c..%5csecret.txt",

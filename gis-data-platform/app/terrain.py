@@ -24,6 +24,12 @@ hole filling and the edge blur (radius <= 64 px < 256 px apron). Tiles
 outside coverage reuse the cached local field of the coverage tile they clamp
 to (an edge segment), and tiles beyond the fade distance are flat base without
 touching disk. Local fields and encoded tiles live in bounded LRU caches.
+
+This dynamic path is only the fallback while nothing is published: a
+successful publish moves the raw terrarium/ tiles into
+tiles/published/<version>/ (single copy on disk) and /tiles/terrain.json then
+advertises the published set. With the raw pyramid absent every tile here is
+simply the flat base (no errors).
 """
 from __future__ import annotations
 
@@ -501,44 +507,3 @@ class TerrainSource:
         if z < 0 or z > meta.maxzoom or not (0 <= x < 2 ** z and 0 <= y < 2 ** z):
             return None
         return self._cached((meta.key, z, x, y), lambda: encode_terrarium(self.heights(z, x, y)))
-
-    def coverage_mask(self, z: int, x: int, y: int, inset_px: float = 3.0) -> np.ndarray:
-        """Boolean 256x256 mask of pixels inside the current coverage, inset
-        by `inset_px` so resampling-edge pixels (black/no-data) are excluded."""
-        meta = self.meta()
-        if not meta.bounds:
-            return np.zeros((TILE, TILE), dtype=bool)
-        west, south, east, north = meta.bounds
-        fx0, fy0 = _global_px(west, north, z)
-        fx1, fy1 = _global_px(east, south, z)
-        gx = x * TILE + np.arange(TILE) + 0.5
-        gy = y * TILE + np.arange(TILE) + 0.5
-        inside_x = (gx >= fx0 + inset_px) & (gx <= fx1 - inset_px)
-        inside_y = (gy >= fy0 + inset_px) & (gy <= fy1 - inset_px)
-        return inside_y[:, None] & inside_x[None, :]
-
-    def hillshade_png(self, path: Path, z: int, x: int, y: int) -> bytes:
-        """Hillshade tile clipped to coverage with real transparency (the
-        legacy tiles are opaque greyscale: no-data is painted grey/black)."""
-        stat = path.stat()
-        key = ("hs", self.meta().key, z, x, y, stat.st_mtime_ns)
-
-        def compute() -> bytes:
-            with Image.open(path) as image:
-                grey = np.asarray(image.convert("L"))
-            alpha = np.where(self.coverage_mask(z, x, y), 255, 0).astype(np.uint8)
-            rgba = np.dstack([grey, grey, grey, alpha])
-            buffer = io.BytesIO()
-            Image.fromarray(rgba, "RGBA").save(buffer, format="PNG")
-            return buffer.getvalue()
-
-        return self._cached(key, compute)
-
-    def tile_in_coverage(self, z: int, x: int, y: int) -> bool:
-        meta = self.meta()
-        if not meta.bounds or z > meta.maxzoom:
-            return False
-        west, south, east, north = meta.bounds
-        fx0, fy0 = _global_px(west, north, z)
-        fx1, fy1 = _global_px(east, south, z)
-        return not (x * TILE >= fx1 or (x + 1) * TILE <= fx0 or y * TILE >= fy1 or (y + 1) * TILE <= fy0)

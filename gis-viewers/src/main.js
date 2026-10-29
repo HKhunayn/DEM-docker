@@ -12,6 +12,8 @@ import WebTileLayer from "@arcgis/core/layers/WebTileLayer.js";
 import * as Cesium from "cesium";
 import {PlatformApi, formatError, imageryTemplate, itemBounds, mergeItems, resolveApiUrl, tileUrls} from "./platformApi.js";
 import {makePlatformTerrainProvider} from "./cesiumTerrain.js";
+import {ReliefImageryProvider} from "./cesiumRelief.js";
+import {COLOR_RELIEF_OPACITY, HILLSHADE, MAP_BACKGROUND, colorReliefExpression, hillshadeExaggerationExpression} from "./relief.js";
 import {formatElapsed, isAbortError, templatesKey, withTimeout} from "./uiHelpers.js";
 
 // A production container serves the viewer and reverse-proxies the platform
@@ -72,9 +74,9 @@ let arcgisImageryLayer = null;
 let arcgisElevationLayer = null;
 let arcgisElevationUrl = null;
 let cesiumImageryLayer = null;
-let cesiumHillshadeLayer = null;
+let cesiumReliefLayer = null;
+let cesiumReliefColour = null;
 let appliedTerrainKey = null;
-let appliedImageryKey = null;
 let loading = false;
 let selectionToken = 0;
 
@@ -248,17 +250,6 @@ function terrainTemplates() {
   return [api.url("/tiles/terrain/{z}/{x}/{y}.png").replaceAll("%7B", "{").replaceAll("%7D", "}")];
 }
 
-function imageryTemplates() {
-  // Prefer the platform's versioned hillshade URL (cache-busted per build).
-  const versioned = tileUrls({tiles: state?.terrain?.imagery}, api.url("/tiles/terrain.json"));
-  if (versioned.length) return versioned;
-  const configured = state?.catalog?.links?.find((link) => link.rel === "imagery")?.href;
-  // Hillshade is only a fallback visualization, not aerial texture. Keep it
-  // transparent where coverage is absent; terrain remains the DEM source.
-  return [resolveApiUrl(configured || "/tiles/imagery/{z}/{x}/{y}.png", platform)
-    .replaceAll("%7B", "{").replaceAll("%7D", "}")];
-}
-
 function terrainMaxzoom() {
   const value = Number(state?.terrain?.maxzoom);
   return Number.isFinite(value) && value > 0 ? value : 13;
@@ -350,13 +341,16 @@ function applyCesiumImagery() {
   const url = imageryTemplate(set, platform);
   if (url) {
     const bounds = Array.isArray(set.bounds) && set.bounds.length === 4 ? set.bounds : null;
-    // Index 0: under the hillshade drape.
+    // Index 0: under the client-side relief drape.
     cesiumImageryLayer = cesiumViewer.imageryLayers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({
       url, maximumLevel: set.maxzoom ?? 18,
       rectangle: bounds ? Cesium.Rectangle.fromDegrees(...bounds) : undefined,
       credit: set.attribution || undefined,
     }), 0);
   }
+  // With imagery the relief drape switches to shade-only (like MapLibre,
+  // where the imagery covers the colour ramp but not the hillshade).
+  if (cesiumReliefColour !== !url) setCesiumRelief();
   cesiumViewer.scene.requestRender();
 }
 
@@ -389,24 +383,21 @@ function setArcGISElevation(url, {force = false} = {}) {
 // Hypsometric tint computed on the GPU from the DEM itself (no extra tiles).
 // Absolute metres, so it works for any area. 0 m is open sea / water (the
 // published tiles put no-data sea at sea level); land starts just above it.
+// Ramp + hillshade values are shared with the Cesium relief (relief.js).
 const COLOR_RELIEF_LAYER = {id: "color-relief", type: "color-relief", source: "relief", paint: {
-  "color-relief-opacity": 0.85,
-  "color-relief-color": ["interpolate", ["linear"], ["elevation"],
-    -500, "#5d8fb5", 0, "#a9c8dc", 0.5, "#b9cf9f", 150, "#cfd8a6", 400, "#e6dcae",
-    800, "#e2c48f", 1200, "#cfa271", 1800, "#b07f55", 2500, "#8f6a4f",
-    3500, "#9b8f86", 4500, "#dedad5", 6000, "#ffffff"],
+  "color-relief-opacity": COLOR_RELIEF_OPACITY,
+  "color-relief-color": colorReliefExpression(),
 }};
-// Client-side multidirectional hillshade (sharper and lighter-weight than the
-// server hillshade drape, which MapLibre no longer loads).
+// Client-side multidirectional hillshade computed from the DEM.
 const HILLSHADE_LAYER = {id: "relief", type: "hillshade", source: "relief", paint: {
   "hillshade-method": "multidirectional",
   // Light from fixed map directions, so tones don't shift when rotating.
   "hillshade-illumination-anchor": "map",
-  "hillshade-illumination-direction": [270, 315, 0, 45],
-  "hillshade-illumination-altitude": [30, 30, 30, 30],
-  "hillshade-highlight-color": ["#fffaf0", "#fffaf0", "#fffaf0", "#fffaf0"],
-  "hillshade-shadow-color": ["#3d3022", "#3d3022", "#5a4a36", "#5a4a36"],
-  "hillshade-exaggeration": ["interpolate", ["linear"], ["zoom"], 3, 0.25, 8, 0.45, 12, 0.6],
+  "hillshade-illumination-direction": [...HILLSHADE.directions],
+  "hillshade-illumination-altitude": [...HILLSHADE.altitudes],
+  "hillshade-highlight-color": [...HILLSHADE.highlightColors],
+  "hillshade-shadow-color": [...HILLSHADE.shadowColors],
+  "hillshade-exaggeration": hillshadeExaggerationExpression(),
 }};
 
 // Colour + shading only inside the build's coverage: outside it the published
@@ -421,7 +412,6 @@ function reliefSource(terrain, maxzoom) {
 // Everything outside the coverage rectangle is painted with the page
 // background: MapLibre loads whole tiles, so without this mask the flat base
 // around the area shows as a large sea/plain apron at low zoom.
-const MAP_BACKGROUND = "#e9e2d3";
 function outsideMask() {
   const b = terrainBounds();
   const world = [[-180, -85.06], [180, -85.06], [180, 85.06], [-180, 85.06], [-180, -85.06]];
@@ -499,18 +489,29 @@ async function createArcGIS() {
   setArcGISElevation(serviceForItem(selectedItem));
 }
 
-function setCesiumHillshade() {
+// Hypsometric colour + multidirectional hillshade computed in the browser
+// from the Terrarium elevation tiles (same ramp/lights as MapLibre). Colour is
+// dropped (shade only) while an imagery set is shown underneath.
+function setCesiumRelief() {
   if (!cesiumViewer) return;
-  if (cesiumHillshadeLayer) { cesiumViewer.imageryLayers.remove(cesiumHillshadeLayer, true); cesiumHillshadeLayer = null; }
-  const bounds = terrainBounds();
-  // Added on top, so an imagery set (inserted at index 0) stays underneath.
-  cesiumHillshadeLayer = cesiumViewer.imageryLayers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({
-    url: imageryTemplates()[0],
-    // Only request the hillshade drape where the platform has DEM coverage.
-    rectangle: bounds ? Cesium.Rectangle.fromDegrees(...bounds) : undefined,
-    // Hillshade exists up to the terrain maxzoom; Cesium over-zooms beyond.
-    maximumLevel: terrainMaxzoom(),
-  }));
+  if (cesiumReliefLayer) { cesiumViewer.imageryLayers.remove(cesiumReliefLayer, true); cesiumReliefLayer = null; }
+  const colour = !imageryTemplate(selectedImagery, platform);
+  cesiumReliefColour = colour;
+  try {
+    // Added on top, so an imagery set (inserted at index 0) stays underneath.
+    cesiumReliefLayer = cesiumViewer.imageryLayers.addImageryProvider(new ReliefImageryProvider({
+      template: terrainTemplates()[0],
+      // Only shade where the platform has DEM coverage (outside it the
+      // terrain is a flat base; the globe shows the background colour).
+      bounds: terrainBounds(),
+      // Cesium over-zooms the maxzoom relief beyond it.
+      maxzoom: terrainMaxzoom(),
+      tileSize: state?.terrain?.tileSize || 256,
+      colour,
+    }));
+  } catch (error) {
+    setMapMessage(`Cesium relief error: ${formatError(error)}`, "cesium");
+  }
   cesiumViewer.scene.requestRender();
 }
 
@@ -565,11 +566,11 @@ async function createCesium() {
     }
   });
   if (import.meta.env.DEV) window.__viewers = Object.assign(window.__viewers || {}, {cesium: viewer, Cesium});
-  // No remote basemap: the ground outside the DEM uses the hillshade's
-  // flat-terrain tone (sun at 45 deg -> ~179/255), so the drape edge blends.
-  viewer.scene.globe.baseColor = Cesium.Color.fromBytes(179, 179, 179, 255);
+  // No remote basemap: the ground outside the DEM uses the same background
+  // colour as MapLibre (the relief drape only covers the DEM coverage).
+  viewer.scene.globe.baseColor = Cesium.Color.fromCssColorString(MAP_BACKGROUND);
   viewer.scene.globe.depthTestAgainstTerrain = true;
-  setCesiumHillshade();
+  setCesiumRelief();
   applyCesiumImagery();
   await setCesiumTerrain();
   cesiumFrame(selectedItem, 0);
@@ -609,7 +610,7 @@ async function startViewers() {
       await createCesium();
       setViewerFailure("cesium", "");
     } catch (error) {
-      destroyQuietly(cesiumViewer); cesiumViewer = null; cesiumImageryLayer = null; cesiumHillshadeLayer = null;
+      destroyQuietly(cesiumViewer); cesiumViewer = null; cesiumImageryLayer = null; cesiumReliefLayer = null; cesiumReliefColour = null;
       setViewerFailure("cesium", `CesiumJS failed to start: ${formatError(error)}`);
       failures.push("CesiumJS");
     }
@@ -618,38 +619,33 @@ async function startViewers() {
 }
 
 /**
- * After a reload: if the platform's terrain/hillshade tile templates changed
- * (they are versioned per build), point every viewer at the new tiles.
+ * After a reload: if the platform's terrain tile template changed (it is
+ * versioned per build), point every viewer at the new tiles. All relief
+ * shading is computed on the client from those tiles.
  */
 function refreshTileSources() {
   const terrain = terrainTemplates();
-  const imagery = imageryTemplates();
-  const terrainKey = templatesKey(terrain); const imageryKey = templatesKey(imagery);
+  const terrainKey = templatesKey(terrain);
   const terrainChanged = appliedTerrainKey !== null && terrainKey !== appliedTerrainKey;
-  const imageryChanged = appliedImageryKey !== null && imageryKey !== appliedImageryKey;
-  appliedTerrainKey = terrainKey; appliedImageryKey = imageryKey;
-  if (maplibre && (terrainChanged || imageryChanged)) {
+  appliedTerrainKey = terrainKey;
+  if (maplibre && terrainChanged) {
     try {
-      if (terrainChanged) {
-        maplibre.getSource("terrain")?.setTiles(terrain);
-        // New build/publish: tiles AND coverage bounds change (bounds can't
-        // be updated in place).
-        if (mapLibreReady) resetMapLibreRelief(terrain);
-      }
-      // (MapLibre shades on the client; the server hillshade drape is only
-      // used by Cesium/ArcGIS.)
+      maplibre.getSource("terrain")?.setTiles(terrain);
+      // New build/publish: tiles AND coverage bounds change (bounds can't
+      // be updated in place).
+      if (mapLibreReady) resetMapLibreRelief(terrain);
     } catch (error) {
       setMapMessage(`MapLibre could not refresh tile sources: ${formatError(error)}`, "maplibre");
     }
   }
-  if (cesiumViewer) {
-    if (terrainChanged || imageryChanged) setCesiumHillshade();
-    if (terrainChanged) setCesiumTerrain();
+  if (cesiumViewer && terrainChanged) {
+    setCesiumRelief();
+    setCesiumTerrain();
   }
   // A rebuilt dataset keeps its ImageServer URL; force a fresh layer so the
   // SceneView drops its cached elevation tiles.
   if (arcgisMap && arcgisView) setArcGISElevation(serviceForItem(selectedItem), {force: terrainChanged});
-  return terrainChanged || imageryChanged;
+  return terrainChanged;
 }
 
 // ---- navigation: each viewer reports when it has actually arrived ---------
@@ -829,7 +825,6 @@ async function loadPlatformState() {
     const failures = await startViewers();
     if (!anyViewer) {
       appliedTerrainKey = templatesKey(terrainTemplates());
-      appliedImageryKey = templatesKey(imageryTemplates());
     } else {
       setBusyStatus("Platform reloaded · moving viewers");
       navigation = await syncViews();
