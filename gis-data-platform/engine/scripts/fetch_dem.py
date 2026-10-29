@@ -10,7 +10,9 @@ unique ``.part`` file with a socket timeout, are validated (Content-Length and
 TIFF magic) and only then moved into place with ``os.replace``. A 404 means the
 tile does not exist at the source (ocean/void) and is not retried; 5xx, 429,
 timeouts and connection errors are retried with exponential backoff. --check
-reports what is cached vs missing without downloading anything.
+reports what is cached vs missing without downloading anything. Missing tiles
+are downloaded concurrently (--jobs, default 8: the transfer is network-bound);
+log lines stay whole and the manifest keeps the tile order of the bbox.
 
 Usage:
   python fetch_dem.py --bbox 6.6 45.6 7.2 46.0 --res 30 --out ../data
@@ -25,10 +27,12 @@ import math
 import os
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 BUCKETS = {
     30: "https://copernicus-dem-30m.s3.amazonaws.com",
@@ -51,6 +55,18 @@ TIFF_MAGIC = (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+")
 MISSING_CODES = (404,)
 RETRY_CODES = (408, 425, 429, 500, 502, 503, 504)
 STALE_PART_AGE = 3600  # seconds; older orphaned .part files are removed
+JOBS = 8              # concurrent downloads
+
+_PRINT_LOCK = threading.Lock()
+
+
+def _say(msg: str, err: bool = False) -> None:
+    """Print one whole line (one write under a lock), so lines from
+    concurrent downloads never interleave."""
+    stream = sys.stderr if err else sys.stdout
+    with _PRINT_LOCK:
+        stream.write(msg + "\n")
+        stream.flush()
 
 
 class MissingTile(Exception):
@@ -184,17 +200,16 @@ def download(url: str, dest: str, retries: int = RETRIES, timeout: float = TIMEO
     if is_cached(dest):
         return
     if os.path.exists(dest):
-        print(f"  INVALID cached {dest} (not a TIFF) — re-downloading", file=sys.stderr)
+        _say(f"  INVALID cached {dest} (not a TIFF) — re-downloading", err=True)
     _clean_stale_parts(dest)
     retries = max(1, int(retries))
     for attempt in range(1, retries + 1):
         tmp = f"{dest}.{os.getpid()}.{uuid.uuid4().hex[:8]}.part"
-        print(f"  GET     {url}" if attempt == 1 else f"  RETRY {attempt}/{retries} {url}",
-              flush=True)
+        _say(f"  GET     {url}" if attempt == 1 else f"  RETRY {attempt}/{retries} {url}")
         try:
             _fetch_once(url, tmp, timeout)
             os.replace(tmp, dest)
-            print(f"  saved   {dest} ({os.path.getsize(dest) / 1e6:.1f} MB)")
+            _say(f"  saved   {dest} ({os.path.getsize(dest) / 1e6:.1f} MB)")
             return
         except _Retryable as exc:
             _remove(tmp)
@@ -203,12 +218,46 @@ def download(url: str, dest: str, retries: int = RETRIES, timeout: float = TIMEO
             delay = exc.delay
             if delay is None:
                 delay = min(backoff * (2 ** (attempt - 1)), MAX_BACKOFF)
-            print(f"  retry {attempt}/{retries} for {url}: {exc} (waiting {delay:g}s)",
-                  file=sys.stderr, flush=True)
+            _say(f"  retry {attempt}/{retries} for {url}: {exc} (waiting {delay:g}s)",
+                 err=True)
             time.sleep(delay)
         except BaseException:
             _remove(tmp)
             raise
+
+
+def _fetch_tile(url: str, dest: str, retries: int, timeout: float) -> str:
+    """One tile: 'ok', 'missing' (404, ocean/void) or 'failed' — the
+    MISSING/FAILED line is printed here as soon as the tile finishes."""
+    try:
+        download(url, dest, retries=retries, timeout=timeout)
+        return "ok"
+    except MissingTile:
+        _say(f"  MISSING {url} (not at source — ocean/void)", err=True)
+        return "missing"
+    except Exception as exc:  # noqa: BLE001
+        _say(f"  FAILED  {url} ({exc})", err=True)
+        return "failed"
+
+
+def fetch_missing(missing, retries: int, timeout: float, jobs: int = JOBS) -> list[str]:
+    """Download (folder, url, dest) tiles with up to `jobs` threads. Returns
+    one status per tile, in the input order."""
+    jobs = max(1, min(int(jobs), len(missing) or 1))
+    if jobs == 1:
+        return [_fetch_tile(url, dest, retries, timeout) for _, url, dest in missing]
+    ex = ThreadPoolExecutor(max_workers=jobs, thread_name_prefix="fetch")
+    try:
+        futures = [ex.submit(_fetch_tile, url, dest, retries, timeout)
+                   for _, url, dest in missing]
+        results = [f.result() for f in futures]
+    except BaseException:
+        # Ctrl-C / SystemExit: drop the queued tiles (running ones finish
+        # into their own .part files and are moved/cleaned up as usual)
+        ex.shutdown(wait=False, cancel_futures=True)
+        raise
+    ex.shutdown(wait=True)
+    return results
 
 
 def main(argv=None) -> int:
@@ -223,6 +272,8 @@ def main(argv=None) -> int:
                     help=f"socket timeout in seconds (default {TIMEOUT})")
     ap.add_argument("--retries", type=int, default=RETRIES,
                     help=f"attempts per tile (default {RETRIES})")
+    ap.add_argument("--jobs", type=int, default=JOBS,
+                    help=f"concurrent downloads (default {JOBS})")
     args = ap.parse_args(argv)
 
     tiles = tile_list(args.res, args.bbox)
@@ -249,15 +300,12 @@ def main(argv=None) -> int:
     for folder, url, dest in cached:
         print(f"  cached  {dest}")
         paths.append(dest)
-    for folder, url, dest in missing:
-        try:
-            download(url, dest, retries=args.retries, timeout=args.timeout)
+    statuses = fetch_missing(missing, args.retries, args.timeout, args.jobs)
+    for (folder, url, dest), status in zip(missing, statuses):
+        if status == "ok":
             paths.append(dest)
             downloaded += 1
-        except MissingTile:
-            print(f"  MISSING {url} (not at source — ocean/void)", file=sys.stderr)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  FAILED  {url} ({exc})", file=sys.stderr)
+        elif status == "failed":
             failed += 1
 
     if not paths:

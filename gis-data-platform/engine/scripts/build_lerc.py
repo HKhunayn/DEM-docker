@@ -26,6 +26,7 @@ Usage:
 
 import argparse
 import atexit
+import ctypes
 import json
 import os
 import shutil
@@ -72,6 +73,9 @@ def _find_lerc1enc() -> str:
 
 
 LERC1ENC = _find_lerc1enc()
+LIB_NAMES = {"nt": ("lerc1enc.dll", "liblerc1enc.dll")}.get(
+    os.name, ("liblerc1enc.dylib", "liblerc1enc.so") if sys.platform == "darwin"
+    else ("liblerc1enc.so",))
 LERC2_PROFILE = dict(
     driver="GTiff", width=TILE_PX, height=TILE_PX, count=1, dtype="float32",
     crs="EPSG:4326", transform=rasterio.transform.from_origin(0, TILE_PX, 1, 1),
@@ -80,11 +84,62 @@ LERC2_PROFILE = dict(
 )
 
 
+def _lib_candidates() -> list[str]:
+    """LERC1LIB env (a path; "0"/"off"/"none" disables the library), then
+    liblerc1enc next to this script, then next to the CLI."""
+    env = os.environ.get("LERC1LIB")
+    if env is not None and env.strip():
+        return [] if env.strip().lower() in ("0", "off", "none", "false") else [env]
+    dirs = [HERE, os.path.dirname(os.path.abspath(LERC1ENC))]
+    out = []
+    for d in dirs:
+        for n in LIB_NAMES:
+            c = os.path.join(d, n)
+            if c not in out:
+                out.append(c)
+    return out
+
+
+# ctypes handle, loaded lazily once per process (pool workers are spawned, so
+# each loads its own copy on first use). False = tried and unavailable.
+_LIB = None
+LERC1_OK, LERC1_E_ENCODE, LERC1_E_ARGS, LERC1_E_SMALL, LERC1_E_NOMEM = range(5)
+
+
+def _load_lib():
+    global _LIB
+    if _LIB is None:
+        _LIB = False
+        for path in _lib_candidates():
+            if not os.path.exists(path):
+                continue
+            try:
+                lib = ctypes.CDLL(os.path.abspath(path))
+                fn = lib.lerc1_encode
+            except (OSError, AttributeError):
+                continue
+            fn.restype = ctypes.c_int
+            fn.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_double,
+                           ctypes.c_float, ctypes.c_void_p, ctypes.c_size_t,
+                           ctypes.POINTER(ctypes.c_size_t)]
+            _LIB = fn
+            break
+    return _LIB or None
+
+
+def lerc1_backend() -> str:
+    """'library' (in-process ctypes), 'cli' (subprocess) or 'missing'."""
+    if _load_lib():
+        return "library"
+    return "cli" if os.path.exists(LERC1ENC) else "missing"
+
+
 def require_lerc1enc() -> None:
-    if not os.path.exists(LERC1ENC):
+    if lerc1_backend() == "missing":
         raise RuntimeError(
-            f"lerc1enc encoder missing ({LERC1ENC}) — run scripts/build_lerc1enc.bat "
-            f"(Windows) or scripts/build_lerc1enc.sh (Linux/macOS) first, or set LERC1ENC"
+            f"lerc1enc encoder missing ({LERC1ENC}; no liblerc1enc library) — run "
+            f"scripts/build_lerc1enc.bat (Windows) or scripts/build_lerc1enc.sh "
+            f"(Linux/macOS) first, or set LERC1ENC / LERC1LIB"
         )
 
 
@@ -101,10 +156,52 @@ def _work_dir() -> str:
 
 
 def lerc1_blob(arr: np.ndarray, maxzerr: float, timeout: float | None = None) -> bytes:
-    """Encode a float32 tile as a Lerc1 CntZImage blob via the bundled CLI
-    (built from GDAL's frmts/mrf/LERCV1 — see scripts/build_lerc1enc.bat).
-    CLI: lerc1enc RAW_IN COLS ROWS OUT_FILE MAXZERR NODATA."""
-    require_lerc1enc()
+    """Encode a float32 tile as a Lerc1 CntZImage blob: in-process through
+    liblerc1enc (ctypes) when available, else via the lerc1enc CLI. Both run
+    the same encoder (scripts/lerc1enc.cpp) and give identical bytes."""
+    fn = _load_lib()
+    if fn:
+        return lerc1_blob_lib(arr, maxzerr, fn)
+    return lerc1_blob_cli(arr, maxzerr, timeout)
+
+
+def lerc1_blob_lib(arr: np.ndarray, maxzerr: float, fn=None) -> bytes:
+    """Lerc1 blob from the shared library (no fork/exec, no temp files)."""
+    fn = fn or _load_lib()
+    if not fn:
+        raise RuntimeError("liblerc1enc not available (set LERC1LIB)")
+    a = np.ascontiguousarray(arr, dtype=np.float32)
+    if a.ndim != 2:
+        raise ValueError(f"lerc1: expected a 2-D array, got shape {a.shape}")
+    rows, cols = a.shape
+    # raw floats + bit mask + headers is the worst case; the encoder reports
+    # the exact size if that is ever not enough
+    cap = a.size * 4 + a.size // 8 + 4096
+    for _ in range(2):
+        out = ctypes.create_string_buffer(cap)
+        n = ctypes.c_size_t(0)
+        rc = fn(a.ctypes.data, cols, rows, float(maxzerr), float(NODATA), out, cap,
+                ctypes.byref(n))
+        if rc == LERC1_E_SMALL and n.value > cap:
+            cap = n.value
+            continue
+        break
+    if rc != LERC1_OK:
+        raise RuntimeError(f"lerc1_encode failed with code {rc} "
+                           f"({cols}x{rows}, maxzerr {maxzerr})")
+    if not n.value:
+        raise RuntimeError("lerc1_encode produced an empty blob")
+    return ctypes.string_at(out, n.value)
+
+
+def lerc1_blob_cli(arr: np.ndarray, maxzerr: float, timeout: float | None = None) -> bytes:
+    """Lerc1 blob via the bundled CLI (built from GDAL's frmts/mrf/LERCV1 —
+    see scripts/build_lerc1enc.bat). CLI: lerc1enc RAW_IN COLS ROWS OUT_FILE
+    MAXZERR NODATA."""
+    if not os.path.exists(LERC1ENC):
+        raise RuntimeError(
+            f"lerc1enc encoder missing ({LERC1ENC}) — run scripts/build_lerc1enc.bat "
+            f"(Windows) or scripts/build_lerc1enc.sh (Linux/macOS) first, or set LERC1ENC")
     td = _work_dir()
     raw_path = os.path.join(td, "t.raw")
     out_path = os.path.join(td, "t.lerc1")
@@ -281,7 +378,9 @@ def main(argv=None) -> int:
     src_hash = source_fingerprint(args.src)
     print(f"sources: {len(idx.datasets)} DEM file(s) (fingerprint {src_hash}); "
           f"windowed LERC build, resume={'off' if args.force else 'on'}, "
-          f"workers={workers}; {describe_limits()}")
+          f"workers={workers}"
+          + (f", lerc1 encoder={lerc1_backend()}" if args.flavor == "lerc1" else "")
+          + f"; {describe_limits()}")
     sys.stdout.flush()
 
     # Statistics: prefer the Terrarium tilejson written by build_tiles for the

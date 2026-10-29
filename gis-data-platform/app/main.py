@@ -21,8 +21,47 @@ from .fetch_api import router as fetch_router
 from .imagery_api import router as imagery_router
 from .terrain import TerrainSource
 
+# Older engines wrote every tile 0600 (tempfile.mkstemp), which a non-root
+# nginx serving the volume read-only cannot open (403). Once per data volume,
+# make the served trees world-readable in the background (the marker file
+# records that it ran; new files are written 0644 by the engine).
+_PERMS_MARKER = ".perms-world-readable-v1"
+
+
+def fix_tile_permissions(data_root: Path) -> int:
+    marker = data_root / _PERMS_MARKER
+    if marker.exists():
+        return 0
+    changed = 0
+    for top in (data_root / "tiles", data_root / "imagery"):
+        for dirpath, dirnames, filenames in os.walk(top):
+            for name in dirnames:
+                p = os.path.join(dirpath, name)
+                try:
+                    if os.stat(p).st_mode & 0o005 != 0o005:
+                        os.chmod(p, 0o755)
+                except OSError:
+                    pass
+            for name in filenames:
+                p = os.path.join(dirpath, name)
+                try:
+                    if not os.stat(p).st_mode & 0o004:
+                        os.chmod(p, 0o644)
+                        changed += 1
+                except OSError:
+                    pass
+    try:
+        marker.write_text(f"{changed} files made world-readable", encoding="utf-8")
+    except OSError:
+        pass
+    return changed
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    if os.environ.get("GIS_FIX_TILE_PERMS", "1") == "1":
+        threading.Thread(target=fix_tile_permissions, args=(TILE_ROOT.parent,),
+                         name="fix-tile-perms", daemon=True).start()
     yield
     # Terminate running engine subprocesses on shutdown, if the jobs module
     # provides a hook (getattr: older jobs modules don't have one).
@@ -224,6 +263,56 @@ def terrain(z: int, x: int, y: int) -> Response:
     return response
 
 
+# ---- published (static, nginx-served) tile sets ---------------------------
+# The engine's publish step bakes the current build into
+# data/tiles/published/<version>/ (seamless Terrarium WebP + clipped
+# hillshade + flat/transparent fallbacks) and points current.json at it. In the
+# composed deployment nginx serves those files directly; the routes below are
+# the same contract for clients that talk to the API port directly.
+_PUBLISHED = TILE_DIR / "published"
+_VERSION_NAME = re.compile(r"^[0-9]{8}T[0-9]{6}-[0-9a-f]{8}$")
+_IMMUTABLE = "public, max-age=31536000, immutable"
+
+
+def published_current() -> dict[str, Any] | None:
+    """current.json of the live published version, if valid and present."""
+    try:
+        data = json.loads((_PUBLISHED / "current.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not _VERSION_NAME.match(str(data.get("version", ""))):
+        return None
+    if not (_PUBLISHED / data["version"] / "meta.json").is_file():
+        return None
+    return data
+
+
+def _published_file(version: str, layer: str, z: int, x: int, y: int, ext: str) -> Path:
+    if not _VERSION_NAME.match(version) or z < 0 or z > 24 or not (0 <= x < 2 ** z and 0 <= y < 2 ** z):
+        raise HTTPException(status_code=404, detail="tile not found", headers=_NO_STORE)
+    root = _PUBLISHED / version
+    if not (root / "meta.json").is_file():
+        raise HTTPException(status_code=404, detail="published version not found", headers=_NO_STORE)
+    path = root / layer / str(z) / str(x) / f"{y}.{ext}"
+    if path.is_file():
+        return path
+    return root / ("flat.webp" if layer == "terrain" else "transparent.png")
+
+
+@app.get("/tiles/published/{version}/terrain/{z}/{x}/{y}.webp")
+def published_terrain(version: str, z: int, x: int, y: int) -> FileResponse:
+    response = FileResponse(_published_file(version, "terrain", z, x, y, "webp"), media_type="image/webp")
+    response.headers["Cache-Control"] = _IMMUTABLE
+    return response
+
+
+@app.get("/tiles/published/{version}/hillshade/{z}/{x}/{y}.png")
+def published_hillshade(version: str, z: int, x: int, y: int) -> FileResponse:
+    response = FileResponse(_published_file(version, "hillshade", z, x, y, "png"), media_type="image/png")
+    response.headers["Cache-Control"] = _IMMUTABLE
+    return response
+
+
 @app.get("/tiles/terrain.json")
 def terrain_tilejson(request: Request) -> JSONResponse:
     path = TILE_DIR / "tilejson.json"
@@ -249,6 +338,20 @@ def terrain_tilejson(request: Request) -> JSONResponse:
     # algorithm revision), so browsers never reuse stale tiles - including
     # copies cached as `immutable` by earlier platform versions or saved
     # without CORS headers by a non-CORS request.
+    published = published_current()
+    if published is not None:
+        # Static, versioned tile set (nginx-served; immutable URLs).
+        ver = published["version"]
+        data["tiles"] = [f"{_base(request)}/tiles/published/{ver}/terrain/{{z}}/{{x}}/{{y}}.webp"]
+        data["imagery"] = [f"{_base(request)}/tiles/published/{ver}/hillshade/{{z}}/{{x}}/{{y}}.png"]
+        data["maxzoom"] = published.get("maxzoom", data.get("maxzoom"))
+        if isinstance(published.get("bounds"), list):
+            data["bounds"] = published["bounds"]
+        data["format"] = "webp"
+        data["published"] = ver
+        response = JSONResponse(_finite(data))
+        response.headers["Cache-Control"] = "no-store"
+        return response
     version = TERRAIN.version()
     data["tiles"] = [f"{_base(request)}/tiles/terrain/{{z}}/{{x}}/{{y}}.png?v={version}"]
     data["imagery"] = [f"{_base(request)}/tiles/imagery/{{z}}/{{x}}/{{y}}.png?v={version}"]

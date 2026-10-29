@@ -80,3 +80,37 @@ source files -> ingest/catalog -> COG/object storage + STAC
 ```
 
 For production, put the API behind a reverse proxy and replace the local filesystem repository with object storage plus PostgreSQL/PostGIS metadata. The API contract remains the same.
+
+## Tile serving (static, nginx)
+
+Tiles are served by the viewer's **nginx straight from the data volume**
+(mounted read-only at `/data`); FastAPI only answers metadata, jobs and
+fallbacks. Measured on this host (oha, 50 concurrent, same 3,492 Riyadh tiles):
+
+| Tile type | Before (FastAPI) | After (nginx static) |
+|---|---:|---:|
+| Terrain (MapLibre/Cesium) | 82 req/s, p50 775 ms (dynamic PNG) | **134,301 req/s, p50 0.25 ms** (WebP) |
+| ArcGIS Lerc (ArcGIS/Cesium) | 646 req/s, p50 79 ms | **141,353 req/s, p50 0.24 ms** |
+| Hillshade drape | dynamic | **178,053 req/s** |
+
+How it works:
+
+* Every elevation job runs `fetch → build → verify → publish`.
+  `publish` (`engine/scripts/publish_tiles.py`, also `terrainhub.py publish`)
+  bakes the seamless edge fade that `/tiles/terrain` used to compute per
+  request into `data/tiles/published/<version>/` (lossless WebP Terrarium +
+  coverage-clipped hillshade + `flat.webp`/`transparent.png` fallbacks) and
+  switches `published/current.json` atomically; the last 2 versions are kept.
+* `/tiles/terrain.json` advertises the published, versioned (immutable) URLs
+  when a published version exists, else the legacy dynamic route.
+* nginx serves `/tiles/published/...`, `/arcgis/rest/services/<name>/ImageServer/tile/...`
+  and `/tiles/imagery-sets/...` from disk (`sendfile`), falling back to the API
+  only for metadata, tilemaps, imagery over-zoom and misses.
+* The engine writes Terrarium as **lossless WebP** (`method=1, quality=25,
+  exact=True`: −29 % bytes vs PNG, bit-exact) and every file **0644** so a
+  non-root nginx can read it. On first start the API makes older 0600 tiles
+  world-readable once (marker `data/.perms-world-readable-v1`;
+  `GIS_FIX_TILE_PERMS=0` disables).
+* To (re)publish existing data without a rebuild:
+  `docker compose exec data-platform python /opt/heightmap-30m/terrainhub.py publish --bbox 0 0 1 1 --root /app/data/tiles`
+  (bbox is ignored by publish; the build's tilejson defines the area).

@@ -164,18 +164,21 @@ def test_hillshade_buffer_is_seamless():
     surf = (0.02 * (xx - 100) ** 2 + 0.03 * (yy - 50) ** 2).astype(np.float32)
     big = np.asarray(bt.hillshade(surf, 30.0))
     tile = np.asarray(bt.hillshade(surf[2:260, 2:260], 30.0, buffer=1))
-    assert tile.shape == (256, 256)
+    assert tile.shape == (256, 256, 2)          # 'LA': grey + alpha
     assert np.array_equal(tile, big[3:259, 3:259])
 
 
 def test_hillshade_nodata_not_a_cliff():
     arr = np.full((50, 50), 800.0, np.float32)
     arr[20:30, 20:30] = bt.NODATA
-    out = np.asarray(bt.hillshade(arr, 30.0))
+    im = bt.hillshade(arr, 30.0)
+    assert im.mode == "LA"
+    out = np.asarray(im)
     flat = int(np.cos(np.radians(45.0)) * 255)
     valid = arr > bt.NODATA + 1
-    assert (out[valid] == flat).all()          # flat ground stays flat at the hole edge
-    assert (out[~valid] == 128).all()
+    assert (out[..., 0][valid] == flat).all()  # flat ground stays flat at the hole edge
+    assert (out[..., 0][~valid] == 128).all()
+    assert (out[..., 1][~valid] == 0).all() and (out[..., 1][valid] == 255).all()
 
 
 def test_hillshade_uses_ground_cell_size():
@@ -240,8 +243,9 @@ def test_source_fingerprint_depends_on_names_and_sizes(tmp_path):
     assert bt.source_fingerprint([a]) != h1
 
 
-def test_roundtrip_check_in_verify():
-    err, alpha_ok = verify_tiles.roundtrip_check()
+@pytest.mark.parametrize("fmt", ["webp", "png"])
+def test_roundtrip_check_in_verify(fmt):
+    err, alpha_ok = verify_tiles.roundtrip_check(fmt)
     assert err <= 1 / 256 + 1e-6 and alpha_ok
 
 

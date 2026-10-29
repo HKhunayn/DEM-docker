@@ -41,8 +41,8 @@ def test_job_runs_engine_steps_and_persists_area(client):
 
     job = wait_done(client, started["id"])
     assert job["state"] == "done"
-    assert job["step"] == "verify"
-    assert [s["name"] for s in job["steps"]] == ["fetch", "build", "verify"]
+    assert job["step"] == "publish"
+    assert [s["name"] for s in job["steps"]] == ["fetch", "build", "verify", "publish"]
     assert all(s["returncode"] == 0 for s in job["steps"])
     assert job["elapsed"] >= 0
     assert any("Done: 2 tile(s)" in line for line in job["log"])
@@ -90,7 +90,7 @@ def test_second_job_rejected_while_one_runs(client, monkeypatch):
 
     running = client.get("/api/status").json()
     assert running["state"] == "running"
-    assert running["step"] in ("fetch", "build", "verify")
+    assert running["step"] in ("fetch", "build", "verify", "publish")
     assert running["elapsed"] >= 0
 
     second = client.post("/api/jobs", json={**JOB, "name": "other"})
@@ -152,7 +152,19 @@ def test_verify_failure_keeps_build_and_finishes_done_with_warning(client, monke
     area = client.get(f"/api/areas/{started['areaId']}").json()
     assert area["dataset"]["state"] == "done" and area["dataset"]["verified"] is False
     assert "verify" in area["dataset"]["warning"]
+    # publish still ran after the verify failure (served tiles follow the build)
+    assert job["steps"][3]["name"] == "publish" and job["steps"][3]["state"] == "done"
 
+
+def test_publish_failure_finishes_done_with_warning(client, monkeypatch):
+    monkeypatch.setenv("STUB_FAIL", "publish")
+    started = client.post("/api/jobs", json=JOB).json()
+    job = wait_done(client, started["id"])
+    assert job["state"] == "done"
+    assert job["error"] is None
+    assert "publish" in job["warning"] and "previously published" in job["warning"]
+    assert job["result"]["verified"] is True
+    assert job["steps"][3]["state"] == "error"
 
 def test_build_failure_restores_previous_tilejson(client, monkeypatch, tmp_path):
     tiles = tmp_path / "data" / "tiles"

@@ -64,6 +64,10 @@ services:
     depends_on:
       data-platform:
         condition: service_healthy
+    # The tile trees are served by nginx straight from the data volume
+    # (read-only): published terrain/hillshade, ArcGIS Lerc tiles, imagery.
+    volumes:
+      - gis-data:/data:ro
     ports:
       - "${GIS_VIEWER_PORT:-5173}:80"
     networks:

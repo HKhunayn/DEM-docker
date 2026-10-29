@@ -357,7 +357,11 @@ class TerrainSource:
         return EARTH_CIRCUMFERENCE * math.cos(math.radians(lat)) / (TILE * 2 ** z)
 
     def _load_tile(self, z: int, tx: int, ty: int) -> np.ndarray | None:
-        path = self.public / "terrarium" / str(z) / str(tx) / f"{ty}.png"
+        # Lossless WebP since engine v3 (.png for older builds).
+        base = self.public / "terrarium" / str(z) / str(tx)
+        path = base / f"{ty}.webp"
+        if not path.is_file():
+            path = base / f"{ty}.png"
         try:
             with Image.open(path) as image:
                 rgba = np.asarray(image.convert("RGBA"))

@@ -1,6 +1,7 @@
 """Convert Copernicus/FABDEM DEM GeoTIFFs (1-degree COG tiles) into a
-Web-Mercator XYZ pyramid of Terrarium-encoded PNG elevation tiles
-(plus, optionally, a hillshade pyramid and the ArcGIS LERC pyramid — all
+Web-Mercator XYZ pyramid of Terrarium-encoded elevation tiles (lossless
+WebP by default, PNG with --terrain-format png) (plus, optionally, a
+hillshade pyramid and the ArcGIS LERC pyramid — all
 three from ONE reprojection per tile).
 
 WINDOWED, RESUMABLE, PARALLEL:
@@ -14,14 +15,23 @@ WINDOWED, RESUMABLE, PARALLEL:
     bbox are treated as stale and rebuilt;
   * tiles are built in a memory-safe process pool (--workers); a failing
     tile is reported and skipped, and the run exits non-zero at the end;
-  * PNGs are written without optimize=True: it costs ~10x CPU for ~3%
-    size on elevation tiles.
+  * Terrarium tiles are LOSSLESS WebP ({z}/{x}/{y}.webp; exact=True keeps
+    the RGB under transparent pixels): ~30% smaller and ~3x faster to encode
+    than PNG level 6. Lossy WebP would corrupt the packed heights — never.
+  * PNGs (hillshade, --terrain-format png) use zlib level 1 and no
+    optimize=True: level 6 costs ~5x CPU for ~10% size, optimize ~10x CPU
+    for ~3%.
+  * every file is written atomically and world-readable (0644) so a
+    non-root web server can serve the pyramid.
 
 Terrarium encoding (used by Mapzen/AWS terrain tiles, MapLibre, deck.gl):
     height_m = (R * 256 + G + B / 256) - 32768
 No-data pixels are transparent (alpha = 0) and decoded as noDataValue. Their
 RGB carries the nearest valid height, so clients that ignore alpha do not
 draw cliffs down to 0 m.
+
+Hillshade tiles are greyscale+alpha PNGs ('LA'): alpha 0 where the source
+has no data, 255 elsewhere.
 
 Usage:
   python build_tiles.py --src ../data/dem/*.tif \\
@@ -60,8 +70,14 @@ from pool_runner import PoolAborted, default_workers, describe_limits, run_pool 
 # pyramids carrying another version are rebuilt instead of resumed.
 #   2 = multi-source merge fix, decimated-read transform fix, ground-scaled
 #       seamless hillshade, filled RGB under transparent pixels.
-ENGINE_VERSION = 2
+#   3 = Terrarium as lossless WebP (default), hillshade 'LA' with transparent
+#       no-data, PNG zlib level 1, files written 0644.
+ENGINE_VERSION = 3
 MANIFEST_NAME = "build_manifest.json"
+TERRAIN_FORMATS = ("webp", "png")
+DEFAULT_TERRAIN_FORMAT = "webp"
+FILE_MODE = 0o644         # tiles/json must be readable by a non-root server
+PNG_COMPRESS_LEVEL = 1    # zlib level: 6 costs ~5x CPU for ~10% size
 
 
 def _default_workers() -> int:
@@ -331,11 +347,13 @@ def _row_latitudes(y: int, z: int, rows: int, buffer: int) -> np.ndarray:
 
 
 def hillshade(arr: np.ndarray, cell_m, buffer: int = 0) -> Image.Image:
-    """ESRI-style hillshade (azimuth 315°, altitude 45°) -> grayscale PNG.
+    """ESRI-style hillshade (azimuth 315°, altitude 45°) -> 'LA' image
+    (grey + alpha).
 
     cell_m is the GROUND cell size in metres: a scalar, or one value per row
     (Web Mercator cell * cos(lat)). NODATA pixels are filled from the nearest
-    valid height before the gradient (no cliffs to 0 m) and drawn mid-gray.
+    valid height before the gradient (no cliffs to 0 m), drawn mid-gray and
+    made transparent (alpha 0; alpha 255 elsewhere).
     `buffer` pixels on each side feed the gradient and are then cropped, so
     adjacent tiles shade seamlessly."""
     valid = arr > NODATA + 1.0
@@ -354,9 +372,12 @@ def hillshade(arr: np.ndarray, cell_m, buffer: int = 0) -> Image.Image:
     hs = np.clip(hs, 0.0, 1.0)
     out = (hs * 255).astype(np.uint8)
     out[~valid] = 128
+    alpha = np.where(valid, 255, 0).astype(np.uint8)
     if buffer:
         out = out[buffer:-buffer, buffer:-buffer]
-    return Image.fromarray(np.ascontiguousarray(out), "L")
+        alpha = alpha[buffer:-buffer, buffer:-buffer]
+    return Image.merge("LA", (Image.fromarray(np.ascontiguousarray(out)),
+                              Image.fromarray(np.ascontiguousarray(alpha))))
 
 
 def tile_hillshade(dst: np.ndarray, x: int, y: int, z: int, buffer: int) -> Image.Image:
@@ -383,10 +404,10 @@ def encode_terrarium(arr: np.ndarray) -> Image.Image:
     return Image.fromarray(out, "RGBA")
 
 
-def decode_terrarium_png(path: str):
-    """Heights (float32) from an existing Terrarium tile; None if unreadable
-    (a truncated PNG from an interrupted build is treated as missing).
-    alpha = 0 is no-data whatever the RGB holds."""
+def decode_terrarium(path: str):
+    """Heights (float32) from an existing Terrarium tile (WebP or PNG); None
+    if unreadable (a truncated tile from an interrupted build is treated as
+    missing). alpha = 0 is no-data whatever the RGB holds."""
     try:
         with Image.open(path) as im:
             arr = np.asarray(im.convert("RGBA")).astype(np.int64)
@@ -396,6 +417,26 @@ def decode_terrarium_png(path: str):
     heights = (v / 256.0 - 32768.0).astype(np.float32)
     heights[arr[..., 3] == 0] = NODATA
     return heights
+
+
+decode_terrarium_png = decode_terrarium  # backwards-compatible name
+
+
+def terrarium_tile_path(root: str, z: int, x: int, y: int,
+                        fmt: str = DEFAULT_TERRAIN_FORMAT) -> str:
+    """{root}/{z}/{x}/{y}.{webp|png}"""
+    return os.path.join(root, str(z), str(x), f"{y}.{fmt}")
+
+
+def save_terrarium(image: Image.Image, f, fmt: str = DEFAULT_TERRAIN_FORMAT) -> None:
+    """Terrarium tile to a file object. WebP MUST be lossless (heights are
+    packed into RGB) and exact (transparent pixels keep their filled RGB)."""
+    if fmt == "webp":
+        image.save(f, format="WEBP", lossless=True, exact=True, method=1, quality=25)
+    elif fmt == "png":
+        image.save(f, format="PNG", compress_level=PNG_COMPRESS_LEVEL)
+    else:
+        raise ValueError(f"unknown terrain format {fmt!r} (expected one of {TERRAIN_FORMATS})")
 
 
 def _tile_stats(arr: np.ndarray):
@@ -417,6 +458,8 @@ def write_atomic(path: str, writer) -> None:
     try:
         with os.fdopen(fd, "wb") as f:
             writer(f)
+        # mkstemp creates 0600: a non-root web server would answer 403
+        os.chmod(tmp, FILE_MODE)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -427,8 +470,15 @@ def write_atomic(path: str, writer) -> None:
 
 
 def _write_png(image: Image.Image, path: str) -> None:
-    """Atomic write. No optimize=True: it spends ~10x CPU for ~3% size."""
-    write_atomic(path, lambda f: image.save(f, format="PNG"))
+    """Atomic write, zlib level 1. No optimize=True: it spends ~10x CPU for
+    ~3% size."""
+    write_atomic(path, lambda f: image.save(f, format="PNG",
+                                            compress_level=PNG_COMPRESS_LEVEL))
+
+
+def _write_terrarium(image: Image.Image, path: str,
+                     fmt: str = DEFAULT_TERRAIN_FORMAT) -> None:
+    write_atomic(path, lambda f: save_terrarium(image, f, fmt))
 
 
 def write_json_atomic(path: str, obj) -> None:
@@ -544,10 +594,14 @@ class BuildManifest:
         self._save()
 
 
-TERRARIUM_PARAMS = {"encoding": "terrarium", "tile_px": TILE_PX, "nodata": NODATA,
-                    "resampling": "bilinear", "nodata_rgb": "nearest"}
+def terrarium_params(fmt: str = DEFAULT_TERRAIN_FORMAT) -> dict:
+    return {"encoding": "terrarium", "tile_px": TILE_PX, "nodata": NODATA,
+            "resampling": "bilinear", "nodata_rgb": "nearest", "terrain_format": fmt}
+
+
+TERRARIUM_PARAMS = terrarium_params(DEFAULT_TERRAIN_FORMAT)
 HILLSHADE_PARAMS = {"azimuth": HS_AZIMUTH, "altitude": HS_ALTITUDE,
-                    "cell": "ground", "buffer": HS_BUFFER}
+                    "cell": "ground", "buffer": HS_BUFFER, "mode": "LA"}
 
 
 def lerc_params(flavor: str, maxzerr: float) -> dict:
@@ -573,14 +627,17 @@ def lerc_tile_path(tile_root, z, x, y):
 
 
 def _tile_job(task):
-    """One tile -> Terrarium PNG (+ hillshade PNG + LERC blob) from a single
-    reprojection. task = (z, x, y, out_root, hs_root, force[, lerc]); force
-    is a bool or a (terrarium, hillshade, lerc) tuple; lerc is None or
-    (tile_root, flavor, maxzerr)."""
+    """One tile -> Terrarium WebP/PNG (+ hillshade PNG + LERC blob) from a
+    single reprojection. task = (z, x, y, out_root, hs_root, force[, lerc[,
+    terrain_format]]); force is a bool or a (terrarium, hillshade, lerc)
+    tuple; lerc is None or (tile_root, flavor, maxzerr). Only a tile in the
+    requested terrain format counts as done (a legacy .png does not satisfy a
+    webp build)."""
     z, x, y, out_root, hs_root, force = task[:6]
     lerc = task[6] if len(task) > 6 else None
+    fmt = task[7] if len(task) > 7 else DEFAULT_TERRAIN_FORMAT
     f_ter, f_hs, f_lerc = force if isinstance(force, tuple) else (force,) * 3
-    terr_path = os.path.join(out_root, str(z), str(x), f"{y}.png")
+    terr_path = terrarium_tile_path(out_root, z, x, y, fmt)
     hs_path = os.path.join(hs_root, str(z), str(x), f"{y}.png") if hs_root else None
     lerc_path = lerc_tile_path(lerc[0], z, x, y) if lerc else None
     need_ter = f_ter or not os.path.exists(terr_path)
@@ -589,10 +646,10 @@ def _tile_job(task):
         f_lerc or not (os.path.exists(lerc_path) and os.path.getsize(lerc_path) > 0))
 
     if not need_ter and not need_hs and not need_lerc:
-        heights = decode_terrarium_png(terr_path)
+        heights = decode_terrarium(terr_path)
         if heights is not None:
             return "skip", _tile_stats(heights), 0
-        need_ter = True  # truncated/corrupt PNG -> rebuild it
+        need_ter = True  # truncated/corrupt tile -> rebuild it
 
     buffer = HS_BUFFER if need_hs else 0
     dst = build_tile(_IDX, x, y, z, buffer=buffer)
@@ -601,7 +658,7 @@ def _tile_job(task):
     inner = dst[buffer:buffer + TILE_PX, buffer:buffer + TILE_PX] if buffer else dst
     st = _tile_stats(inner)
     if need_ter:
-        _write_png(encode_terrarium(inner), terr_path)
+        _write_terrarium(encode_terrarium(inner), terr_path, fmt)
     if need_hs:
         _write_png(tile_hillshade(dst, x, y, z, buffer), hs_path)
     if need_lerc:
@@ -613,11 +670,14 @@ def _tile_job(task):
 
 def _tilejson(args, gmin, gmax):
     minlon, minlat, maxlon, maxlat = args.bbox
+    fmt = getattr(args, "terrain_format", DEFAULT_TERRAIN_FORMAT)
     return {
         "tilejson": "3.0.0",
         "name": "Copernicus DEM 30m (Terrarium)",
-        "description": "Local heightmap pyramid, Terrarium-encoded PNG tiles",
-        "tiles": ["/terrarium/{z}/{x}/{y}.png"],
+        "description": f"Local heightmap pyramid, Terrarium-encoded "
+                       f"{'lossless WebP' if fmt == 'webp' else 'PNG'} tiles",
+        "tiles": [f"/terrarium/{{z}}/{{x}}/{{y}}.{fmt}"],
+        "format": fmt,
         "minzoom": args.minzoom,
         "maxzoom": args.maxzoom,
         "bounds": [minlon, minlat, maxlon, maxlat],
@@ -637,6 +697,10 @@ def parse_args(argv=None):
     ap.add_argument("--minzoom", type=int, default=8)
     ap.add_argument("--maxzoom", type=int, default=13)
     ap.add_argument("--out", default="public/terrarium")
+    ap.add_argument("--terrain-format", choices=TERRAIN_FORMATS,
+                    default=DEFAULT_TERRAIN_FORMAT,
+                    help="Terrarium tile format: lossless WebP {z}/{x}/{y}.webp "
+                         "(default) or PNG {z}/{x}/{y}.png")
     ap.add_argument("--hillshade-out", default=None,
                     help="also write a grayscale hillshade pyramid, e.g. public/hillshade")
     ap.add_argument("--lerc-out", default=None,
@@ -680,11 +744,13 @@ def main(argv=None) -> int:
     src_hash = source_fingerprint(args.src)
     _log(f"sources: {n_src} DEM file(s) (fingerprint {src_hash}); engine "
          f"v{ENGINE_VERSION}; windowed build, resume={'off' if args.force else 'on'}, "
-         f"workers={workers}; {describe_limits()}")
+         f"workers={workers}, terrain format={args.terrain_format}; "
+         f"{describe_limits()}")
 
     common = dict(source_hash=src_hash, bbox=args.bbox, minzoom=args.minzoom,
                   maxzoom=args.maxzoom, user_force=args.force, log=_log)
-    products = {"ter": BuildManifest(args.out, "terrarium", TERRARIUM_PARAMS, **common)}
+    products = {"ter": BuildManifest(args.out, "terrarium",
+                                     terrarium_params(args.terrain_format), **common)}
     roots = [args.out]
     if args.hillshade_out:
         products["hs"] = BuildManifest(args.hillshade_out, "hillshade",
@@ -695,6 +761,7 @@ def main(argv=None) -> int:
         import build_lerc
         if args.flavor == "lerc1":
             build_lerc.require_lerc1enc()
+            _log(f"lerc1 encoder: {build_lerc.lerc1_backend()}")
         svc_root = build_lerc.service_root(args.lerc_out, args.lerc_name)
         lerc = (os.path.join(svc_root, "tile"), args.flavor, args.maxzerr)
         products["lerc"] = BuildManifest(svc_root, "lerc",
@@ -713,7 +780,7 @@ def main(argv=None) -> int:
         span = (x1 - x0 + 1) * (y1 - y0 + 1)
         force = tuple(products[k].force_zoom(z) if k in products else False
                       for k in ("ter", "hs", "lerc"))
-        tasks = [(z, x, y, args.out, args.hillshade_out, force, lerc)
+        tasks = [(z, x, y, args.out, args.hillshade_out, force, lerc, args.terrain_format)
                  for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
         c = {"w": 0, "s": 0, "e": 0, "f": 0, "l": 0, "min": gmin, "max": gmax}
 

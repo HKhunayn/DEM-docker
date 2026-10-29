@@ -11,7 +11,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY engine/scripts/lerc1enc.cpp engine/scripts/lercv1/Lerc1Image.cpp engine/scripts/lercv1/Lerc1Image.h ./
-RUN g++ -O2 -std=c++17 lerc1enc.cpp Lerc1Image.cpp -o lerc1enc
+# CLI + in-process shared library (ctypes, build_lerc.py) from the same source
+RUN g++ -O2 -std=c++17 lerc1enc.cpp Lerc1Image.cpp -o lerc1enc \
+    && g++ -O2 -std=c++17 -shared -fPIC -fvisibility=hidden -DLERC1ENC_NO_MAIN \
+       lerc1enc.cpp Lerc1Image.cpp -o liblerc1enc.so
 
 # ---- stage 2: API + heightmap-30m DEM engine ----
 FROM ${PYTHON_IMAGE}
@@ -70,6 +73,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # heightmap-30m engine (fetch/build/verify/serve) + its prebuilt Lerc1 encoder
 COPY engine /opt/heightmap-30m
 COPY --from=lerc /build/lerc1enc /opt/heightmap-30m/scripts/lerc1enc
+COPY --from=lerc /build/liblerc1enc.so /opt/heightmap-30m/scripts/liblerc1enc.so
 
 COPY app ./app
 

@@ -1,9 +1,14 @@
 """Verify the Terrarium tile pyramid against the source DEM.
 
+Terrarium tiles may be lossless WebP ({z}/{x}/{y}.webp, the default) or PNG;
+--terrain-format auto takes the format from tilejson.json ("format"), else
+from the files present.
+
 Checks (all scoped to the AOI being verified — nothing is hard-coded to a
 particular place):
-  1. PNG encode/decode round-trip is lossless within the quantization step,
-     and transparent (alpha = 0) pixels decode as no-data.
+  1. Terrarium encode/decode round-trip (in the pyramid's format) is
+     bit-exact — including the RGB under transparent pixels — and within the
+     quantization step; transparent (alpha = 0) pixels decode as no-data.
   2. EVERY zoom of this build: a sample of tiles (random ones plus tiles on
      the 1-degree source boundaries crossing the AOI, plus the tile at
      --lon/--lat or the AOI centre) is decoded on a pixel grid and compared
@@ -42,8 +47,8 @@ from rasterio.enums import Resampling
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from build_tiles import (  # noqa: E402
-    NODATA, TILE_PX, SourceIndex, encode_terrarium, lonlat_to_tile,
-    pixel_center_lonlat, tile_range, validate_bbox,
+    NODATA, TERRAIN_FORMATS, TILE_PX, SourceIndex, encode_terrarium, lonlat_to_tile,
+    pixel_center_lonlat, save_terrarium, terrarium_tile_path, tile_range, validate_bbox,
 )
 
 __all__ = ["lonlat_to_tile", "tile_range", "main"]
@@ -54,6 +59,7 @@ GRID = 8                          # sample pixels per tile edge
 
 
 def decode_png(path):
+    """Heights + (w, h) of a Terrarium tile (PNG or WebP, despite the name)."""
     with Image.open(path) as im:
         arr = np.asarray(im.convert("RGBA")).astype(np.int64)
     h, w, _ = arr.shape
@@ -61,6 +67,24 @@ def decode_png(path):
     heights = v / 256.0 - 32768.0
     heights[arr[..., 3] == 0] = NODATA
     return heights, (w, h)
+
+
+decode_tile = decode_png
+
+
+def detect_format(tiles_dir, meta=None, zooms=()):
+    """Terrarium format of a pyramid: tilejson "format", else 'webp' when any
+    .webp tile exists under the given zooms, else 'png' (legacy builds)."""
+    fmt = (meta or {}).get("format") if isinstance(meta, dict) else None
+    if fmt in TERRAIN_FORMATS:
+        return fmt
+    for z in zooms:
+        zdir = os.path.join(tiles_dir, str(z))
+        for xs in (os.listdir(zdir) if os.path.isdir(zdir) else ()):
+            xdir = os.path.join(zdir, xs)
+            if os.path.isdir(xdir) and any(f.endswith(".webp") for f in os.listdir(xdir)):
+                return "webp"
+    return "png"
 
 
 def _valid(v):
@@ -164,12 +188,12 @@ def pick_tiles(bbox, z, n, rng, extra_points):
     return chosen
 
 
-def check_zoom(src, tiles_dir, bbox, z, tiles, base_tol, rng):
+def check_zoom(src, tiles_dir, bbox, z, tiles, base_tol, rng, fmt="png"):
     """Returns dict with counts and error stats for one zoom."""
     res = {"tiles": 0, "missing": 0, "points": 0, "nodata_where_src": 0,
            "errors": [], "examples": []}
     for x, y in tiles:
-        path = os.path.join(tiles_dir, str(z), str(x), f"{y}.png")
+        path = terrarium_tile_path(tiles_dir, z, x, y, fmt)
         grid = [(c, r) for r in np.linspace(2, TILE_PX - 3, GRID).astype(int)
                 for c in np.linspace(2, TILE_PX - 3, GRID).astype(int)]
         jitter = [(min(TILE_PX - 1, c + rng.randint(0, 3)),
@@ -217,13 +241,18 @@ def check_zoom(src, tiles_dir, bbox, z, tiles, base_tol, rng):
     return res
 
 
-def roundtrip_check():
-    """Terrarium encoder round-trip (in memory)."""
+def roundtrip_check(fmt="png"):
+    """Terrarium encoder round-trip (in memory) in the given tile format.
+    Returns (max height error on valid pixels, ok) where ok requires alpha 0
+    exactly on no-data, 255 elsewhere, AND the decoded RGBA bit-identical to
+    the encoder's (lossless, RGB kept under transparent pixels)."""
     rng = np.random.default_rng(42)
     synthetic = rng.uniform(-400, 4800, (256, 256)).astype(np.float32)
     synthetic[0, :5] = NODATA
+    synthetic[100:120, 30:90] = NODATA
+    image = encode_terrarium(synthetic)
     buf = io.BytesIO()
-    encode_terrarium(synthetic).save(buf, format="PNG")
+    save_terrarium(image, buf, fmt)
     buf.seek(0)
     with Image.open(buf) as im:
         arr = np.asarray(im.convert("RGBA")).astype(np.int64)
@@ -232,7 +261,8 @@ def roundtrip_check():
     valid = synthetic > NODATA + 1.0
     err = float(np.abs(rt[valid] - synthetic[valid]).max())
     alpha_ok = bool((arr[..., 3][~valid] == 0).all() and (arr[..., 3][valid] == 255).all())
-    return err, alpha_ok
+    exact = bool(np.array_equal(arr, np.asarray(image).astype(np.int64)))
+    return err, alpha_ok and exact
 
 
 def main(argv=None):
@@ -255,16 +285,33 @@ def main(argv=None):
     ap.add_argument("--max-scan", type=int, default=3000,
                     help="tiles decoded for the min/max stats check (sampled above this)")
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--terrain-format", choices=("auto",) + TERRAIN_FORMATS,
+                    default="auto",
+                    help="Terrarium tile format (auto: tilejson.json 'format', "
+                         "else the files present)")
     args = ap.parse_args(argv)
 
     failures = 0
     rng = random.Random(args.seed)
 
+    meta_path = os.path.join(os.path.dirname(args.tiles.rstrip("/\\")), "tilejson.json")
+    meta, meta_err = None, None
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+        except (OSError, ValueError) as e:
+            meta_err = e
+    all_zooms = sorted(int(z) for z in os.listdir(args.tiles) if z.isdigit()) \
+        if os.path.isdir(args.tiles) else []
+    fmt = (args.terrain_format if args.terrain_format != "auto"
+           else detect_format(args.tiles, meta, all_zooms))
+
     # 0) encoder round-trip within the Terrarium quantization step (1/256 m)
-    err, alpha_ok = roundtrip_check()
+    err, alpha_ok = roundtrip_check(fmt)
     ok = err <= 1 / 256 + 1e-6 and alpha_ok
-    print(f"encoder round-trip max error: {err:.6f} m, nodata->alpha 0: "
-          f"{'yes' if alpha_ok else 'NO'} ({'PASS' if ok else 'FAIL'}, "
+    print(f"encoder round-trip ({fmt}) max error: {err:.6f} m, nodata->alpha 0 + "
+          f"bit-exact RGBA: {'yes' if alpha_ok else 'NO'} ({'PASS' if ok else 'FAIL'}, "
           f"quantization step {1/256:.4f} m)")
     failures += 0 if ok else 1
 
@@ -281,8 +328,7 @@ def main(argv=None):
         else:
             extra = [((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)]
 
-        zooms = sorted(int(z) for z in os.listdir(args.tiles) if z.isdigit()) \
-            if os.path.isdir(args.tiles) else []
+        zooms = list(all_zooms)
         if args.minzoom is not None:
             zooms = [z for z in zooms if z >= args.minzoom]
         if args.maxzoom is not None:
@@ -301,7 +347,7 @@ def main(argv=None):
         mid_lat = (bbox[1] + bbox[3]) / 2
         for z in zooms:
             tiles = pick_tiles(bbox, z, args.tiles_per_zoom, rng, extra)
-            r = check_zoom(src, args.tiles, bbox, z, tiles, args.tolerance, rng)
+            r = check_zoom(src, args.tiles, bbox, z, tiles, args.tolerance, rng, fmt)
             tol, pixel_m = zoom_tolerance(args.tolerance, z, mid_lat)
             e = np.array(r["errors"]) if r["errors"] else np.array([np.nan])
             med = float(np.median(e))
@@ -334,6 +380,7 @@ def main(argv=None):
     # 2) stats over THIS BUILD's tiles only (a shared pyramid may hold tiles
     #    from earlier builds of other areas)
     files, stale = [], 0
+    ext = f".{fmt}"
     for z in zooms:
         zdir = os.path.join(args.tiles, str(z))
         x0, y0, x1, y1 = tile_range(bbox, z)
@@ -341,12 +388,13 @@ def main(argv=None):
             if not xs.isdigit():
                 continue
             xi = int(xs)
-            names = [f for f in os.listdir(os.path.join(zdir, xs)) if f.endswith(".png")]
+            names = [f for f in os.listdir(os.path.join(zdir, xs)) if f.endswith(ext)]
             if not x0 <= xi <= x1:
                 stale += len(names)
                 continue
             for f in names:
-                yi = int(f[:-4]) if f[:-4].isdigit() else -1
+                stem = f[:-len(ext)]
+                yi = int(stem) if stem.isdigit() else -1
                 if y0 <= yi <= y1:
                     files.append(os.path.join(zdir, xs, f))
                 else:
@@ -361,15 +409,9 @@ def main(argv=None):
             gmin, gmax = min(gmin, float(v.min())), max(gmax, float(v.max()))
             count += 1
 
-    meta_path = os.path.join(os.path.dirname(args.tiles.rstrip("/\\")), "tilejson.json")
-    meta = None
-    if os.path.exists(meta_path):
-        try:
-            with open(meta_path) as f:
-                meta = json.load(f)
-        except (OSError, ValueError) as e:
-            print(f"tilejson.json unreadable: {e} (FAIL)")
-            failures += 1
+    if meta_err is not None:
+        print(f"tilejson.json unreadable: {meta_err} (FAIL)")
+        failures += 1
     scope = "all" if exact else f"a sample of {len(scan)} of {len(files)}"
     stale_txt = f" (ignored {stale} stale tiles from earlier builds)" if stale else ""
     if count:

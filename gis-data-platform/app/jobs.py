@@ -45,7 +45,7 @@ from .config import (  # noqa: F401  (re-exported)
 
 log = logging.getLogger(__name__)
 
-STEPS = ("fetch", "build", "verify")
+STEPS = ("fetch", "build", "verify", "publish")
 HISTORY_LIMIT = 20
 LOG_TAIL_LIMIT = 5000          # lines kept in memory per job (full log is on disk)
 DEFAULT_TAIL = 200
@@ -526,6 +526,7 @@ def _run_job(
     verified_pass = False
     failed_step: str | None = None
     failed_rc: int | None = None
+    verify_failed_rc: int | None = None
     try:
         _open_log(job)
         threading.Thread(target=_watchdog, args=(job,), daemon=True).start()
@@ -584,6 +585,11 @@ def _run_job(
             if abort:
                 break
             if rc != 0:
+                if step == "verify":
+                    # A verify failure keeps the new build; still publish it so
+                    # the served tiles match the metadata (warning below).
+                    verify_failed_rc = rc
+                    continue
                 failed_step, failed_rc = step, rc
                 break
             if step == "build":
@@ -598,16 +604,20 @@ def _run_job(
             outcome = "error"
             error = (f"{job['step']} step stalled: the engine printed nothing for "
                      f"{_fmt_duration(IDLE_TIMEOUT_S)} and was terminated")
-        elif failed_step == "verify":
+        elif failed_step == "publish":
             outcome = "done"
-            warning = (f"verify step failed (exit {failed_rc}); the new build was kept - "
-                       "check the log for the verify differences")
+            warning = (f"publish step failed (exit {failed_rc}); the new build was kept but "
+                       "the previously published tiles are still served - check the log")
         elif failed_step is not None:
             outcome, error = "error", f"{failed_step} step failed (exit {failed_rc})"
         else:
             outcome = "done"
+        if outcome == "done" and verify_failed_rc is not None:
+            note = (f"verify step failed (exit {verify_failed_rc}); the new build was kept - "
+                    "check the log for the verify differences")
+            warning = f"{note}; {warning}" if warning else note
         if outcome == "done":
-            result = {**matches, "verified": verified_pass and failed_step is None}
+            result = {**matches, "verified": verified_pass and verify_failed_rc is None}
     except BaseException as exc:  # noqa: BLE001
         outcome, result = "error", None
         error = f"{job.get('step')} step failed ({exc})"

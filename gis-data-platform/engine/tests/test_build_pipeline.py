@@ -80,8 +80,9 @@ def test_tiles_without_manifest_are_stale(tmp_path, capsys, sources):
     os.remove(os.path.join(root, "terrarium", bt.MANIFEST_NAME))
     # poison a tile: a resumed run would keep it, a stale-run must replace it
     x, y = bt.lonlat_to_tile(47.0, 24.5, 9)
-    p = os.path.join(root, "terrarium", "9", str(x), f"{y}.png")
-    Image.new("RGBA", (256, 256)).save(p)
+    p = bt.terrarium_tile_path(os.path.join(root, "terrarium"), 9, x, y)
+    assert p.endswith(".webp") and os.path.exists(p)
+    bt._write_terrarium(Image.new("RGBA", (256, 256)), p)
     rc, out = run_build(capsys, sources, root, zooms=("9", "9"))
     assert rc == 0 and "no build_manifest.json" in out
     assert (np.asarray(Image.open(p))[..., 3] == 255).any()
@@ -169,13 +170,13 @@ def test_lerc1_blob_errors_include_stderr_and_time_out(tmp_path, monkeypatch):
     bad.chmod(0o755)
     monkeypatch.setattr(build_lerc, "LERC1ENC", str(bad))
     with pytest.raises(RuntimeError, match="exited with 3: cannot open input"):
-        build_lerc.lerc1_blob(np.zeros((4, 4), np.float32), 0.01)
+        build_lerc.lerc1_blob_cli(np.zeros((4, 4), np.float32), 0.01)
     slow = tmp_path / "slow.sh"
     slow.write_text("#!/bin/sh\nsleep 5\n")
     slow.chmod(0o755)
     monkeypatch.setattr(build_lerc, "LERC1ENC", str(slow))
     with pytest.raises(RuntimeError, match="timed out"):
-        build_lerc.lerc1_blob(np.zeros((4, 4), np.float32), 0.01, timeout=0.5)
+        build_lerc.lerc1_blob_cli(np.zeros((4, 4), np.float32), 0.01, timeout=0.5)
     # one scratch dir per process, not one per tile
     assert os.path.isdir(build_lerc._work_dir())
     assert build_lerc._work_dir() == build_lerc._work_dir()
@@ -211,10 +212,10 @@ def test_verify_passes_and_catches_transparent_pixels(tmp_path, capsys, sources)
         assert f"z{z}:" in out
     # punch transparent holes in a boundary tile at z8 (what E1 looked like)
     x, y = bt.lonlat_to_tile(47.0, 24.5, 8)
-    p = os.path.join(root, "terrarium", "8", str(x), f"{y}.png")
-    rgba = np.asarray(Image.open(p)).copy()
+    p = bt.terrarium_tile_path(os.path.join(root, "terrarium"), 8, x, y)
+    rgba = np.asarray(Image.open(p).convert("RGBA")).copy()
     rgba[..., 3] = 0
-    Image.fromarray(rgba, "RGBA").save(p)
+    bt._write_terrarium(Image.fromarray(rgba, "RGBA"), p)
     rc = verify_tiles.main(args)
     out = capsys.readouterr().out
     assert rc == 1 and "transparent pixel" in out

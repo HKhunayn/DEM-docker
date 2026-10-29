@@ -6,7 +6,9 @@ Subcommands (all local, all open source):
   build    DEM -> terrarium PNG pyramid + ArcGIS LERC ImageServer pyramid
   verify   encoder round-trip + ground-truth checks
   serve    local server: ArcGIS REST elevation service + terrarium tiles
-  all      fetch + build + verify in one go
+  publish  bake the current build into a static, seamless tile set
+           (data/tiles/published/<version>/) that nginx serves directly
+  all      fetch + build + verify + publish in one go
 
 Examples:
   python terrainhub.py all --bbox 6.6 45.6 7.2 46.0 --name local30m
@@ -19,7 +21,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
-import fetch_dem, fetch_fabdem, build_tiles, verify_tiles, serve  # noqa: E402
+import fetch_dem, fetch_fabdem, build_tiles, verify_tiles, serve, publish_tiles  # noqa: E402
 
 # Single data root: gis-data-platform owns storage, this project is only the
 # build engine. Sources land in <root>/dem, pyramids in <root>/tiles.
@@ -125,7 +127,7 @@ def main() -> int:
     common.add_argument("--data", default=DATA_DIR)
     common.add_argument("--root", default=TILE_DIR)
 
-    for c in ("fetch", "build", "verify", "all"):
+    for c in ("fetch", "build", "verify", "publish", "all"):
         sp = sub.add_parser(c, parents=[common])
         if c == "fetch":
             sp.add_argument("--out", default=DATA_DIR, help="source DEM output dir")
@@ -212,6 +214,9 @@ def main() -> int:
                                        "--minzoom", str(args.minzoom),
                                        "--maxzoom", str(args.maxzoom)])
 
+    def publish():
+        return run(publish_tiles.main, ["--root", args.root])
+
     if args.cmd == "status":
         args.check = True
         return fetch()
@@ -221,6 +226,8 @@ def main() -> int:
         return build()
     if args.cmd == "verify":
         return verify()
+    if args.cmd == "publish":
+        return publish()
 
     # all
     rc = fetch()
@@ -229,7 +236,10 @@ def main() -> int:
     rc = build()
     if rc:
         return rc
-    return verify()
+    rc = verify()
+    if rc:
+        return rc
+    return publish()
 
 
 if __name__ == "__main__":
