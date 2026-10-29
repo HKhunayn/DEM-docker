@@ -46,3 +46,18 @@ button.quiet { padding: .25rem .55rem; }
 .warnings button { margin-top: .45rem; }
 .notice.error button { margin-top: .6rem; }
 button:disabled, button:disabled:hover { opacity: .55; cursor: progress; background: #17263d; border-color: #385174; }
+
+/* go-to box (header) */
+.goto { position: relative; display: flex; gap: .35rem; margin-left: auto; }
+.goto input { width: 18rem; padding: .4rem .6rem; border-radius: .4rem; border: 1px solid #3a4d6e; background: #0b1424; color: #e8eef9; font: inherit; font-size: .85rem; }
+.goto input:focus { outline: 2px solid #4f8cff; outline-offset: 0; }
+.goto > button { padding: .4rem .8rem; }
+.goto-suggestions { position: absolute; top: calc(100% + .25rem); left: 0; right: 0; z-index: 50; display: flex; flex-direction: column; max-height: 22rem; overflow: auto; background: #111c2f; border: 1px solid #3a4d6e; border-radius: .4rem; box-shadow: 0 8px 24px rgba(0,0,0,.35); }
+.goto-suggestions button { text-align: start; padding: .45rem .65rem; background: none; border: 0; border-bottom: 1px solid #1f2d46; border-radius: 0; color: #e8eef9; font-size: .82rem; cursor: pointer; unicode-bidi: plaintext; }
+.goto-suggestions button:hover { background: #1c2c48; }
+.goto-suggestions.hidden { display: none; }
+
+/* cursor position readout (map corner) */
+.coords { position: absolute; left: .6rem; bottom: .6rem; z-index: 15; padding: .25rem .55rem; border-radius: .35rem; border: 0; background: rgba(17, 28, 47, .82); color: #e8eef9; font: 600 .75rem/1.4 ui-monospace, SFMono-Regular, Consolas, monospace; cursor: copy; }
+.coords.hidden { display: none; }
+.attribution-note { font-size: .7rem; color: #8ea0bd; margin-top: .8rem; }

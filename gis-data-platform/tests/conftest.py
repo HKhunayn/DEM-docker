@@ -39,7 +39,7 @@ STUB_TERRAINHUB = textwrap.dedent(
             with open(os.path.join(root, "tilejson.json"), "w") as fh:
                 fh.write(os.environ["STUB_TILEJSON"])
     elif cmd == "verify":
-        print("stats match: PASS")
+        print("stats match (sampled: range inside tilejson): PASS")
     print(f"stub {cmd}: done")
     '''
 )

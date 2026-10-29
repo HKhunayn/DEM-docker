@@ -571,7 +571,8 @@ def _run_job(
                     m = regex.search(line)
                     if m:
                         matches[key] = int(m.group(1))  # keep the last match
-                if "stats match: PASS" in line:
+                # "stats match: PASS" (exact) or "stats match (sampled: ...): PASS"
+                if line.startswith("stats match") and line.endswith(": PASS"):
                     verified_pass = True
             rc = proc.wait()
             with _LOCK:

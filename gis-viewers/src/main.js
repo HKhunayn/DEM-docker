@@ -15,6 +15,8 @@ import {makePlatformTerrainProvider} from "./cesiumTerrain.js";
 import {ReliefImageryProvider} from "./cesiumRelief.js";
 import {COLOR_RELIEF_OPACITY, HILLSHADE, MAP_BACKGROUND, colorReliefExpression, hillshadeExaggerationExpression} from "./relief.js";
 import {formatElapsed, isAbortError, templatesKey, withTimeout} from "./uiHelpers.js";
+import {GOTO_HINT, findCatalogItem, formatLatLon, normalizeText, parseCoordinates, parsePlaces, placeLabel, searchPlaces, zoomForPopulation} from "./goto.js";
+import {cleanCamera, fromArcgisZoom, fromCesiumPitch, parseCameraHash, rangeForZoom, throttle, toArcgisZoom, toCesiumPitch, verticalFov, withCameraHash, zoomForRange} from "./camera.js";
 
 // A production container serves the viewer and reverse-proxies the platform
 // under the same origin. VITE_PLATFORM_URL remains available for local dev or
@@ -33,6 +35,11 @@ app.innerHTML = `
       <button data-view="arcgis">ArcGIS</button>
       <button data-view="cesium">CesiumJS</button>
     </nav>
+    <form id="goto" class="goto" role="search" autocomplete="off">
+      <input id="goto-input" type="search" aria-label="Go to a place or coordinates" spellcheck="false">
+      <button type="submit">Go</button>
+      <div id="goto-suggestions" class="goto-suggestions hidden" role="listbox"></div>
+    </form>
   </header>
   <main>
     <aside aria-label="Platform catalog">
@@ -44,12 +51,14 @@ app.innerHTML = `
       <div class="panel-heading imagery-heading"><h2>Imagery</h2></div>
       <select id="imagery-select" aria-label="Imagery set"><option value="">— none —</option></select>
       <div id="imagery-info" class="imagery-info">No imagery sets yet — fetch one on the platform's /fetch/ page (Imagery tab).</div>
+      <p class="attribution-note">Place search: offline <a href="https://www.geonames.org/" target="_blank" rel="noopener">GeoNames</a> cities (CC-BY 4.0).</p>
     </aside>
     <section id="map" aria-label="Geospatial viewers">
       <div id="maplibre" class="viewer"></div>
       <div id="arcgis" class="viewer hidden"></div>
       <div id="cesium" class="viewer hidden"></div>
       <div id="map-message" class="map-message hidden" role="alert"></div>
+      <button id="coords" class="coords hidden" type="button" title="Cursor position (lat, lon) - click to copy"></button>
     </section>
   </main>`;
 
@@ -68,7 +77,6 @@ let arcgisView = null;
 let arcgisMap = null;
 let cesiumViewer = null;
 let selectedImagery = null;
-let arcgisPendingGoTo = false;
 let mapLibreReady = false;
 let arcgisImageryLayer = null;
 let arcgisElevationLayer = null;
@@ -463,6 +471,7 @@ function createMapLibre() {
   });
   maplibre.addControl(new maplibregl.NavigationControl(), "top-right");
   if (import.meta.env.DEV) window.__viewers = Object.assign(window.__viewers || {}, {maplibre});
+  watchMapLibre();
   maplibre.on("load", () => {
     // Gentle vertical exaggeration: most of the data is low-relief desert.
     maplibre.setTerrain({source: "terrain", exaggeration: 1.4});
@@ -486,6 +495,7 @@ async function createArcGIS() {
   if (import.meta.env.DEV) window.__viewers = Object.assign(window.__viewers || {}, {arcgis: arcgisView});
   applyArcGISImagery();
   await arcgisView.when();
+  watchArcGIS();
   setArcGISElevation(serviceForItem(selectedItem));
 }
 
@@ -573,7 +583,8 @@ async function createCesium() {
   setCesiumRelief();
   applyCesiumImagery();
   await setCesiumTerrain();
-  cesiumFrame(selectedItem, 0);
+  watchCesium();
+  if (lastCamera) applyCamera("cesium", lastCamera); else cesiumFrame(selectedItem, 0);
 }
 
 function destroyQuietly(object) {
@@ -701,11 +712,8 @@ function arcgisNavigate(center, zoom) {
   setArcGISElevation(serviceForItem(selectedItem));
   // A hidden SceneView is suspended: its goTo aborts or never settles. Record
   // the target and replay it when the ArcGIS tab is shown (setViewer).
-  if (activeView !== "arcgis") {
-    arcgisPendingGoTo = true;
-    return Promise.resolve("deferred");
-  }
-  arcgisPendingGoTo = false;
+  // The camera is handed over when the tab is shown (setViewer).
+  if (activeView !== "arcgis") return Promise.resolve("deferred");
   return arcgisView.goTo({center, zoom}).then(() => "arrived", (error) => {
     // goTo rejects with AbortError when superseded by a newer navigation or
     // while the view is hidden in another tab; that is not a failure.
@@ -714,6 +722,301 @@ function arcgisNavigate(center, zoom) {
     throw error;
   });
 }
+
+// ---- shared camera: go-to box, URL hash, tab hand-over, cursor readout ----
+// The common camera is MapLibre's {lon, lat, zoom, bearing, pitch} (camera.js
+// converts it for ArcGIS and CesiumJS).
+
+let lastCamera = parseCameraHash(window.location.hash);   // restored on reload
+const startCamera = lastCamera;
+let arcgisPendingCamera = null;     // applied when the ArcGIS tab is shown
+let suppressCameraTracking = 0;     // ignore our own programmatic moves' events
+const writeHash = throttle((camera) => {
+  const hash = withCameraHash(window.location.hash, camera);
+  if (hash !== window.location.hash) history.replaceState(null, "", `${window.location.pathname}${window.location.search}${hash}`);
+}, 400);
+
+const rad = (deg) => (deg * Math.PI) / 180;
+const deg = (radians) => (radians * 180) / Math.PI;
+
+function cesiumFovy() {
+  const frustum = cesiumViewer?.camera?.frustum;
+  const canvas = cesiumViewer?.scene?.canvas;
+  return verticalFov(frustum?.fov ?? rad(60), canvas?.clientWidth || 1, canvas?.clientHeight || 1);
+}
+
+function cesiumCenterPick() {
+  const scene = cesiumViewer.scene; const canvas = scene.canvas;
+  const ray = cesiumViewer.camera.getPickRay(new Cesium.Cartesian2(canvas.clientWidth / 2, canvas.clientHeight / 2));
+  return ray ? scene.globe.pick(ray, scene) : undefined;
+}
+
+/** Current camera of a viewer in the common format (null if unavailable). */
+function readCamera(view) {
+  try {
+    if (view === "maplibre" && maplibre) {
+      const c = maplibre.getCenter();
+      return cleanCamera({lon: c.lng, lat: c.lat, zoom: maplibre.getZoom(), bearing: maplibre.getBearing(), pitch: maplibre.getPitch()});
+    }
+    if (view === "arcgis" && arcgisView?.ready && arcgisView.center) {
+      const cam = arcgisView.camera;
+      return cleanCamera({lon: arcgisView.center.longitude, lat: arcgisView.center.latitude,
+        zoom: fromArcgisZoom(arcgisView.zoom), bearing: cam?.heading ?? 0, pitch: cam?.tilt ?? 0});
+    }
+    if (view === "cesium" && cesiumViewer) {
+      const camera = cesiumViewer.camera;
+      const target = cesiumCenterPick();
+      const canvas = cesiumViewer.scene.canvas;
+      let lon, lat, range;
+      if (target) {
+        const carto = Cesium.Cartographic.fromCartesian(target);
+        lon = deg(carto.longitude); lat = deg(carto.latitude);
+        range = Cesium.Cartesian3.distance(camera.positionWC, target);
+      } else {           // looking at the sky/horizon: use the camera position
+        const carto = camera.positionCartographic;
+        lon = deg(carto.longitude); lat = deg(carto.latitude); range = carto.height;
+      }
+      return cleanCamera({lon, lat, zoom: zoomForRange(range, lat, canvas.clientHeight, cesiumFovy()),
+        bearing: deg(camera.heading), pitch: fromCesiumPitch(deg(camera.pitch))});
+    }
+  } catch { /* viewer not ready */ }
+  return null;
+}
+
+/** Record the active viewer's camera (URL hash + hand-over to other tabs). */
+function trackCamera(view) {
+  if (view !== activeView || suppressCameraTracking > 0) return;
+  const camera = readCamera(view);
+  if (!camera) return;
+  lastCamera = camera;
+  writeHash(camera);
+}
+
+/** Put one viewer at `camera`; animate only when it is the visible one. */
+function applyCamera(view, camera, {animate = false} = {}) {
+  const c = cleanCamera(camera);
+  if (!c) return Promise.resolve("skipped");
+  const visible = view === activeView;
+  if (view === "maplibre" && maplibre) {
+    const options = {center: [c.lon, c.lat], zoom: c.zoom, bearing: c.bearing, pitch: c.pitch};
+    if (!(animate && visible)) { maplibre.jumpTo(options); return Promise.resolve("arrived"); }
+    return new Promise((resolve) => { maplibre.once("moveend", () => resolve("arrived")); maplibre.flyTo(options); });
+  }
+  if (view === "arcgis" && arcgisView) {
+    // A hidden SceneView is suspended (goTo aborts): apply when shown.
+    if (!visible) { arcgisPendingCamera = c; return Promise.resolve("deferred"); }
+    arcgisPendingCamera = null;
+    const target = {center: [c.lon, c.lat], zoom: toArcgisZoom(c.zoom), heading: c.bearing, tilt: c.pitch};
+    return arcgisView.when().then(() => arcgisView.goTo(target, {animate: animate && visible}))
+      .then(() => "arrived", (error) => { if (isAbortError(error)) return "deferred"; throw error; });
+  }
+  if (view === "cesium" && cesiumViewer) {
+    return new Promise((resolve) => {
+      const carto = Cesium.Cartographic.fromDegrees(c.lon, c.lat);
+      const ground = cesiumViewer.scene.globe.getHeight(carto) ?? (Number(state?.terrain?.statistics?.min) || 0);
+      const centre = Cesium.Cartesian3.fromDegrees(c.lon, c.lat, Math.max(0, ground));
+      const canvas = cesiumViewer.scene.canvas;
+      const range = rangeForZoom(c.zoom, c.lat, canvas.clientHeight, cesiumFovy());
+      cesiumViewer.camera.flyToBoundingSphere(new Cesium.BoundingSphere(centre, 0), {
+        // A hidden widget never advances a flight: duration 0 is synchronous.
+        duration: animate && visible ? 1.5 : 0,
+        offset: new Cesium.HeadingPitchRange(rad(c.bearing), rad(toCesiumPitch(c.pitch)), range),
+        complete: () => resolve("arrived"), cancel: () => resolve("cancelled"),
+      });
+      cesiumViewer.scene.requestRender();
+    });
+  }
+  return Promise.resolve("skipped");
+}
+
+/** Smallest built elevation area whose bounds contain lon/lat (or null). */
+function areaCovering(lon, lat) {
+  const hits = allItems().filter((item) => {
+    const b = itemBounds(item);
+    return item?.kind !== "imagery" && b && lon >= b[0] && lon <= b[2] && lat >= b[1] && lat <= b[3] && serviceForItem(item);
+  });
+  const size = (item) => { const b = itemBounds(item); return (b[2] - b[0]) * (b[3] - b[1]); };
+  return hits.sort((a, b) => size(a) - size(b))[0] || null;
+}
+
+/** Make the area under the target the selection (ArcGIS elevation is per area). */
+function selectAreaAt(lon, lat) {
+  const item = areaCovering(lon, lat);
+  if (!item || sameItem(item, selectedItem)) return;
+  selectedItem = item;
+  renderCatalog(allItems());
+  renderDetails(item);
+  for (const view of ["maplibre", "cesium"]) setMapMessage("", view);
+  setArcGISElevation(serviceForItem(item));
+}
+
+/** Move every viewer to `camera` (the visible one animates). */
+async function teleport(camera, {animate = true} = {}) {
+  const c = cleanCamera(camera);
+  if (!c) return;
+  selectAreaAt(c.lon, c.lat);
+  lastCamera = c; writeHash(c);
+  suppressCameraTracking += 1;
+  try {
+    await Promise.allSettled(["maplibre", "arcgis", "cesium"].map((view) =>
+      withTimeout(applyCamera(view, c, {animate}), NAVIGATION_TIMEOUT_MS)));
+  } finally {
+    suppressCameraTracking -= 1;
+  }
+  trackCamera(activeView);
+}
+
+// Called once per created viewer (camera tracking + cursor readout).
+function watchMapLibre() {
+  maplibre.on("moveend", () => trackCamera("maplibre"));
+  maplibre.on("mousemove", (event) => {
+    const terrain = maplibre.getTerrain?.();
+    let elevation = terrain ? maplibre.queryTerrainElevation(event.lngLat) : null;
+    // queryTerrainElevation includes the vertical exaggeration.
+    if (Number.isFinite(elevation) && terrain?.exaggeration) elevation /= terrain.exaggeration;
+    showReadout("maplibre", event.lngLat.lat, event.lngLat.lng, elevation);
+  });
+}
+
+function watchCesium() {
+  cesiumViewer.camera.moveEnd.addEventListener(() => trackCamera("cesium"));
+  const handler = new Cesium.ScreenSpaceEventHandler(cesiumViewer.scene.canvas);
+  let pending = null;
+  handler.setInputAction((movement) => {
+    if (pending) { pending.position = movement.endPosition; return; }
+    pending = {position: movement.endPosition};
+    requestAnimationFrame(() => {
+      const ray = cesiumViewer?.camera.getPickRay(pending.position); pending = null;
+      const hit = ray && cesiumViewer.scene.globe.pick(ray, cesiumViewer.scene);
+      if (!hit) return;
+      const carto = Cesium.Cartographic.fromCartesian(hit);
+      showReadout("cesium", deg(carto.latitude), deg(carto.longitude), carto.height);
+    });
+  }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+}
+
+function watchArcGIS() {
+  arcgisView.watch("stationary", (stationary) => { if (stationary) trackCamera("arcgis"); });
+  let busy = false;
+  arcgisView.on("pointer-move", (event) => {
+    if (busy) return;
+    busy = true;
+    requestAnimationFrame(() => {
+      busy = false;
+      const point = arcgisView?.toMap({x: event.x, y: event.y});
+      if (point) showReadout("arcgis", point.latitude, point.longitude, point.z);
+    });
+  });
+}
+
+// ---- go-to box -------------------------------------------------------------
+
+const gotoForm = document.querySelector("#goto");
+const gotoInput = document.querySelector("#goto-input");
+const gotoList = document.querySelector("#goto-suggestions");
+let places = null;          // lazily loaded offline gazetteer
+let placesLoading = null;
+let suggestionHits = [];
+
+function loadPlaces() {
+  if (places) return Promise.resolve(places);
+  placesLoading ||= fetch(`${import.meta.env.BASE_URL}places.tsv`)
+    .then((response) => { if (!response.ok) throw new Error(`gazetteer HTTP ${response.status}`); return response.text(); })
+    .then((text) => (places = parsePlaces(text)))
+    .catch((error) => { placesLoading = null; throw error; });
+  return placesLoading;
+}
+
+function catalogNames(item) {
+  return [itemName(item), item?.name, item?.title, item?.dataset?.name, item?.properties?.name].filter(Boolean);
+}
+
+function hideSuggestions() {
+  suggestionHits = [];
+  gotoList.replaceChildren();
+  gotoList.classList.add("hidden");
+}
+
+async function showSuggestions() {
+  const query = gotoInput.value.trim();
+  if (!query || parseCoordinates(query)) { hideSuggestions(); return; }
+  const rows = allItems().filter((item) => catalogNames(item).some((name) => normalizeText(name).includes(normalizeText(query))))
+    .slice(0, 3).map((item) => ({label: `${itemName(item)} · saved area`, run: () => goToItem(item)}));
+  try {
+    const hits = searchPlaces(await loadPlaces(), query, 8 - rows.length);
+    if (gotoInput.value.trim() !== query) return;   // the user kept typing
+    suggestionHits = hits;
+    rows.push(...hits.map((hit) => ({label: placeLabel(hit), run: () => goToPlace(hit)})));
+  } catch { /* gazetteer unavailable: saved areas only */ }
+  gotoList.replaceChildren(...rows.map((row) => el("button", {type: "button", text: row.label,
+    onmousedown: (event) => { event.preventDefault(); hideSuggestions(); row.run(); }})));
+  gotoList.classList.toggle("hidden", rows.length === 0);
+}
+
+function goToItem(item) {
+  gotoInput.value = itemName(item);
+  return selectItem(item);
+}
+
+function goToPlace(hit) {
+  const {place} = hit;
+  gotoInput.value = place.name;
+  const zoom = zoomForPopulation(place.population);
+  setStatus(`Going to ${placeLabel(hit)} · ${formatLatLon(place.lat, place.lon)}`, "success");
+  return teleport({...(readCamera(activeView) || lastCamera || {}), lat: place.lat, lon: place.lon, zoom});
+}
+
+async function goTo(query) {
+  const text = String(query || "").trim();
+  if (!text) return;
+  hideSuggestions();
+  const coords = parseCoordinates(text);
+  if (coords?.error) { setStatus(`Go to: ${coords.error}`, "error"); return; }
+  if (coords) {
+    const zoom = coords.zoom ?? Math.max(lastCamera?.zoom ?? 0, 12);
+    const note = coords.swapped ? " (first value > 90 read as longitude)" : "";
+    setStatus(`Going to ${formatLatLon(coords.lat, coords.lon)}${note}`, "success");
+    await teleport({...(readCamera(activeView) || lastCamera || {}), lat: coords.lat, lon: coords.lon, zoom});
+    return;
+  }
+  const item = findCatalogItem(allItems(), text, catalogNames);
+  if (item) { await goToItem(item); return; }
+  setBusyStatus(`Searching places for "${text}"`);
+  try {
+    const [best] = searchPlaces(await loadPlaces(), text, 1);
+    if (!best) { setStatus(`No place or coordinates matched "${text}" · try "lat, lon" (e.g. 24.7136, 46.6753)`, "warning"); return; }
+    await goToPlace(best);
+  } catch (error) {
+    setStatus(`Place search unavailable (${formatError(error)}) · coordinates still work: "lat, lon"`, "error");
+  }
+}
+
+gotoInput.placeholder = "Go to: place or lat, lon";
+gotoInput.title = GOTO_HINT;
+gotoForm.addEventListener("submit", (event) => { event.preventDefault(); goTo(gotoInput.value); });
+let suggestTimer = null;
+gotoInput.addEventListener("input", () => { clearTimeout(suggestTimer); suggestTimer = setTimeout(showSuggestions, 150); });
+gotoInput.addEventListener("focus", () => { loadPlaces().catch(() => {}); });
+gotoInput.addEventListener("blur", () => setTimeout(hideSuggestions, 150));
+gotoInput.addEventListener("keydown", (event) => { if (event.key === "Escape") { hideSuggestions(); gotoInput.blur(); } });
+
+// ---- cursor readout ----------------------------------------------------------
+
+const readout = document.querySelector("#coords");
+let readoutText = "";
+
+function showReadout(view, lat, lon, elevation) {
+  if (view !== activeView || !Number.isFinite(lat) || !Number.isFinite(lon)) return;
+  readoutText = formatLatLon(lat, lon);
+  readout.textContent = `${readoutText}${Number.isFinite(elevation) ? ` · ${Math.round(elevation)} m` : ""}`;
+  readout.classList.remove("hidden");
+}
+
+readout.addEventListener("click", async () => {
+  if (!readoutText) return;
+  try { await navigator.clipboard.writeText(readoutText); setStatus(`Copied ${readoutText}`, "success"); }
+  catch { setStatus(`Copy failed · ${readoutText}`, "warning"); }
+});
 
 /** Move every viewer to the selection; resolves once all navigations settled. */
 async function syncViews() {
@@ -740,26 +1043,35 @@ async function syncViews() {
 }
 
 function setViewer(view) {
+  // Hand the current position over to the viewer being shown.
+  const handOver = (view !== activeView && readCamera(activeView)) || lastCamera;
+  if (handOver) lastCamera = handOver;
   activeView = view;
   renderMapMessage();
   document.querySelectorAll("header nav button").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
   document.querySelectorAll(".viewer").forEach((element) => element.classList.toggle("hidden", element.id !== view));
   requestAnimationFrame(() => {
     if (view === "maplibre") maplibre?.resize();
-    if (view === "arcgis") {
-      // SceneView has no resize(); it tracks its container size itself.
-      if (arcgisPendingGoTo && arcgisView && selectedItem) {
-        arcgisPendingGoTo = false;
-        // The first time the view becomes visible it may still be starting up
-        // and abort the navigation; retry a few times until it lands.
-        const target = {center: itemCenter(selectedItem), zoom: itemZoom(selectedItem)};
-        const attempt = (left) => arcgisView?.when()
-          .then(() => arcgisView.goTo(target))
-          .catch(() => { if (left > 0 && activeView === "arcgis") setTimeout(() => attempt(left - 1), 400); });
-        attempt(5);
-      }
-    }
     if (view === "cesium" && cesiumViewer) { cesiumViewer.resize(); cesiumViewer.scene.requestRender(); }
+    const target = handOver || arcgisPendingCamera;
+    if (!target || activeView !== view) return;
+    if (view === "arcgis" && arcgisView) {
+      // SceneView has no resize(); it tracks its container size itself. The
+      // first time it becomes visible it may still be starting up and abort
+      // the navigation; retry a few times until it lands.
+      arcgisPendingCamera = null;
+      suppressCameraTracking += 1;
+      const attempt = (left) => applyCamera("arcgis", target)
+        .then((result) => { if (result !== "arrived") throw new Error(result); suppressCameraTracking -= 1; })
+        .catch(() => {
+          if (left > 0 && activeView === "arcgis") setTimeout(() => attempt(left - 1), 400);
+          else suppressCameraTracking -= 1;
+        });
+      attempt(5);
+    } else {
+      suppressCameraTracking += 1;
+      applyCamera(view, target).finally(() => { suppressCameraTracking -= 1; });
+    }
   });
 }
 
@@ -825,6 +1137,12 @@ async function loadPlatformState() {
     const failures = await startViewers();
     if (!anyViewer) {
       appliedTerrainKey = templatesKey(terrainTemplates());
+      // A position in the URL (#map=zoom/lat/lon/bearing/pitch) wins over
+      // the default framing of the selected area.
+      if (startCamera) {
+        await teleport(startCamera, {animate: false});
+        navigation = {text: "restored the position from the URL", kind: "success"};
+      }
     } else {
       setBusyStatus("Platform reloaded · moving viewers");
       navigation = await syncViews();
