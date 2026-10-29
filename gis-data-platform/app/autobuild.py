@@ -1,4 +1,4 @@
-"""Keep every saved elevation area tiled.
+"""Keep every saved elevation area tiled (runs in the ENGINE).
 
 Tiles are derived data: a TRUTH backup (docker-volume-tool export) carries the
 DEMs, catalog and job history but no tiles/, and an old FULL backup may carry
@@ -14,8 +14,16 @@ missing, one job at a time, through the normal job runner:
   LERC-only job (its ArcGIS ImageServer), which never replaces the published
   set.
 
-The DEM sources are normally already in the volume, so ``fetch`` only checks
-them. Builds stop (state ``blocked``) when the data disk is low.
+- every area the data-platform downloaded while the engine was busy or not
+  running (dataset ``pendingBuild: full``, state ``downloaded``, or a full
+  build cut short by an engine restart) gets a full build first.
+
+The engine never downloads: every job starts with an offline ``check`` of the
+DEMs on the volume. Builds stop (state ``blocked``) when the data disk is low.
+Besides the start-up pass, a periodic check (GIS_AUTOBUILD_INTERVAL_S, default
+60 s, only while idle) picks up areas downloaded while the engine runs; an
+area whose build failed is not retried by the periodic check until it is
+handed over again (or POST /api/tiles/rebuild-missing).
 """
 
 from __future__ import annotations
@@ -44,10 +52,21 @@ _LOCK = threading.Lock()
 _STATE: dict[str, Any] = {"state": "idle", "message": "", "queue": [], "current": None,
                           "done": [], "failed": [], "started": None, "finished": None}
 _THREAD: threading.Thread | None = None
+_PERIODIC: threading.Thread | None = None
+_WAKE = threading.Event()
+_FAILED: set[str] = set()       # area names whose last automatic build failed
+PENDING_STATES = ("downloaded", "interrupted", "queued")
 
 
 def enabled() -> bool:
     return os.environ.get("GIS_AUTOBUILD", "1") not in ("0", "false", "no", "off")
+
+
+def interval_s() -> float:
+    try:
+        return float(os.environ.get("GIS_AUTOBUILD_INTERVAL_S", "60"))
+    except ValueError:
+        return 60.0
 
 
 def min_free_gb() -> float:
@@ -174,28 +193,57 @@ def primary_area(areas: list[dict[str, Any]], published: dict[str, Any]) -> dict
     return max(areas, key=size)
 
 
+def pending_build(area: dict[str, Any]) -> str | None:
+    """Why a full build of this area is still owed (downloaded by the
+    data-platform, or a full build cut short), else None."""
+    dataset = area.get("dataset")
+    if not isinstance(dataset, dict) or dataset.get("pendingBuild") != "full":
+        return None
+    state = dataset.get("state")
+    if state == "downloaded":
+        return "downloaded by the data-platform, not built yet"
+    if state in PENDING_STATES:
+        return f"full build {state} - resuming"
+    return None
+
+
 def plan() -> dict[str, Any]:
-    """What is missing and the jobs that would fix it (primary first)."""
+    """What is missing and the jobs that would fix it (handed-over downloads
+    first, then the primary area, then LERC-only rebuilds)."""
     areas = elevation_areas()
     published = published_status()
     primary = primary_area(areas, published)
-    rows, tasks = [], []
+    rows, pending, tasks = [], [], []
     for a in areas:
         lerc = lerc_status(a)
         is_primary = primary is not None and a.get("id") == primary.get("id")
         row = {"name": a["name"], "bbox": a["bbox"], "minzoom": a.get("minzoom"), "maxzoom": a.get("maxzoom"),
                "primary": is_primary, "lerc": lerc}
+        dataset = a.get("dataset") if isinstance(a.get("dataset"), dict) else {}
+        if dataset.get("state"):
+            row["state"] = dataset.get("state")
         rows.append(row)
         task = None
-        if is_primary and not published["ok"]:
+        owed = pending_build(a)
+        if owed:
+            task = {"mode": "full", "reason": owed}
+        elif is_primary and not published["ok"]:
             task = {"mode": "full", "reason": published["reason"]}
         elif not lerc["ok"]:
             task = {"mode": "lerc", "reason": lerc["reason"]}
         if task:
             task.update(name=a["name"], bbox=list(a["bbox"]), provider=a.get("provider") or "copernicus",
                         minzoom=int(a.get("minzoom", 0)), maxzoom=int(a.get("maxzoom", 13)))
-            (tasks.insert(0, task) if is_primary else tasks.append(task))
+            if owed:
+                task["_order"] = str(a.get("updated") or "")
+                pending.append(task)
+            elif is_primary:
+                tasks.insert(0, task)
+            else:
+                tasks.append(task)
             row["needs"] = task["mode"]
+    pending.sort(key=lambda t: t.pop("_order"))
+    tasks = pending + tasks
     return {"published": {k: v for k, v in published.items() if k != "current"} | {
                 "version": (published.get("current") or {}).get("version"),
                 "bounds": (published.get("current") or {}).get("bounds")},
@@ -217,6 +265,9 @@ def status() -> dict[str, Any]:
                        "jobState": job.get("state")}
             auto["current"] = current
     auto["enabled"] = enabled()
+    auto["intervalS"] = interval_s() if enabled() else 0
+    with _LOCK:
+        auto["skipped"] = sorted(_FAILED)
     return {"ready": p["published"]["ok"] and not p["tasks"], **p, "autobuild": auto}
 
 
@@ -241,8 +292,43 @@ def _wait_idle(stop: threading.Event) -> None:
         stop.wait(POLL_S)
 
 
-def _run(stop: threading.Event) -> None:
+def _jobs_busy() -> bool:
+    latest = jobs.current_job(tail=0)
+    if latest is not None and latest.get("state") in jobs.ACTIVE_STATES:
+        return True
+    return jobs.orphan_engine_pid() is not None
+
+
+def _pass_running() -> bool:
+    thread = _THREAD
+    return thread is not None and thread.is_alive()
+
+
+def _todo(skip_failed: bool) -> list[dict[str, Any]]:
     tasks = plan()["tasks"]
+    if skip_failed:
+        with _LOCK:
+            failed = set(_FAILED)
+        tasks = [t for t in tasks if t["name"] not in failed]
+    return tasks
+
+
+def forget_failure(name: str | None = None) -> None:
+    """Retry `name` (all areas when None) in the next automatic pass."""
+    with _LOCK:
+        if name is None:
+            _FAILED.clear()
+        else:
+            _FAILED.discard(name)
+
+
+def wake() -> None:
+    """Run the periodic check soon (e.g. a hand-off was queued behind a running build)."""
+    _WAKE.set()
+
+
+def _run(stop: threading.Event, skip_failed: bool = False) -> None:
+    tasks = _todo(skip_failed)
     _set(state="running" if tasks else "done", queue=[f"{t['name']} ({t['mode']})" for t in tasks],
          current=None, done=[], failed=[], started=_now(), finished=None,
          message=f"{len(tasks)} build(s) queued" if tasks else "all saved areas are tiled")
@@ -280,11 +366,13 @@ def _run(stop: threading.Event) -> None:
             except Exception as exc:  # noqa: BLE001
                 with _LOCK:
                     _STATE["failed"].append(f"{label}: {exc}")
+                    _FAILED.add(task["name"])
                 continue
         except Exception as exc:  # noqa: BLE001
             log.exception("autobuild could not start %s", label)
             with _LOCK:
                 _STATE["failed"].append(f"{label}: {exc}")
+                _FAILED.add(task["name"])
             continue
         _set(current={"name": task["name"], "mode": task["mode"], "reason": task["reason"],
                       "jobId": snap["id"], "index": i, "total": len(tasks)},
@@ -299,8 +387,12 @@ def _run(stop: threading.Event) -> None:
             _STATE["queue"] = [q for q in _STATE["queue"] if q != label]
             if job.get("state") == "done":
                 _STATE["done"].append(label)
+                _FAILED.discard(task["name"])
+            elif job.get("state") == "interrupted":
+                _STATE["failed"].append(f"{label}: {job.get('error') or job.get('state')}")
             else:
                 _STATE["failed"].append(f"{label}: {job.get('error') or job.get('state')}")
+                _FAILED.add(task["name"])
             _STATE["current"] = None
     with _LOCK:
         failed = list(_STATE["failed"])
@@ -312,19 +404,22 @@ def _run(stop: threading.Event) -> None:
 _STOP = threading.Event()
 
 
-def start(delay: float = 0.0) -> bool:
-    """Start one reconcile pass in the background; False if one is running."""
+def start(delay: float = 0.0, skip_failed: bool = False) -> bool:
+    """Start one reconcile pass in the background; False if one is running.
+    A manual/start-up pass retries everything (skip_failed=False)."""
     global _THREAD
     with _LOCK:
         if _THREAD is not None and _THREAD.is_alive():
             return False
+        if not skip_failed:
+            _FAILED.clear()
         _STATE.update(state="checking", message="checking which areas need tiles")
 
         def target() -> None:
             if delay and _STOP.wait(delay):
                 return
             try:
-                _run(_STOP)
+                _run(_STOP, skip_failed=skip_failed)
             except Exception as exc:  # noqa: BLE001
                 log.exception("autobuild crashed")
                 _set(state="error", message=f"autobuild crashed: {exc}", current=None, finished=_now())
@@ -334,8 +429,44 @@ def start(delay: float = 0.0) -> bool:
     return True
 
 
+def _periodic(interval: float) -> None:
+    """Every `interval` s while idle (or soon after wake()): start a pass when
+    something needs building - areas downloaded while the engine runs."""
+    while not _STOP.is_set():
+        woke = _WAKE.wait(interval)
+        if _STOP.is_set():
+            return
+        _WAKE.clear()
+        try:
+            # a queued hand-off waits for the running build / pass to end
+            while woke and not _STOP.is_set() and (_pass_running() or _jobs_busy()):
+                _STOP.wait(POLL_S)
+            if _STOP.is_set() or _pass_running() or _jobs_busy():
+                continue
+            if _todo(skip_failed=True):
+                log.warning("autobuild: periodic check found work - starting a pass")
+                start(skip_failed=True)
+        except Exception:  # noqa: BLE001
+            log.exception("autobuild periodic check failed")
+
+
+def start_periodic(interval: float | None = None) -> bool:
+    """Start the periodic check thread (once); False when disabled/running."""
+    global _PERIODIC
+    interval = interval_s() if interval is None else interval
+    if interval <= 0:
+        return False
+    with _LOCK:
+        if _PERIODIC is not None and _PERIODIC.is_alive():
+            return False
+        _PERIODIC = threading.Thread(target=_periodic, args=(interval,), name="autobuild-periodic", daemon=True)
+        _PERIODIC.start()
+    return True
+
+
 def stop() -> None:
     _STOP.set()
+    _WAKE.set()
 
 
 def wait(timeout: float = 30.0) -> None:

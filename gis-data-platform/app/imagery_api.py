@@ -1,4 +1,9 @@
-"""Imagery APIs: providers, fetch jobs, local imagery sets (TileJSON + XYZ)."""
+"""Imagery APIs.
+
+data-platform (``router``): providers, download jobs, delete a set.
+engine (``serve_router``): list the local sets, TileJSON and the XYZ tile
+fallback (nginx serves the stored tiles; FastAPI over-zooms / crops).
+"""
 from __future__ import annotations
 
 from typing import Any, Literal
@@ -9,7 +14,8 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from . import catalog, imagery, jobs
 
-router = APIRouter()
+router = APIRouter()        # data-platform
+serve_router = APIRouter()  # engine
 
 
 class ImageryJobInput(BaseModel):
@@ -88,7 +94,7 @@ def start_imagery_job(body: ImageryJobInput) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@router.get("/api/imagery")
+@serve_router.get("/api/imagery")
 def imagery_sets(request: Request) -> dict[str, Any]:
     sets = [_tilejson(meta, _base(request)) for meta in imagery.list_sets()]
     return {"sets": sets, "count": len(sets)}
@@ -106,7 +112,7 @@ def delete_imagery_set(name: str) -> dict[str, Any]:
     return {"deleted": True}
 
 
-@router.get("/tiles/imagery-sets/{name}.json")
+@serve_router.get("/tiles/imagery-sets/{name}.json")
 def imagery_tilejson(name: str, request: Request) -> JSONResponse:
     meta = imagery.get_set(name)
     if not meta:
@@ -116,7 +122,7 @@ def imagery_tilejson(name: str, request: Request) -> JSONResponse:
     return response
 
 
-@router.get("/tiles/imagery-sets/{name}/{z}/{x}/{y}")
+@serve_router.get("/tiles/imagery-sets/{name}/{z}/{x}/{y}")
 def imagery_tile(name: str, z: int, x: int, y: int) -> Response:
     out = imagery.tile(name, z, x, y)
     if out is None:

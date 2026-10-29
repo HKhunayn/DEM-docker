@@ -9,7 +9,8 @@ from fastapi.testclient import TestClient
 NAME = "Terrain3D"
 
 
-def _load(tmp_path, monkeypatch):
+def _load(tmp_path, monkeypatch, role="engine"):
+    monkeypatch.setenv("GIS_ROLE", role)
     monkeypatch.setenv("GIS_DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.setenv("LEGACY_HEIGHTMAP_ROOT", str(tmp_path / "legacy"))
     import app.config
@@ -118,7 +119,7 @@ def test_finite_sanitizer():
 
 
 def test_ingest_maps_errors(tmp_path, monkeypatch):
-    main = _load(tmp_path, monkeypatch)
+    main = _load(tmp_path, monkeypatch, role="platform")
     client = TestClient(main.app)
 
     def raise_(exc):

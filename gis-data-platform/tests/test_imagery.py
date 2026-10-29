@@ -46,7 +46,7 @@ def test_imagery_providers_listed(client):
     assert all("url" not in p for p in data["providers"])
 
 
-def test_world_z0_z1_fetch_creates_set_area_and_tiles(client, monkeypatch):
+def test_world_z0_z1_fetch_creates_set_area_and_tiles(client, serve_client, monkeypatch):
     calls = _stub_http(monkeypatch)
     response = client.post("/api/imagery/jobs", json=WORLD)
     assert response.status_code == 202, response.text
@@ -57,23 +57,23 @@ def test_world_z0_z1_fetch_creates_set_area_and_tiles(client, monkeypatch):
     assert len(calls) == 5
     assert any("/1/1/0.jpg" in url for url in calls)  # {z}/{y}/{x} WMTS order
 
-    sets = client.get("/api/imagery").json()
+    sets = serve_client.get("/api/imagery").json()   # served by the engine
     assert sets["count"] == 1
     tj = sets["sets"][0]
     assert tj["name"] == "world_test" and tj["maxzoom"] == 1
     assert "/tiles/imagery-sets/world_test/{z}/{x}/{y}" in tj["tiles"][0]
-    assert client.get("/tiles/imagery-sets/world_test.json").json()["attribution"]
+    assert serve_client.get("/tiles/imagery-sets/world_test.json").json()["attribution"]
 
     area = client.get(f"/api/areas/{job['areaId']}").json()
     assert area["kind"] == "imagery"
     assert area["dataset"]["state"] == "done"
     assert area["dataset"]["tilejson"] == "/tiles/imagery-sets/world_test.json"
 
-    tile = client.get("/tiles/imagery-sets/world_test/1/1/0")
+    tile = serve_client.get("/tiles/imagery-sets/world_test/1/1/0")
     assert tile.status_code == 200 and tile.headers["content-type"] == "image/jpeg"
 
     # over-zoom above maxzoom is served from the ancestor
-    deep = client.get("/tiles/imagery-sets/world_test/12/2048/1300")
+    deep = serve_client.get("/tiles/imagery-sets/world_test/12/2048/1300")
     assert deep.status_code == 200 and deep.headers["content-type"] == "image/jpeg"
     assert Image.open(io.BytesIO(deep.content)).size == (256, 256)
 
@@ -84,13 +84,13 @@ def test_world_z0_z1_fetch_creates_set_area_and_tiles(client, monkeypatch):
     assert len(client.get("/api/areas").json()["areas"]) == 1
 
 
-def test_imagery_missing_set_and_out_of_area_tiles(client, monkeypatch):
+def test_imagery_missing_set_and_out_of_area_tiles(client, serve_client, monkeypatch):
     _stub_http(monkeypatch)
-    assert client.get("/tiles/imagery-sets/nope/0/0/0").status_code == 404
+    assert serve_client.get("/tiles/imagery-sets/nope/0/0/0").status_code == 404
     small = {"name": "small", "provider": "bluemarble", "bbox": [40, 20, 41, 21], "minzoom": 2, "maxzoom": 3}
     job = wait_done(client, client.post("/api/imagery/jobs", json=small).json()["id"])
     assert job["state"] == "done"
-    outside = client.get("/tiles/imagery-sets/small/3/0/0")
+    outside = serve_client.get("/tiles/imagery-sets/small/3/0/0")
     assert outside.headers["content-type"] == "image/png"   # transparent fill
 
 
@@ -174,13 +174,13 @@ def test_http_get_checks_content_type_and_size(monkeypatch):
         imagery.http_get("https://x/0/0/0.jpg")
 
 
-def test_corrupt_ancestor_tile_gives_transparent_png_not_500(client, monkeypatch):
+def test_corrupt_ancestor_tile_gives_transparent_png_not_500(client, serve_client, monkeypatch):
     _stub_http(monkeypatch)
     job = wait_done(client, client.post("/api/imagery/jobs", json=WORLD).json()["id"])
     assert job["state"] == "done"
     imagery = sys.modules["app.imagery"]
     (imagery.set_dir("world_test") / "1" / "1" / "0.jpg").write_bytes(b"\xff\xd8\xff truncated garbage")
-    deep = client.get("/tiles/imagery-sets/world_test/12/2048/1300")
+    deep = serve_client.get("/tiles/imagery-sets/world_test/12/2048/1300")
     assert deep.status_code == 200 and deep.headers["content-type"] == "image/png"
 
 
@@ -268,3 +268,11 @@ def test_imagery_job_cancel(client, monkeypatch):
     assert job["state"] == "cancelled"
     area = client.get(f"/api/areas/{started['areaId']}").json()
     assert area["dataset"]["state"] == "cancelled"
+
+
+def test_imagery_routes_split_between_apps(client, serve_client):
+    """Downloads on the data-platform, tiles/TileJSON on the engine."""
+    assert client.get("/api/imagery").status_code in (404, 405)
+    assert client.get("/tiles/imagery-sets/x/0/0/0").status_code == 404
+    assert serve_client.post("/api/imagery/jobs", json=WORLD).status_code in (404, 405)
+    assert serve_client.get("/api/imagery/providers").status_code == 404

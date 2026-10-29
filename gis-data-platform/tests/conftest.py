@@ -28,6 +28,10 @@ STUB_TERRAINHUB = textwrap.dedent(
     if os.environ.get("STUB_FAIL") == cmd:
         print("FAIL stub failure")
         raise SystemExit(1)
+    if cmd == "sources" and os.environ.get("STUB_NO_SOURCES"):
+        print("MISSING source DEMs: no copernicus DEM file for this bbox - download this area "
+              "with the data-platform (fetch page) first; the engine does not download")
+        raise SystemExit(3)
     if cmd == "fetch":
         print("  saved   data/tile.tif (1.0 MB)")
         print("Done: 2 tile(s) -> manifest data/manifest.json")
@@ -38,6 +42,9 @@ STUB_TERRAINHUB = textwrap.dedent(
             root = sys.argv[sys.argv.index("--root") + 1]
             with open(os.path.join(root, "tilejson.json"), "w") as fh:
                 fh.write(os.environ["STUB_TILEJSON"])
+    elif cmd == "sources":
+        print("tiles for bbox: 2 | cached: 2 | missing: 0")
+        print("sources OK: 2 DEM file(s) on disk for this area")
     elif cmd == "verify":
         print("stats match (sampled: range inside tilejson): PASS")
     print(f"stub {cmd}: done")
@@ -45,7 +52,8 @@ STUB_TERRAINHUB = textwrap.dedent(
 )
 
 # Modules that capture DATA_ROOT / ENGINE_ROOT at import time.
-PLATFORM_MODULES = ["app.config", "app.catalog", "app.imagery", "app.jobs", "app.autobuild", "app.fetch_api", "app.imagery_api"]
+PLATFORM_MODULES = ["app.config", "app.catalog", "app.handoff", "app.imagery", "app.jobs", "app.autobuild",
+                    "app.fetch_api", "app.build_api", "app.imagery_api"]
 
 
 @pytest.fixture()
@@ -78,6 +86,13 @@ def isolated_platform(tmp_path, monkeypatch, stub_engine):
     jobs, provider cache or lock file.
     """
     monkeypatch.setenv("GIS_DATA_ROOT", str(tmp_path / "data"))
+    # Default role for tests that build app.main themselves: the engine
+    # (serving). The `client` fixture is the data-platform, `engine` the engine.
+    monkeypatch.setenv("GIS_ROLE", "engine")
+    # The hand-off target: nothing listens there (= engine not running) unless
+    # a test patches app.handoff.
+    monkeypatch.setenv("ENGINE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("ENGINE_TIMEOUT_S", "2")
     # No automatic rebuild on app start-up in tests (test_autobuild drives it).
     monkeypatch.setenv("GIS_AUTOBUILD", "0")
     monkeypatch.setenv("LEGACY_HEIGHTMAP_ROOT", str(tmp_path / "legacy"))
@@ -85,7 +100,7 @@ def isolated_platform(tmp_path, monkeypatch, stub_engine):
     monkeypatch.setenv("HEIGHTMAP_PYTHON", sys.executable)
     # ingest is restricted to an allow-listed dir; tests ingest from tmp_path
     monkeypatch.setenv("GIS_INGEST_ROOT", str(tmp_path))
-    for var in ("STUB_SLEEP", "STUB_SLEEP_STEP", "STUB_FAIL", "STUB_SPAWN_CHILD", "STUB_TILEJSON",
+    for var in ("STUB_SLEEP", "STUB_SLEEP_STEP", "STUB_FAIL", "STUB_SPAWN_CHILD", "STUB_TILEJSON", "STUB_NO_SOURCES",
                 "GIS_JOB_IDLE_TIMEOUT_S", "GIS_INGEST_MAX_BYTES"):
         monkeypatch.delenv(var, raising=False)
     jobs = reload_platform()
@@ -107,7 +122,31 @@ def isolated_platform(tmp_path, monkeypatch, stub_engine):
         current._wait_threads(timeout=10.0)  # the test reloaded app.jobs
 
 
+def use_role(monkeypatch, role: str):
+    """Switch the process to `role` (job dirs/locks follow) and rebuild the app."""
+    monkeypatch.setenv("GIS_ROLE", role)
+    jobs = reload_platform(include_main=True)
+    with jobs._LOCK:
+        jobs._JOBS.clear()
+        jobs._ORDER.clear()
+        jobs._CURRENT_ID = None
+    return sys.modules["app.main"]
+
+
 @pytest.fixture()
-def client(isolated_platform):
-    reload_platform(include_main=True)
-    return TestClient(sys.modules["app.main"].app)
+def client(isolated_platform, monkeypatch):
+    """The data-platform app (downloads)."""
+    return TestClient(use_role(monkeypatch, "platform").app)
+
+
+@pytest.fixture()
+def engine(isolated_platform, monkeypatch):
+    """The engine app (build + serve)."""
+    return TestClient(use_role(monkeypatch, "engine").app)
+
+
+@pytest.fixture()
+def serve_client(client):
+    """The engine's routes next to a data-platform `client` (same process and
+    data root): read-only serving checks after a platform download."""
+    return TestClient(sys.modules["app.main"].create_app("engine"))

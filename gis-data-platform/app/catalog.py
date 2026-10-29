@@ -1,4 +1,5 @@
 from __future__ import annotations
+import contextlib
 import json
 import mimetypes
 import os
@@ -10,7 +11,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import CATALOG_PATH, SOURCE_ROOT, ingest_max_bytes, ingest_root
+from .config import CATALOG_LOCK_PATH, CATALOG_PATH, SOURCE_ROOT, ingest_max_bytes, ingest_root
+
+try:  # POSIX (the containers); a Windows dev run only has the thread lock
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 
 TITLE_MAX_LEN = 200
 CRS_MAX_LEN = 100
@@ -19,9 +25,36 @@ CRS_MAX_LEN = 100
 class NameConflictError(Exception):
     """A saved area / imagery set name is already used with another provider (HTTP 409)."""
 
-# The catalog is read-modify-written from API requests and job threads; every
-# edit holds this lock and writes through a unique temp file before replacing.
+# The catalog is read-modify-written from API requests and job threads of TWO
+# processes (data-platform + engine containers share the volume). Every edit
+# holds edit_lock(): a thread RLock plus an exclusive flock on
+# catalog/.catalog.lock, and writes through a unique temp file + os.replace,
+# so readers never see a partial file and no process loses another's edit.
 _EDIT_LOCK = threading.RLock()
+_LOCAL = threading.local()
+
+
+@contextlib.contextmanager
+def edit_lock():
+    """Cross-thread + cross-process lock around a catalog load-modify-write.
+    Re-entrant within a thread (the flock is taken by the outermost call)."""
+    with _EDIT_LOCK:
+        depth = getattr(_LOCAL, "depth", 0)
+        handle = None
+        if depth == 0 and fcntl is not None:
+            CATALOG_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(CATALOG_LOCK_PATH, "a+")
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        _LOCAL.depth = depth + 1
+        try:
+            yield
+        finally:
+            _LOCAL.depth = depth
+            if handle is not None:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                finally:
+                    handle.close()
 
 
 def _now() -> str:
@@ -35,7 +68,7 @@ def load_catalog() -> dict[str, Any]:
 
 def save_catalog(catalog: dict[str, Any]) -> None:
     CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with _EDIT_LOCK:
+    with edit_lock():
         temp = CATALOG_PATH.with_name(f"{CATALOG_PATH.name}.{uuid.uuid4().hex}.tmp")
         temp.write_text(json.dumps(catalog, indent=2), encoding="utf-8")
         temp.replace(CATALOG_PATH)
@@ -124,14 +157,14 @@ def ingest_file(source: Path, kind: str = "unknown", title: str | None = None, c
         },
         "links": [],
     }
-    with _EDIT_LOCK:
+    with edit_lock():
         catalog = load_catalog()
         catalog["items"] = [*catalog.get("items", []), item]
         save_catalog(catalog)
     return item
 
 def delete_item(item_id: str) -> bool:
-    with _EDIT_LOCK:
+    with edit_lock():
         catalog = load_catalog()
         old = catalog.get("items", [])
         kept = [item for item in old if item.get("id") != item_id]
@@ -156,6 +189,38 @@ def list_areas() -> list[dict[str, Any]]:
 
 def find_area(area_id: str) -> dict[str, Any] | None:
     return next((area for area in list_areas() if area.get("id") == area_id), None)
+
+
+def find_area_by_name(name: str, kind: str = "elevation", provider: str | None = None) -> dict[str, Any] | None:
+    """The saved area called `name` (newest first when several providers)."""
+    matches = [a for a in list_areas() if a.get("name") == name and (a.get("kind") or "elevation") == kind
+               and (provider is None or a.get("provider") == provider)]
+    matches.sort(key=lambda a: str(a.get("updated") or ""), reverse=True)
+    return matches[0] if matches else None
+
+
+def update_area_dataset(area_id: str, if_state: str | None = None, **fields: Any) -> dict[str, Any] | None:
+    """Merge `fields` into the area's dataset (other dataset keys are kept);
+    a None value removes the key. With `if_state` the change is only applied
+    while the dataset is still in that state (another process may have moved
+    it on meanwhile, e.g. the engine started building it)."""
+    with edit_lock():
+        catalog = load_catalog()
+        for area in catalog.get("areas", []):
+            if area.get("id") == area_id:
+                dataset = dict(area.get("dataset") or {})
+                if if_state is not None and dataset.get("state") != if_state:
+                    return area
+                for key, value in fields.items():
+                    if value is None:
+                        dataset.pop(key, None)
+                    else:
+                        dataset[key] = value
+                area["dataset"] = dataset
+                area["updated"] = _now()
+                save_catalog(catalog)
+                return area
+    return None
 
 
 def _area_kind(area: dict[str, Any]) -> str:
@@ -199,7 +264,7 @@ def create_area(
         "created": now,
         "updated": now,
     }
-    with _EDIT_LOCK:
+    with edit_lock():
         catalog = load_catalog()
         catalog["areas"] = [*catalog.get("areas", []), area]
         save_catalog(catalog)
@@ -218,7 +283,7 @@ def upsert_area(
     """Save a fetch result without duplicating: a saved area is identified by
     (name, provider), so re-running a fetch refreshes that area instead of
     leaving a new row with the same name in the viewer's selection list."""
-    with _EDIT_LOCK:
+    with edit_lock():
         check_area_provider(name, provider, kind)
         catalog = load_catalog()
         existing = next(
@@ -241,7 +306,7 @@ def upsert_area(
 
 
 def update_area(area_id: str, **fields: Any) -> dict[str, Any] | None:
-    with _EDIT_LOCK:
+    with edit_lock():
         catalog = load_catalog()
         for area in catalog.get("areas", []):
             if area.get("id") == area_id:
@@ -253,7 +318,7 @@ def update_area(area_id: str, **fields: Any) -> dict[str, Any] | None:
 
 
 def delete_area(area_id: str) -> bool:
-    with _EDIT_LOCK:
+    with edit_lock():
         catalog = load_catalog()
         old = catalog.get("areas", [])
         kept = [area for area in old if area.get("id") != area_id]
@@ -266,7 +331,7 @@ def delete_area(area_id: str) -> bool:
 
 def delete_areas(name: str, kind: str) -> int:
     """Remove every saved area called `name` of `kind`; returns how many."""
-    with _EDIT_LOCK:
+    with edit_lock():
         catalog = load_catalog()
         old = catalog.get("areas", [])
         kept = [a for a in old if not (a.get("name") == name and _area_kind(a) == kind)]
@@ -276,16 +341,17 @@ def delete_areas(name: str, kind: str) -> int:
         return len(old) - len(kept)
 
 
-def mark_interrupted_areas(message: str) -> int:
-    """Startup: datasets left in state 'building' by a dead job -> 'interrupted'."""
-    with _EDIT_LOCK:
+def mark_interrupted_areas(message: str, states: tuple[str, ...] = ("building",)) -> int:
+    """Startup: datasets left in one of `states` by a dead job -> 'interrupted'
+    (each role passes only the states its own jobs write)."""
+    with edit_lock():
         if not CATALOG_PATH.exists():
             return 0
         catalog = load_catalog()
         changed = 0
         for area in catalog.get("areas", []):
             dataset = area.get("dataset")
-            if isinstance(dataset, dict) and dataset.get("state") == "building":
+            if isinstance(dataset, dict) and dataset.get("state") in states:
                 dataset["state"] = "interrupted"
                 dataset["error"] = message
                 area["updated"] = _now()

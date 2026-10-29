@@ -3,6 +3,9 @@ any ArcGIS client (plus MapLibre/deck.gl/QGIS via the Terrarium pyramid).
 
 Subcommands (all local, all open source):
   fetch    download Copernicus DEM COG tiles for a bbox (ESA open data)
+  sources  OFFLINE check that the source DEMs of a bbox are on disk (never
+           downloads; exit 3 + a clear message when none are) - the build
+           engine's first step, so it never touches the network
   build    DEM -> Terrarium (lossless WebP) pyramid + ArcGIS LERC ImageServer
            pyramid (no hillshade: browsers shade the elevation tiles)
   verify   encoder round-trip + ground-truth checks
@@ -130,7 +133,7 @@ def main() -> int:
     common.add_argument("--data", default=DATA_DIR)
     common.add_argument("--root", default=TILE_DIR)
 
-    for c in ("fetch", "build", "verify", "publish", "all"):
+    for c in ("fetch", "sources", "build", "verify", "publish", "all"):
         sp = sub.add_parser(c, parents=[common])
         if c == "fetch":
             sp.add_argument("--out", default=DATA_DIR, help="source DEM output dir")
@@ -231,9 +234,25 @@ def main() -> int:
         keep = ["--keep-raw"] if getattr(args, "keep_raw", False) else []
         return run(publish_tiles.main, ["--root", args.root] + keep)
 
+    def sources():
+        """Offline: report cached/missing source tiles, then require that the
+        build will find at least one DEM file for the bbox."""
+        args.check = True
+        fetch()   # --check: lists cached / missing, never downloads
+        srcs, _bb, provider = dataset()
+        if not srcs:
+            print(f"MISSING source DEMs: no {provider} DEM file for bbox {list(bbox)} in {args.data} - "
+                  f"download this area with the data-platform (fetch page) first; "
+                  f"the engine does not download", file=sys.stderr)
+            return 3
+        print(f"sources OK: {len(srcs)} DEM file(s) on disk for this area")
+        return 0
+
     if args.cmd == "status":
         args.check = True
         return fetch()
+    if args.cmd == "sources":
+        return sources()
     if args.cmd == "fetch":
         return fetch()
     if args.cmd == "build":

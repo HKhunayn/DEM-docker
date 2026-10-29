@@ -1,3 +1,14 @@
+"""FastAPI app factory for the two roles sharing this package (GIS_ROLE):
+
+- ``engine``   (container ``engine``, host port 5000 behind nginx): serves the
+  tiles' metadata (ArcGIS ImageServer, tilemap, terrain.json, imagery TileJSON
+  and over-zoom), the read-only catalog/saved areas for viewers, tile status,
+  and BUILD jobs (check -> build -> verify -> publish, never downloads);
+  builds missing areas on start-up and periodically.
+- ``platform`` (container ``data-platform``, host port 5100): DOWNLOADS only -
+  fetch page, saved areas, providers, DEM/imagery download jobs, ingest; a
+  finished DEM download is handed to the engine (app/handoff.py).
+"""
 from __future__ import annotations
 
 import json
@@ -10,15 +21,14 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
+from . import build_api, fetch_api, imagery_api
 from .catalog import catalog_items, delete_item, find_item, ingest_file, item_path, load_catalog
-from .config import TILE_ROOT
-from .fetch_api import router as fetch_router
-from .imagery_api import router as imagery_router
+from .config import ROLE, TILE_ROOT
 from .terrain import TerrainSource
 
 # Older engines wrote every tile 0600 (tempfile.mkstemp), which a non-root
@@ -58,17 +68,30 @@ def fix_tile_permissions(data_root: Path) -> int:
 
 
 @asynccontextmanager
-async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+async def _engine_lifespan(_app: FastAPI) -> AsyncIterator[None]:
     if os.environ.get("GIS_FIX_TILE_PERMS", "1") == "1":
         threading.Thread(target=fix_tile_permissions, args=(TILE_ROOT.parent,),
                          name="fix-tile-perms", daemon=True).start()
-    # Build whatever saved area has no (or stale) tiles, e.g. after importing
-    # a TRUTH backup that carries only the DEMs + catalog.
+    # Build whatever saved area has no (or stale) tiles - e.g. after importing
+    # a TRUTH backup that carries only the DEMs + catalog, or areas the
+    # data-platform downloaded while the engine was stopped - then keep
+    # checking periodically while idle.
     from . import autobuild
     if autobuild.enabled():
         autobuild.start(delay=float(os.environ.get("GIS_AUTOBUILD_DELAY_S", "5")))
+        autobuild.start_periodic()
     yield
     autobuild.stop()
+    _shutdown_jobs()
+
+
+@asynccontextmanager
+async def _platform_lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    yield
+    _shutdown_jobs()
+
+
+def _shutdown_jobs() -> None:
     # Terminate running engine subprocesses on shutdown, if the jobs module
     # provides a hook (getattr: older jobs modules don't have one).
     try:
@@ -80,13 +103,10 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         shutdown()
 
 
-app = FastAPI(title="Local Open GIS Data Platform", version="0.1.0", lifespan=_lifespan)
-app.include_router(fetch_router)
-app.include_router(imagery_router)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"],
-)
+VERSION = "0.2.0"
+serve = APIRouter()    # engine: tile metadata, ArcGIS, terrain.json, tile status
+common = APIRouter()   # both: read-only catalog
+data = APIRouter()     # platform: ingest / delete catalog items
 
 # Derived tile pyramids + ArcGIS services live under the platform's own data
 # root (data/tiles/), alongside data/dem/ (source GeoTIFFs) and data/catalog/.
@@ -155,12 +175,7 @@ def _tile_file(relative: str) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
-@app.get("/health")
-def health() -> dict[str, Any]:
-    return {"status": "ok", "service": "gis-data-platform", "version": app.version}
-
-
-@app.get("/api/tiles/status")
+@serve.get("/api/tiles/status")
 def tiles_status() -> JSONResponse:
     """Are the saved areas tiled? (published Terrarium set + each area's
     ArcGIS LERC service) and the automatic rebuild's progress."""
@@ -170,7 +185,7 @@ def tiles_status() -> JSONResponse:
     return response
 
 
-@app.post("/api/tiles/rebuild-missing", status_code=202)
+@serve.post("/api/tiles/rebuild-missing", status_code=202)
 def tiles_rebuild_missing() -> dict[str, Any]:
     """Queue builds for every saved area whose tiles are missing or stale."""
     from . import autobuild
@@ -179,7 +194,7 @@ def tiles_rebuild_missing() -> dict[str, Any]:
     return {"started": True}
 
 
-@app.get("/api/catalog")
+@common.get("/api/catalog")
 def catalog(request: Request) -> dict[str, Any]:
     result = load_catalog()
     result["links"] = [
@@ -189,7 +204,7 @@ def catalog(request: Request) -> dict[str, Any]:
     return result
 
 
-@app.get("/api/items")
+@common.get("/api/items")
 def items(request: Request) -> dict[str, Any]:
     features = []
     for item in catalog_items():
@@ -202,7 +217,7 @@ def items(request: Request) -> dict[str, Any]:
     return {"type": "FeatureCollection", "features": features, "numberMatched": len(features), "numberReturned": len(features)}
 
 
-@app.post("/api/ingest", status_code=201)
+@data.post("/api/ingest", status_code=201)
 def ingest(body: IngestRequest, request: Request) -> dict[str, Any]:
     try:
         item = ingest_file(Path(body.path), body.kind, body.title, body.crs)
@@ -216,14 +231,14 @@ def ingest(body: IngestRequest, request: Request) -> dict[str, Any]:
     return item
 
 
-@app.delete("/api/items/{item_id}", response_model=DeleteResponse)
+@data.delete("/api/items/{item_id}", response_model=DeleteResponse)
 def remove(item_id: str) -> DeleteResponse:
     if not delete_item(item_id):
         raise HTTPException(status_code=404, detail="item not found")
     return DeleteResponse(deleted=True)
 
 
-@app.get("/api/assets/{item_id}")
+@common.get("/api/assets/{item_id}")
 def asset(item_id: str) -> FileResponse:
     item = find_item(item_id)
     if not item:
@@ -234,7 +249,7 @@ def asset(item_id: str) -> FileResponse:
     return FileResponse(path, media_type=item.get("mediaType"), filename=item["filename"])
 
 
-@app.get("/api/services")
+@serve.get("/api/services")
 def services(request: Request) -> dict[str, Any]:
     result: list[dict[str, Any]] = []
     service_root = TILE_DIR / "arcgis" / "rest" / "services"
@@ -256,7 +271,7 @@ _DEFAULT_TILEJSON: dict[str, Any] = {"tilejson": "3.0.0", "name": "local terrain
                                      "encoding": "terrarium", "tileSize": 256}
 
 
-@app.get("/tiles/terrain/{z}/{x}/{y}.png")
+@serve.get("/tiles/terrain/{z}/{x}/{y}.png")
 def terrain(z: int, x: int, y: int) -> Response:
     if z < 0 or z > 24 or not (0 <= x < 2 ** z) or not (0 <= y < 2 ** z):
         raise HTTPException(status_code=404, detail="terrain tile not found", headers=_NO_STORE)
@@ -309,14 +324,14 @@ def _published_file(version: str, z: int, x: int, y: int) -> Path:
     return root / "flat.webp"
 
 
-@app.get("/tiles/published/{version}/terrain/{z}/{x}/{y}.webp")
+@serve.get("/tiles/published/{version}/terrain/{z}/{x}/{y}.webp")
 def published_terrain(version: str, z: int, x: int, y: int) -> FileResponse:
     response = FileResponse(_published_file(version, z, x, y), media_type="image/webp")
     response.headers["Cache-Control"] = _IMMUTABLE
     return response
 
 
-@app.get("/tiles/terrain.json")
+@serve.get("/tiles/terrain.json")
 def terrain_tilejson(request: Request) -> JSONResponse:
     path = TILE_DIR / "tilejson.json"
     data: Any = None
@@ -362,7 +377,7 @@ def terrain_tilejson(request: Request) -> JSONResponse:
     return response
 
 
-@app.get("/arcgis/rest/services/{name}/ImageServer")
+@serve.get("/arcgis/rest/services/{name}/ImageServer")
 def arcgis_metadata(name: str) -> JSONResponse:
     service = _service_dir(name)
     path = _tile_file(f"arcgis/rest/services/{service.name}/ImageServer.json")
@@ -379,7 +394,7 @@ def arcgis_metadata(name: str) -> JSONResponse:
     return JSONResponse(_finite(data))
 
 
-@app.get("/arcgis/rest/services/{name}/ImageServer/tilemap/{level}/{row}/{col}/{height}/{width}")
+@serve.get("/arcgis/rest/services/{name}/ImageServer/tilemap/{level}/{row}/{col}/{height}/{width}")
 def arcgis_tilemap(name: str, level: int, row: int, col: int, height: int, width: int) -> JSONResponse:
     # The service metadata advertises the "Tilemap" capability; CesiumJS (and
     # the ArcGIS SDK) request this before any tile. A 404 here makes CesiumJS
@@ -448,7 +463,7 @@ def _scan_tilemap(level_dir: Path, row: int, col: int, height: int, width: int) 
     return data
 
 
-@app.get("/arcgis/rest/services/{name}/ImageServer/tile/{z}/{row}/{col}")
+@serve.get("/arcgis/rest/services/{name}/ImageServer/tile/{z}/{row}/{col}")
 def arcgis_tile(name: str, z: int, row: int, col: int) -> FileResponse:
     service = _service_dir(name)
     if z < 0 or row < 0 or col < 0:
@@ -461,9 +476,53 @@ def arcgis_tile(name: str, z: int, row: int, col: int) -> FileResponse:
     return response
 
 
-@app.get("/")
-def root() -> dict[str, str]:
-    return {"service": app.title, "docs": "/docs", "health": "/health", "catalog": "/api/catalog", "fetch": "/fetch/", "imagery": "/api/imagery"}
+def create_app(role: str = ROLE) -> FastAPI:
+    """The FastAPI app of one role ("engine" or "platform")."""
+    if role == "platform":
+        application = FastAPI(title="GIS data-platform (downloads)", version=VERSION, lifespan=_platform_lifespan)
+        application.include_router(fetch_api.page_router)
+        # API routers twice: at / and under /fetch (the fetch page uses
+        # relative urls, so it also works behind the viewer's /fetch/ proxy)
+        for prefix in ("", "/fetch"):
+            hidden = {"include_in_schema": False} if prefix else {}
+            application.include_router(fetch_api.router, prefix=prefix, **hidden)
+            application.include_router(fetch_api.jobs_router, prefix=prefix, **hidden)
+            application.include_router(fetch_api.areas_router, prefix=prefix, **hidden)
+            application.include_router(imagery_api.router, prefix=prefix, **hidden)
+        application.include_router(common)
+        application.include_router(data)
+        service = "gis-data-platform"
+        links = {"fetch": "/fetch/", "areas": "/api/areas", "jobs": "/api/jobs", "engine": "/api/engine/status"}
+    elif role == "engine":
+        application = FastAPI(title="GIS engine (build + serve)", version=VERSION, lifespan=_engine_lifespan)
+        application.include_router(serve)
+        application.include_router(build_api.router)
+        application.include_router(fetch_api.jobs_router)
+        application.include_router(fetch_api.areas_router)
+        application.include_router(imagery_api.serve_router)
+        application.include_router(common)
+        service = "gis-engine"
+        links = {"terrain": "/tiles/terrain.json", "services": "/api/services", "catalog": "/api/catalog",
+                 "jobs": "/api/jobs", "tilesStatus": "/api/tiles/status"}
+    else:
+        raise ValueError(f"unknown role {role!r}")
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"],
+    )
+
+    @application.get("/health")
+    def health() -> dict[str, Any]:
+        return {"status": "ok", "service": service, "role": role, "version": VERSION}
+
+    @application.get("/", include_in_schema=False)
+    def root() -> dict[str, Any]:
+        return {"service": application.title, "role": role, "docs": "/docs", "health": "/health", **links}
+
+    return application
+
+
+app = create_app(ROLE)
 
 
 if __name__ == "__main__":

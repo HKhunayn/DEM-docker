@@ -1,3 +1,19 @@
+# Three independently runnable apps sharing ONE data volume (gis-data):
+#
+#   engine         host GIS_ENGINE_PORT (5000) - what other apps connect to.
+#                  nginx serves every tile file; FastAPI serves ArcGIS
+#                  ImageServer metadata/tilemap, terrain.json, catalog, tile
+#                  status and BUILD jobs (DEM -> lossless WebP + ArcGIS Lerc,
+#                  never downloads). Builds missing / newly downloaded areas on
+#                  start-up and periodically.          docker compose up -d engine
+#   data-platform  host GIS_DATA_PORT (5100) - DOWNLOADS only: fetch page,
+#                  saved areas, DEM/imagery download jobs. Hands a finished
+#                  download to the engine (or leaves it "downloaded" for the
+#                  engine to build when it starts).    docker compose up -d data-platform
+#   viewer         host GIS_VIEWER_PORT (3100) - optional web viewer; talks to
+#                  the engine only (fetch page proxied to the data-platform).
+#                                                      docker compose up -d viewer
+#
 # Shared json-file log rotation: at most 5 x 20 MB per container.
 x-logging: &default-logging
   driver: json-file
@@ -6,16 +22,15 @@ x-logging: &default-logging
     max-file: "5"
 
 services:
-  data-platform:
+  engine:
     build:
       context: ./gis-data-platform
       dockerfile: Dockerfile
-    image: local-gis-data-platform:latest
+      target: engine
+    image: local-gis-engine:latest
     restart: unless-stopped
-    # tini as PID 1: reaps the engine subprocesses (fetch/build/verify jobs and
-    # their worker pools) and forwards SIGTERM so `compose stop` is clean.
-    init: true
-    # Give uvicorn and a running job time to shut down before SIGKILL.
+    # Give uvicorn and a running build time to shut down before SIGKILL.
+    # (tini is PID 1 inside the image: it reaps the build subprocesses.)
     stop_grace_period: 60s
     logging: *default-logging
     # Hard memory ceiling for the API + tile builds. Keeps a country-scale
@@ -23,25 +38,70 @@ services:
     # once). memswap = mem -> no swap thrash; the builders' pool watchdog
     # (engine/scripts/pool_runner.py) keeps usage under 75% of this cap.
     # Raise it if you give WSL more RAM in %UserProfile%\.wslconfig.
-    mem_limit: ${GIS_PLATFORM_MEM_LIMIT:-20g}
-    memswap_limit: ${GIS_PLATFORM_MEM_LIMIT:-20g}
+    mem_limit: ${GIS_ENGINE_MEM_LIMIT:-${GIS_PLATFORM_MEM_LIMIT:-20g}}
+    memswap_limit: ${GIS_ENGINE_MEM_LIMIT:-${GIS_PLATFORM_MEM_LIMIT:-20g}}
     # Optional CPU cap (e.g. leave cores free for the desktop during a build):
-    # cpus: "${GIS_PLATFORM_CPUS:-8}"
+    # cpus: "${GIS_ENGINE_CPUS:-8}"
     environment:
+      GIS_ROLE: engine
+      GIS_DATA_ROOT: /app/data
+      HEIGHTMAP_ENGINE_ROOT: /opt/heightmap-30m
+      HEIGHTMAP_PYTHON: /usr/local/bin/python
+      # periodic check for areas downloaded while the engine runs (0 = off)
+      GIS_AUTOBUILD_INTERVAL_S: ${GIS_AUTOBUILD_INTERVAL_S:-60}
+    volumes:
+      # nginx serves the tiles from here (/data) and FastAPI reads/writes the
+      # same volume as /app/data. Never rename the volume or its mount paths.
+      - gis-data:/app/data
+      - gis-data:/data:ro
+    ports:
+      - "${GIS_ENGINE_PORT:-${GIS_PLATFORM_PORT:-5000}}:80"
+    # 8787 = the engine's FastAPI, reachable as engine:8787 on the compose
+    # network only (the data-platform's hand-off); not published on the host.
+    expose:
+      - "8787"
+    networks:
+      - gis
+    healthcheck:
+      # through nginx -> uvicorn: both must answer
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  data-platform:
+    build:
+      context: ./gis-data-platform
+      dockerfile: Dockerfile
+      target: platform
+    image: local-gis-data-platform:latest
+    restart: unless-stopped
+    # tini as PID 1: reaps the download subprocesses and forwards SIGTERM.
+    init: true
+    stop_grace_period: 30s
+    logging: *default-logging
+    # Downloads only (network-bound, small memory).
+    mem_limit: ${GIS_DATA_MEM_LIMIT:-2g}
+    memswap_limit: ${GIS_DATA_MEM_LIMIT:-2g}
+    environment:
+      GIS_ROLE: platform
       GIS_DATA_ROOT: /app/data
       HEIGHTMAP_ENGINE_ROOT: /opt/heightmap-30m
       HEIGHTMAP_PYTHON: /usr/local/bin/python
       LEAFLET_ROOT: /opt/leaflet
+      # hand-off target (compose network); the engine may be stopped
+      ENGINE_URL: http://engine:8787
+      # links on the fetch page: http://<same host>:<this port>
+      ENGINE_PUBLIC_PORT: ${GIS_ENGINE_PORT:-${GIS_PLATFORM_PORT:-5000}}
     volumes:
       - gis-data:/app/data
       # The DEM engine is baked into the image at /opt/heightmap-30m (copied
       # from gis-data-platform/engine). Uncomment to override it with a local
-      # engine checkout while developing the engine itself:
+      # engine checkout while developing the engine itself (same for engine):
       # - ${HEIGHTMAP_ENGINE_ROOT:-../heightmap-30m}:/opt/heightmap-30m:ro
-    # Not published on the host: apps reach FastAPI through the gateway
-    # (port 5000), which serves the tiles itself and proxies the rest here.
-    expose:
-      - "8787"
+    ports:
+      - "${GIS_DATA_PORT:-5100}:8787"
     networks:
       - gis
     healthcheck:
@@ -51,33 +111,8 @@ services:
       retries: 10
       start_period: 10s
 
-  # Platform entry point for apps (host port 5000): nginx serves every tile
-  # file from the data volume (sendfile) and proxies everything else - REST
-  # API, ImageServer metadata/tilemap, jobs, fetch page, /docs, tiles that are
-  # not on disk - to FastAPI. Point other applications here.
-  gateway:
-    image: nginx:1.27.5-alpine
-    restart: unless-stopped
-    logging: *default-logging
-    depends_on:
-      data-platform:
-        condition: service_healthy
-    volumes:
-      - gis-data:/data:ro
-      - ./nginx/gateway.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./nginx/gis-tiles.conf:/etc/nginx/gis/gis-tiles.conf:ro
-    ports:
-      - "${GIS_PLATFORM_PORT:-5000}:80"
-    networks:
-      - gis
-    healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/gateway-health"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 5s
-
-  # Optional web viewer (MapLibre / ArcGIS / Cesium) on host port 3100.
+  # Optional web viewer (MapLibre / ArcGIS / Cesium). No data volume: tiles
+  # and metadata come from the engine, the fetch page from the data-platform.
   viewer:
     build:
       context: ./gis-viewers
@@ -88,13 +123,8 @@ services:
     restart: unless-stopped
     logging: *default-logging
     depends_on:
-      data-platform:
+      engine:
         condition: service_healthy
-    # The tile trees are served by nginx straight from the data volume
-    # (read-only): published terrain, ArcGIS Lerc tiles, imagery sets.
-    volumes:
-      - gis-data:/data:ro
-      - ./nginx/gis-tiles.conf:/etc/nginx/gis/gis-tiles.conf:ro
     ports:
       - "${GIS_VIEWER_PORT:-3100}:80"
     networks:

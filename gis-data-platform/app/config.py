@@ -12,9 +12,41 @@ DEM_ROOT = DATA_ROOT / "dem"          # source DEM GeoTIFFs + manifest.json
 TILE_ROOT = DATA_ROOT / "tiles"       # derived: published/, arcgis/, tilejson.json (+ terrarium/ until published)
 IMAGERY_ROOT = DATA_ROOT / "imagery"  # fetched imagery sets: <name>/{z}/{x}/{y}.jpg + imagery.json
 CATALOG_PATH = CATALOG_ROOT / "catalog.json"
-JOBS_ROOT = DATA_ROOT / "jobs"        # persisted job records (<id>.json) + full logs (<id>.log)
-JOB_LOCK_PATH = DATA_ROOT / ".job.lock"  # PID of the running engine (cross-process guard)
+CATALOG_LOCK_PATH = CATALOG_ROOT / ".catalog.lock"  # flock: catalog edits across processes
 INCOMING_ROOT = DATA_ROOT / "incoming"   # default allow-listed directory for POST /api/ingest
+
+# Which app this process is (one image, two containers sharing the volume):
+#   platform - downloads only: fetch page, saved areas, DEM/imagery download
+#              jobs; hands a downloaded area to the engine (ENGINE_URL)
+#   engine   - builds (check -> build -> verify -> publish, never downloads)
+#              and serves tiles/metadata (behind nginx on port 5000)
+ROLES = ("engine", "platform")
+ROLE = (os.environ.get("GIS_ROLE") or "engine").strip().lower()
+if ROLE not in ROLES:
+    raise RuntimeError(f"GIS_ROLE must be one of {ROLES}, not {ROLE!r}")
+
+# Each role keeps its own job history + engine-process lock so the two
+# containers never load or block on each other's jobs.
+if ROLE == "platform":
+    JOBS_ROOT = DATA_ROOT / "jobs"               # download jobs: <id>.json + <id>.log
+    JOB_LOCK_PATH = DATA_ROOT / ".job.lock"      # PID of the running download subprocess
+else:
+    JOBS_ROOT = DATA_ROOT / "engine-jobs"        # build jobs: <id>.json + <id>.log
+    JOB_LOCK_PATH = DATA_ROOT / ".engine-job.lock"
+
+# Platform -> engine hand-off (compose network). Public URL of the engine for
+# links shown on the fetch page: ENGINE_PUBLIC_URL, else the page's host name
+# with ENGINE_PUBLIC_PORT (the published engine port, default 5000).
+ENGINE_URL = (os.environ.get("ENGINE_URL") or "http://engine:8787").rstrip("/")
+ENGINE_PUBLIC_URL = (os.environ.get("ENGINE_PUBLIC_URL") or "").rstrip("/")
+ENGINE_PUBLIC_PORT = os.environ.get("ENGINE_PUBLIC_PORT") or "5000"
+
+
+def engine_timeout_s() -> float:
+    try:
+        return float(os.environ.get("ENGINE_TIMEOUT_S", "5"))
+    except ValueError:
+        return 5.0
 
 
 def ingest_root() -> Path:

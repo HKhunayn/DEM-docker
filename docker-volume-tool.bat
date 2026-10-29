@@ -10,7 +10,7 @@ REM                docker-volume-tool.bat import FILE VOLUME [keeptiles]
 REM
 REM  TRUTH = everything in the volume EXCEPT tiles/  (DEM COGs, catalog,
 REM          sources, imagery, incoming, jobs). tiles/ is derived data: the
-REM          platform rebuilds it from the DEMs by itself on the next start.
+REM          engine rebuilds it from the DEMs by itself on its next start.
 REM  FULL  = the whole volume including tiles/ (huge, millions of files).
 REM
 REM  Archives are plain .tar (no gzip): COGs and PNG tiles are already
@@ -195,8 +195,8 @@ if errorlevel 1 (
 )
 echo [OK] Export complete: %OUTDIR%\%FILE%
 if /i "%SCOPE%"=="truth" (
-    echo      tiles/ was not included - the platform rebuilds them from the DEMs
-    echo      by itself when the stack starts on the target machine.
+    echo      tiles/ was not included - the engine rebuilds them from the DEMs
+    echo      by itself when it starts on the target machine.
 )
 goto DONE
 
@@ -317,12 +317,13 @@ if errorlevel 1 (
 )
 echo [OK] Import complete. Volume "%TARGET%" is ready.
 echo.
-echo NEXT: start the stack ^(docker compose up -d, or Run.bat^). On start-up the
-echo       platform checks every saved area and builds the tiles that are
-echo       missing or were made by an older engine ^(a TRUTH backup has none^).
-echo       The DEMs are in the volume, so nothing is downloaded again.
-echo       Progress: the viewer shows a banner; details on the fetch page ^(/fetch/^)
-echo       or GET /api/tiles/status. A whole country takes about an hour.
+echo NEXT: start the engine ^(docker compose up -d engine, or Run.bat up^). On
+echo       start-up the engine checks every saved area and builds the tiles that
+echo       are missing or were made by an older engine ^(a TRUTH backup has none^).
+echo       The DEMs are in the volume, so nothing is downloaded again ^(the
+echo       data-platform is not needed for this^).
+echo       Progress: the viewer shows a banner; GET http://127.0.0.1:5000/api/tiles/status
+echo       or /api/jobs/current on the engine. A whole country takes about an hour.
 goto DONE
 
 

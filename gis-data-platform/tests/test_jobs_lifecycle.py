@@ -66,20 +66,20 @@ def test_job_record_and_log_are_persisted(client, tmp_path):
     record = json.loads((jobs_dir / f"{job['id']}.json").read_text(encoding="utf-8"))
     assert record["state"] == "done"
     assert "log" not in record
-    assert record["result"]["tilesBuilt"] == 42
+    assert record["result"]["sourceTiles"] == 2
     log_lines = (jobs_dir / f"{job['id']}.log").read_text(encoding="utf-8").splitlines()
-    assert any("WROTE 42 tiles" in line for line in log_lines)
+    assert any("Done: 2 tile(s)" in line for line in log_lines)
     assert job["log_total"] == len(log_lines)
     assert not list(jobs_dir.glob("*.tmp"))
     # lock file is released when the job ends
     assert not (tmp_path / "data" / ".job.lock").exists()
 
 
-def test_restart_marks_running_job_and_building_area_interrupted(client, tmp_path):
-    # Simulate a crash: a job record left 'running' + an area left 'building'.
+def test_restart_marks_running_job_and_downloading_area_interrupted(client, tmp_path):
+    # Simulate a crash: a job record left 'running' + an area left 'downloading'.
     area = client.post("/api/areas", json={**{k: JOB[k] for k in ("name", "bbox", "provider", "minzoom", "maxzoom")}}).json()
     catalog = sys.modules["app.catalog"]
-    catalog.update_area(area["id"], dataset={"name": "local30m", "state": "building"})
+    catalog.update_area(area["id"], dataset={"name": "local30m", "state": "downloading"})
     job_id = uuid.uuid4().hex
     jobs_dir = tmp_path / "data" / "jobs"
     jobs_dir.mkdir(parents=True, exist_ok=True)
@@ -115,7 +115,7 @@ def test_restart_marks_running_job_and_building_area_interrupted(client, tmp_pat
     assert area_now["dataset"]["error"] == jobs.INTERRUPTED_MSG
 
     # starting the same area again works (resume)
-    snap = jobs.start_job("local30m", JOB["bbox"], "copernicus", 0, 13)
+    snap = jobs.start_download_job("local30m", JOB["bbox"], "copernicus", 0, 13)
     jobs._wait_threads()
     assert jobs.get_job(snap["id"])["state"] == "done"
 
@@ -208,10 +208,11 @@ def test_catalog_failure_after_job_does_not_wedge_runner(client, monkeypatch):
 def test_cancel_terminates_engine_process_group(client, monkeypatch, tmp_path):
     pidfile = tmp_path / "child.pid"
     monkeypatch.setenv("STUB_SLEEP", "60")
+    monkeypatch.setenv("STUB_SLEEP_STEP", "fetch")
     monkeypatch.setenv("STUB_SPAWN_CHILD", "1")
     monkeypatch.setenv("STUB_CHILD_PIDFILE", str(pidfile))
     started = client.post("/api/jobs", json=JOB).json()
-    wait_step(client, started["id"], "build")
+    wait_step(client, started["id"], "fetch")
     deadline = time.time() + 10
     while not pidfile.exists() and time.time() < deadline:
         time.sleep(0.05)
@@ -227,8 +228,8 @@ def test_cancel_terminates_engine_process_group(client, monkeypatch, tmp_path):
     assert time.time() - t0 < 15
     assert job["state"] == "cancelled"
     assert job["error"] == "cancelled by user"
-    assert job["steps"][1]["state"] == "cancelled"
-    assert job["steps"][2]["state"] == "pending"
+    assert job["steps"][0]["state"] == "cancelled"
+    assert job["steps"][1]["state"] == "pending"
     assert not pid_alive(lock["pid"])
     deadline = time.time() + 5
     while pid_alive(child) and time.time() < deadline:
@@ -274,8 +275,9 @@ def test_cancel_escalates_to_sigkill(client, monkeypatch, tmp_path):
 
 def test_shutdown_marks_running_job_interrupted(client, monkeypatch):
     monkeypatch.setenv("STUB_SLEEP", "60")
+    monkeypatch.setenv("STUB_SLEEP_STEP", "fetch")
     started = client.post("/api/jobs", json=JOB).json()
-    wait_step(client, started["id"], "build")
+    wait_step(client, started["id"], "fetch")
     jobs = jobs_mod()
     jobs.shutdown(grace=2.0)
     job = jobs.get_job(started["id"])
@@ -327,10 +329,11 @@ def test_watchdog_terminates_silent_engine(client, monkeypatch):
     monkeypatch.setattr(jobs, "IDLE_TIMEOUT_S", 1.0)
     monkeypatch.setattr(jobs, "TERM_GRACE_S", 2.0)
     monkeypatch.setenv("STUB_SLEEP", "30")
+    monkeypatch.setenv("STUB_SLEEP_STEP", "fetch")
     started = client.post("/api/jobs", json=JOB).json()
     job = wait_state(client, started["id"], timeout=20)
     assert job["state"] == "error"
-    assert "printed nothing" in job["error"] and "build" in job["error"]
+    assert "printed nothing" in job["error"] and "fetch" in job["error"]
     assert any("WATCHDOG" in line for line in job["log"])
     assert jobs._CURRENT_ID is None
 

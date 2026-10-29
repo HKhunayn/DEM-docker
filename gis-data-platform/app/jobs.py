@@ -1,8 +1,13 @@
-"""Background fetch/build jobs driven by the heightmap-30m engine CLI.
+"""Background jobs driven by the heightmap-30m engine CLI (terrainhub.py).
 
-The DEM download/build/verify logic lives in the existing heightmap-30m project
-(terrainhub.py + scripts/). This module schedules those CLI steps as one
-background job and records step / elapsed / log / result for the fetch page.
+Two kinds of elevation job, one per app (both share this runner):
+- data-platform: DOWNLOAD jobs, steps ``fetch`` (terrainhub fetch) ->
+  ``handoff`` (ask the engine to build the area; if the engine is not running
+  the area stays ``downloaded`` and the engine builds it when it starts);
+- engine: BUILD jobs, steps ``check`` (terrainhub sources: offline check that
+  the DEMs are on the volume - the engine never downloads) -> ``build`` ->
+  ``verify`` -> ``publish`` (LERC-only rebuilds: check -> build).
+The runner records step / elapsed / log / result for the UIs.
 
 Restart safety:
 - every job record (without its log) is persisted as DATA_ROOT/jobs/<id>.json on
@@ -45,10 +50,16 @@ from .config import (  # noqa: F401  (re-exported)
 
 log = logging.getLogger(__name__)
 
-STEPS = ("fetch", "build", "verify", "publish")
+# Engine build: `check` = offline source check (terrainhub sources), never a download.
+STEPS = ("check", "build", "verify", "publish")
+BUILD_STEPS = STEPS
 # Rebuild only an area's ArcGIS LERC service: verify/publish work on the shared
 # Terrarium set, which a LERC-only build does not touch.
-LERC_ONLY_STEPS = ("fetch", "build")
+LERC_ONLY_STEPS = ("check", "build")
+# Data-platform download: fetch the source DEMs, then hand the area to the engine.
+DOWNLOAD_STEPS = ("fetch", "handoff")
+# terrainhub sub-command per job step
+_ENGINE_CMD = {"check": "sources"}
 HISTORY_LIMIT = 20
 LOG_TAIL_LIMIT = 5000          # lines kept in memory per job (full log is on disk)
 DEFAULT_TAIL = 200
@@ -95,7 +106,7 @@ def build_command(step: str, bbox, provider: str, minzoom: int, maxzoom: int, na
     return [
         str(engine_python()),
         str(ENGINE_ROOT / "terrainhub.py"),
-        step,
+        _ENGINE_CMD.get(step, step),
         "--bbox", *map(str, bbox),
         "--provider", provider,
         "--minzoom", str(minzoom),
@@ -415,7 +426,8 @@ def orphan_engine_pid() -> int | None:
 def _check_can_start() -> None:
     """Caller holds _LOCK."""
     if _CURRENT_ID is not None and _JOBS.get(_CURRENT_ID, {}).get("state") in ACTIVE_STATES:
-        raise JobRunningError("a fetch job is already running")
+        raise JobRunningError(f"a job is already running ({_JOBS[_CURRENT_ID].get('name')}, "
+                              f"step {_JOBS[_CURRENT_ID].get('step')})")
 
 
 def _check_no_orphan() -> None:
@@ -439,11 +451,33 @@ def start_job(
     lerc_only: bool = False,
     origin: str = "user",
 ) -> dict[str, Any]:
-    """Start fetch -> build -> verify -> publish for an area. ``lerc_only``
-    rebuilds just the area's ArcGIS LERC service (the published Terrarium set,
-    which holds a single area, stays as it is). ``origin`` records who asked
-    ("user" or "autobuild")."""
+    """ENGINE: start check -> build -> verify -> publish for an area whose
+    DEMs are already on the volume (never downloads). ``lerc_only`` rebuilds
+    just the area's ArcGIS LERC service (the published Terrarium set, which
+    holds a single area, stays as it is). ``origin`` records who asked
+    ("user", "handoff" or "autobuild")."""
+    return _start_elevation(name, bbox, provider, minzoom, maxzoom, save_area,
+                            mode="lerc" if lerc_only else "full", origin=origin)
+
+
+def start_download_job(
+    name: str,
+    bbox: list[float],
+    provider: str = "copernicus",
+    minzoom: int = 0,
+    maxzoom: int = 13,
+    save_area: bool = True,
+    origin: str = "user",
+) -> dict[str, Any]:
+    """DATA-PLATFORM: download the source DEMs of an area (terrainhub fetch),
+    then hand the area to the engine for the build."""
+    return _start_elevation(name, bbox, provider, minzoom, maxzoom, save_area,
+                            mode="download", origin=origin)
+
+
+def _start_elevation(name, bbox, provider, minzoom, maxzoom, save_area, mode, origin) -> dict[str, Any]:
     global _CURRENT_ID
+    steps = {"full": STEPS, "lerc": LERC_ONLY_STEPS, "download": DOWNLOAD_STEPS}[mode]
     catalog.check_area_provider(name, provider, kind="elevation")
     with _LOCK:
         _check_can_start()
@@ -452,31 +486,37 @@ def start_job(
         _check_can_start()
         area = None
         if save_area:
+            dataset = {
+                "name": name,
+                "state": "downloading" if mode == "download" else "building",
+                "provider": provider,
+                "bbox": list(bbox),
+                "minzoom": minzoom,
+                "maxzoom": maxzoom,
+                "mode": mode,
+            }
+            if mode == "full":
+                # survives an engine restart: the engine resumes the full build
+                dataset["pendingBuild"] = "full"
             area = catalog.upsert_area(
                 name=name,
                 bbox=list(bbox),
                 provider=provider,
                 minzoom=minzoom,
                 maxzoom=maxzoom,
-                dataset={
-                    "name": name,
-                    "state": "building",
-                    "provider": provider,
-                    "bbox": list(bbox),
-                    "minzoom": minzoom,
-                    "maxzoom": maxzoom,
-                },
+                dataset=dataset,
             )
         job = _new_job("elevation", name, provider, bbox, minzoom, maxzoom,
-                       area["id"] if area else None, LERC_ONLY_STEPS if lerc_only else STEPS)
-        job["lercOnly"] = lerc_only
+                       area["id"] if area else None, steps)
+        job["lercOnly"] = mode == "lerc"
+        job["mode"] = mode
         job["origin"] = origin
         _register(job)
         _CURRENT_ID = job["id"]
         snap = _snapshot(job)
         thread = threading.Thread(
             target=_run_job,
-            args=(job["id"], name, list(bbox), provider, minzoom, maxzoom, lerc_only),
+            args=(job["id"], name, list(bbox), provider, minzoom, maxzoom, mode == "lerc"),
             daemon=True,
             name=f"job-{job['id'][:8]}",
         )
@@ -539,6 +579,8 @@ def _run_job(
     failed_step: str | None = None
     failed_rc: int | None = None
     verify_failed_rc: int | None = None
+    download = job.get("mode") == "download"
+    handoff: dict[str, Any] | None = None
     try:
         _open_log(job)
         threading.Thread(target=_watchdog, args=(job,), daemon=True).start()
@@ -554,6 +596,12 @@ def _run_job(
             _persist(job)
             if step == "build":
                 build_started = True
+            if step == "handoff":
+                handoff = _handoff(job, matches)
+                with _LOCK:
+                    entry["state"] = "done"
+                    entry["returncode"] = 0
+                continue
             cmd = build_command(step, bbox, provider, minzoom, maxzoom, name)
             if lerc_only and step == "build":
                 cmd.append("--lerc-only")
@@ -624,15 +672,24 @@ def _run_job(
             outcome = "done"
             warning = (f"publish step failed (exit {failed_rc}); the new build was kept but "
                        "the previously published tiles are still served - check the log")
+        elif failed_step == "check":
+            outcome = "error"
+            error = (f"check step failed (exit {failed_rc}): the source DEMs of this area are not on the "
+                     "volume - download the area with the data-platform (fetch page) first; "
+                     "the engine never downloads")
         elif failed_step is not None:
             outcome, error = "error", f"{failed_step} step failed (exit {failed_rc})"
         else:
             outcome = "done"
+        if outcome == "done" and handoff is not None and handoff.get("state") not in ("started", "queued"):
+            warning = handoff.get("message")
         if outcome == "done" and verify_failed_rc is not None:
             note = (f"verify step failed (exit {verify_failed_rc}); the new build was kept - "
                     "check the log for the verify differences")
             warning = f"{note}; {warning}" if warning else note
-        if outcome == "done":
+        if outcome == "done" and download:
+            result = {"sourceTiles": matches["sourceTiles"], "handoff": handoff}
+        elif outcome == "done":
             result = {**matches, "verified": verified_pass and verify_failed_rc is None}
             if lerc_only:
                 result["lercOnly"] = True
@@ -676,6 +733,8 @@ def _run_job(
         _close_log(job)
         _persist(job)
 
+    if job["areaId"] and download and outcome == "done":
+        return  # the area is "downloaded" (set before the hand-off); the engine owns it now
     if job["areaId"]:
         dataset: dict[str, Any] = {
             "name": name,
@@ -686,13 +745,17 @@ def _run_job(
             "maxzoom": maxzoom,
             "service": f"/arcgis/rest/services/{name}/ImageServer",
         }
-        if result:
+        if job.get("mode"):
+            dataset["mode"] = job["mode"]
+        if result and not download:
             dataset.update(
                 sourceTiles=result["sourceTiles"],
                 tilesBuilt=result["tilesBuilt"],
                 lercTiles=result["lercTiles"],
                 verified=result["verified"],
             )
+        if outcome == "interrupted" and job.get("mode") == "full":
+            dataset["pendingBuild"] = "full"   # the engine resumes it on its next start
         if error:
             dataset["error"] = error
         if warning:
@@ -701,6 +764,40 @@ def _run_job(
             catalog.update_area(job["areaId"], dataset=dataset)
         except Exception:  # noqa: BLE001
             log.exception("could not update area %s for job %s", job["areaId"], job_id)
+
+
+# ---- platform -> engine hand-off ----------------------------------------------
+
+def _handoff(job: dict[str, Any], matches: dict[str, Any]) -> dict[str, Any]:
+    """After a successful download: mark the area ``downloaded`` (pending a
+    full build) and ask the engine to build it now. Never fails the job: when
+    the engine is down the area simply waits for it (the engine's periodic
+    autobuild picks up every ``downloaded`` area)."""
+    from . import handoff as engine_client
+
+    area_id = job.get("areaId")
+    if not area_id:
+        result = {"state": "skipped", "message": "not saved as an area - nothing was handed to the engine; "
+                                                 "save the area and start it again to build it"}
+        _append_log(job, f"HANDOFF {result['message']}")
+        return result
+    try:
+        catalog.update_area_dataset(area_id, state="downloaded", pendingBuild="full", mode="full",
+                                    sourceTiles=matches.get("sourceTiles"), error=None, warning=None,
+                                    message="downloaded - handing it to the engine")
+    except Exception:  # noqa: BLE001
+        log.exception("could not mark area %s downloaded", area_id)
+    _append_log(job, f"HANDOFF asking the engine ({engine_client.engine_url()}) to build '{job['name']}'")
+    result = engine_client.request_build(job["name"], job["provider"])
+    _append_log(job, f"HANDOFF {result['state']}: {result['message']}")
+    if result["state"] != "started":
+        try:
+            catalog.update_area_dataset(area_id, if_state="downloaded", message=result["message"])
+        except Exception:  # noqa: BLE001
+            log.exception("could not record the hand-off of area %s", area_id)
+    with _LOCK:
+        job["handoff"] = result
+    return result
 
 
 # ---- imagery jobs (in-process download, same registry/status shape) --------
@@ -997,7 +1094,10 @@ def init() -> None:
     except Exception:  # noqa: BLE001
         log.exception("could not load job history from %s", JOBS_ROOT)
     try:
-        catalog.mark_interrupted_areas(INTERRUPTED_MSG)
+        from .config import ROLE
+        # each role only reconciles the dataset state its own jobs write
+        catalog.mark_interrupted_areas(INTERRUPTED_MSG,
+                                       ("downloading",) if ROLE == "platform" else ("building",))
     except Exception:  # noqa: BLE001
         log.exception("could not reconcile saved areas")
     try:

@@ -1,3 +1,7 @@
+# One package, two images (targets) sharing every layer up to the last:
+#   platform -> local-gis-data-platform  GIS_ROLE=platform: downloads only
+#   engine   -> local-gis-engine         GIS_ROLE=engine: builds + serves tiles
+#               (adds nginx; tini runs uvicorn + nginx via engine-entrypoint.sh)
 # Base pinned to the Python patch release the image was validated with.
 # Bump deliberately (and re-run the tests) rather than floating on 3.13-slim.
 ARG PYTHON_IMAGE=python:3.13.18-slim-trixie
@@ -16,8 +20,8 @@ RUN g++ -O2 -std=c++17 lerc1enc.cpp Lerc1Image.cpp -o lerc1enc \
     && g++ -O2 -std=c++17 -shared -fPIC -fvisibility=hidden -DLERC1ENC_NO_MAIN \
        lerc1enc.cpp Lerc1Image.cpp -o liblerc1enc.so
 
-# ---- stage 2: API + heightmap-30m DEM engine ----
-FROM ${PYTHON_IMAGE}
+# ---- stage 2 / target "platform": API + heightmap-30m DEM engine ----
+FROM ${PYTHON_IMAGE} AS platform
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -82,9 +86,28 @@ COPY app ./app
 # chown of the volume first.
 RUN mkdir -p /app/data
 
+ENV GIS_ROLE=platform
 EXPOSE 8787
 
 HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=10 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=3)"
 
 CMD ["python", "-m", "app", "--host", "0.0.0.0", "--port", "8787"]
+
+# ---- target "engine": the platform image + nginx (tile files) + tini ----
+FROM platform AS engine
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nginx tini \
+    && rm -rf /var/lib/apt/lists/* /etc/nginx/sites-enabled /etc/nginx/sites-available \
+    && rm -f /etc/nginx/conf.d/*.conf
+COPY nginx/nginx.conf /etc/nginx/nginx.conf
+COPY nginx/engine.conf /etc/nginx/conf.d/default.conf
+COPY nginx/gis-tiles.conf /etc/nginx/gis/gis-tiles.conf
+COPY --chmod=0755 engine-entrypoint.sh /usr/local/bin/engine-entrypoint.sh
+ENV GIS_ROLE=engine
+EXPOSE 80 8787
+# through nginx -> uvicorn: both must answer
+HEALTHCHECK --interval=10s --timeout=5s --start-period=20s --retries=10 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1/health', timeout=3)"
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/engine-entrypoint.sh"]
+CMD []

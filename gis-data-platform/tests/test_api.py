@@ -3,7 +3,8 @@ import importlib
 from fastapi.testclient import TestClient
 
 
-def load_app(tmp_path, monkeypatch):
+def load_app(tmp_path, monkeypatch, role="engine"):
+    monkeypatch.setenv("GIS_ROLE", role)
     monkeypatch.setenv("GIS_DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.setenv("LEGACY_HEIGHTMAP_ROOT", str(tmp_path / "legacy"))
     import app.config
@@ -23,7 +24,7 @@ def test_health_and_empty_catalog(tmp_path, monkeypatch):
 
 
 def test_ingest_registers_source_and_serves_it(tmp_path, monkeypatch):
-    app = load_app(tmp_path, monkeypatch)
+    app = load_app(tmp_path, monkeypatch, role="platform")
     source = tmp_path / "sample.tif"
     source.write_bytes(b"test-raster")
     client = TestClient(app)
@@ -138,7 +139,7 @@ def test_no_server_hillshade_routes(tmp_path, monkeypatch):
 
 
 def test_repeated_fetch_refreshes_area_instead_of_duplicating(tmp_path, monkeypatch):
-    app = load_app(tmp_path, monkeypatch)
+    app = load_app(tmp_path, monkeypatch, role="platform")
     client = TestClient(app)
     payload = {"name": "same_name", "bbox": [1, 2, 3, 4], "provider": "copernicus",
                "minzoom": 0, "maxzoom": 13}
