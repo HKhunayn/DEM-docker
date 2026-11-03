@@ -1,17 +1,23 @@
 # Three independently runnable apps sharing ONE data volume (gis-data):
 #
-#   engine         host GIS_ENGINE_PORT (5000) - what other apps connect to.
-#                  nginx serves every tile file; FastAPI serves ArcGIS
-#                  ImageServer metadata/tilemap, terrain.json, catalog, tile
-#                  status and BUILD jobs (DEM -> lossless WebP + ArcGIS Lerc,
-#                  never downloads). Builds missing / newly downloaded areas on
-#                  start-up and periodically.          docker compose up -d engine
-#   data-platform  host GIS_DATA_PORT (5100) - DOWNLOADS only: fetch page,
-#                  saved areas, DEM/imagery download jobs. Hands a finished
-#                  download to the engine (or leaves it "downloaded" for the
-#                  engine to build when it starts).    docker compose up -d data-platform
-#   viewer         host GIS_VIEWER_PORT (3100) - optional web viewer; talks to
-#                  the engine only (fetch page proxied to the data-platform).
+#   engine         host GIS_ENGINE_PORT (5000) - PUBLIC: what other apps
+#                  connect to. nginx serves every tile file plus the read-only
+#                  metadata (ArcGIS ImageServer ?f=json + tilemap,
+#                  terrain.json, imagery TileJSON, the viewer's catalog GETs);
+#                  everything else on that port answers 403/404. Its FastAPI
+#                  (build jobs, conversion status) is internal: engine:8787 on
+#                  the compose network only. Builds missing / newly downloaded
+#                  areas on start-up and periodically.
+#                                                      docker compose up -d engine
+#   data-platform  host GIS_DATA_BIND:GIS_DATA_PORT (127.0.0.1:5100) - LOCAL
+#                  ONLY by default: home page (/), Download data (/fetch/),
+#                  Data library (/library/: conversion status + Convert now),
+#                  DEM/imagery download jobs. Talks to the engine at
+#                  engine:8787. GIS_DATA_BIND=0.0.0.0 opens it to the LAN.
+#                                                      docker compose up -d data-platform
+#   viewer         host GIS_VIEWER_PORT (3100) - optional web viewer (public,
+#                  a tile consumer); proxies only the engine's public port
+#                  (engine:80), never the data-platform.
 #                                                      docker compose up -d viewer
 #
 # Shared json-file log rotation: at most 5 x 20 MB per container.
@@ -49,6 +55,10 @@ services:
       HEIGHTMAP_PYTHON: /usr/local/bin/python
       # periodic check for areas downloaded while the engine runs (0 = off)
       GIS_AUTOBUILD_INTERVAL_S: ${GIS_AUTOBUILD_INTERVAL_S:-60}
+      # 0 = never convert by itself (only "Convert now" / hand-offs build)
+      GIS_AUTOBUILD: ${GIS_AUTOBUILD:-1}
+      # background refresh of the data library's tile counts (s, 0 = off)
+      GIS_CONVERSION_WATCH_S: ${GIS_CONVERSION_WATCH_S:-15}
     volumes:
       # nginx serves the tiles from here (/data) and FastAPI reads/writes the
       # same volume as /app/data. Never rename the volume or its mount paths.
@@ -56,8 +66,9 @@ services:
       - gis-data:/data:ro
     ports:
       - "${GIS_ENGINE_PORT:-${GIS_PLATFORM_PORT:-5000}}:80"
-    # 8787 = the engine's FastAPI, reachable as engine:8787 on the compose
-    # network only (the data-platform's hand-off); not published on the host.
+    # 8787 = the engine's FastAPI (build jobs, conversion status), reachable
+    # as engine:8787 on the compose network only (the data-platform); never
+    # published on the host. Port 80 (nginx) is public but read-only.
     expose:
       - "8787"
     networks:
@@ -92,16 +103,19 @@ services:
       LEAFLET_ROOT: /opt/leaflet
       # hand-off target (compose network); the engine may be stopped
       ENGINE_URL: http://engine:8787
-      # links on the fetch page: http://<same host>:<this port>
+      # links on the pages: http://<same host>:<this port>
       ENGINE_PUBLIC_PORT: ${GIS_ENGINE_PORT:-${GIS_PLATFORM_PORT:-5000}}
+      VIEWER_PUBLIC_PORT: ${GIS_VIEWER_PORT:-3100}
     volumes:
       - gis-data:/app/data
       # The DEM engine is baked into the image at /opt/heightmap-30m (copied
       # from gis-data-platform/engine). Uncomment to override it with a local
       # engine checkout while developing the engine itself (same for engine):
       # - ${HEIGHTMAP_ENGINE_ROOT:-../heightmap-30m}:/opt/heightmap-30m:ro
+    # LOCAL ONLY by default (downloads + conversion control have no login):
+    # set GIS_DATA_BIND=0.0.0.0 in .env to reach it from the LAN.
     ports:
-      - "${GIS_DATA_PORT:-5100}:8787"
+      - "${GIS_DATA_BIND:-127.0.0.1}:${GIS_DATA_PORT:-5100}:8787"
     networks:
       - gis
     healthcheck:
@@ -112,7 +126,8 @@ services:
       start_period: 10s
 
   # Optional web viewer (MapLibre / ArcGIS / Cesium). No data volume: tiles
-  # and metadata come from the engine, the fetch page from the data-platform.
+  # and metadata come from the engine's public port; the data-platform is not
+  # proxied (local-only).
   viewer:
     build:
       context: ./gis-viewers

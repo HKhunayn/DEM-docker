@@ -46,6 +46,7 @@ CHUNK = 64
 MAX_RESTARTS = 10       # pool deaths outside isolation before giving up
 ISOLATED_KILLS = 2      # kills while running alone -> tile quarantined
 MAX_LOGGED_ERRORS = 50
+PROGRESS_EVERY_S = float(os.environ.get("BUILD_PROGRESS_EVERY_S", "3"))   # live progress lines
 
 
 class PoolAborted(RuntimeError):
@@ -175,6 +176,9 @@ def run_pool(job, tasks, workers, initializer, initargs, on_result, label,
     isolate = []       # single tiles to run alone after repeated pool deaths
     kills = {}         # task desc -> deaths while running alone
     total, done, next_report = len(tasks), 0, 4096
+    # also every PROGRESS_EVERY_S seconds: the data library's live percent
+    # moves during a long zoom, not only every 4096 tiles
+    last_report = time.monotonic()
     restarts = 0
     failed = 0
     fail_limit = max(MIN_FAIL_ABORT, int(total * MAX_FAIL_FRAC))
@@ -239,12 +243,15 @@ def run_pool(job, tasks, workers, initializer, initargs, on_result, label,
                         else:
                             fail(r[1], r[2])
                     done += len(chunk)
-                    if done >= next_report:
+                    if done >= next_report or (done < total
+                                               and time.monotonic() - last_report >= PROGRESS_EVERY_S):
                         frac = mem_frac()
                         mem = f", mem {frac:.0%}" if frac is not None else ""
                         print(f"  {label} progress {done}/{total} workers={workers}{mem}")
                         sys.stdout.flush()
-                        next_report += 4096
+                        last_report = time.monotonic()
+                        while next_report <= done:
+                            next_report += 4096
         except BrokenProcessPool:
             lost = list(inflight.values())
             inflight.clear()

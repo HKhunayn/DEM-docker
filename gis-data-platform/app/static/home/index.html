@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>GIS data platform</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; font: 14px/1.5 system-ui, sans-serif; color: #1a1a1a; background: #f3f5f8; }
+    nav { display: flex; gap: 4px; align-items: center; padding: 10px 24px; background: #fff;
+          border-bottom: 1px solid #d5d9de; }
+    nav b { margin-right: 14px; }
+    nav a { padding: 5px 10px; border-radius: 6px; color: #374151; text-decoration: none; }
+    nav a:hover { background: #eff6ff; color: #1d4ed8; }
+    nav a.on { background: #eff6ff; color: #1d4ed8; font-weight: 600; }
+    main { max-width: 900px; margin: 0 auto; padding: 28px 24px 40px; }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    .sub { color: #6b7280; margin: 0 0 18px; }
+    #enginestatus { margin: 0 0 22px; padding: 9px 12px; border-radius: 8px; font-size: 13px;
+                    background: #f3f4f6; color: #374151; display: flex; gap: 10px; align-items: center; }
+    #enginestatus.up { background: #ecfdf5; color: #065f46; }
+    #enginestatus.busy { background: #eff6ff; color: #1e3a8a; }
+    #enginestatus.down { background: #fef3c7; color: #92400e; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #9ca3af; flex: none; }
+    .up .dot { background: #10b981; } .busy .dot { background: #2563eb; animation: pulse 1.2s infinite; }
+    .down .dot { background: #f59e0b; }
+    @keyframes pulse { 50% { opacity: .35; } }
+    .spinner { width: 14px; height: 14px; border-radius: 50%; border: 2px solid #c7d2fe;
+               border-top-color: #2563eb; animation: spin .9s linear infinite; flex: none; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    a.big { display: block; padding: 26px 24px; border-radius: 14px; text-decoration: none; color: #fff;
+            background: #2563eb; box-shadow: 0 2px 8px rgba(37,99,235,.25); transition: transform .08s; }
+    a.big:hover { transform: translateY(-2px); background: #1d4ed8; }
+    a.big.alt { background: #111827; box-shadow: 0 2px 8px rgba(17,24,39,.25); }
+    a.big.alt:hover { background: #000; }
+    a.big .t { display: block; font-size: 20px; font-weight: 700; margin-bottom: 6px; }
+    a.big .d { display: block; font-size: 13px; opacity: .88; }
+    footer { margin-top: 30px; padding: 14px 16px; border: 1px solid #d5d9de; border-radius: 10px; background: #fff;
+             font-size: 13px; }
+    footer h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: #6b7280; margin: 0 0 8px; }
+    footer code { background: #f3f4f6; padding: 1px 5px; border-radius: 4px; font-size: 12px; word-break: break-all; }
+    footer li { margin: 3px 0; }
+    .note { font-size: 12px; color: #6b7280; margin-top: 8px; }
+    @media (max-width: 640px) { .buttons { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <nav>
+    <b>GIS data platform</b>
+    <a href="/" class="on">Home</a>
+    <a href="/fetch/">Download data</a>
+    <a href="/library/">Data library</a>
+  </nav>
+  <main>
+    <h1>GIS data platform</h1>
+    <p class="sub">Download elevation and imagery data, then follow how it is converted into tiles for
+      ArcGIS (Lerc ImageServer) and MapLibre / Cesium (Terrarium WebP).</p>
+    <div id="enginestatus" role="status" aria-live="polite"><span class="spinner"></span><span id="enginetext">engine: checking…</span></div>
+    <div class="buttons">
+      <a class="big" id="btn-download" href="/fetch/">
+        <span class="t">⤓ Download data</span>
+        <span class="d">Pick an area on the map and download its elevation (DEM) or imagery. The engine
+          converts every downloaded elevation area by itself.</span>
+      </a>
+      <a class="big alt" id="btn-library" href="/library/">
+        <span class="t">▦ Data library</span>
+        <span class="d">Every saved area: source data, ArcGIS and MapLibre/Cesium conversion progress (%),
+          size on disk, live progress and “Convert now” for what is still missing.</span>
+      </a>
+    </div>
+    <footer>
+      <h2>Public tile serving (engine)</h2>
+      <ul id="urls">
+        <li>loading…</li>
+      </ul>
+      <div class="note">Only tile serving is public. This page, the download page and the data library are
+        local-only: the data-platform listens on 127.0.0.1 by default (set <code>GIS_DATA_BIND=0.0.0.0</code> in
+        <code>.env</code> to open it to the LAN). The apps talk to each other on the internal Docker network only.</div>
+    </footer>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    function fmtSecs(s) {
+      s = Math.max(0, Math.round(Number(s) || 0));
+      return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`;
+    }
+    function li(label, url) {
+      const item = document.createElement("li");
+      const code = document.createElement("code");
+      code.textContent = url;
+      item.append(`${label}: `, code);
+      return item;
+    }
+    let failures = 0;
+    async function loadUrls() {
+      try {
+        const r = await fetch("/api/library/urls", { cache: "no-store" });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const u = await r.json();
+        $("urls").replaceChildren(
+          li("ArcGIS ImageServer (per area)", u.arcgis),
+          li("MapLibre / Cesium terrain (TileJSON)", u.terrain),
+          li("ArcGIS services list", u.services),
+          li("Web viewer", u.viewer + "/"));
+      } catch (e) {
+        $("urls").replaceChildren(li("could not load the URLs", String(e.message || e)));
+        setTimeout(loadUrls, 5000);
+      }
+    }
+    async function poll() {
+      const box = $("enginestatus");
+      try {
+        const r = await fetch("/api/engine/status", { cache: "no-store" });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const s = await r.json();
+        failures = 0;
+        const job = s.current && ["running", "queued"].includes(s.current.state) ? s.current : null;
+        box.className = !s.running ? "down" : job ? "busy" : "up";
+        box.replaceChildren(document.createElement("span"));
+        box.firstChild.className = "dot";
+        const text = document.createElement("span");
+        text.textContent = !s.running
+          ? "Engine not running — tiles are not served or converted until it starts (Run.bat up engine)."
+          : job ? `Engine running — converting ${job.name} (step ${job.step}, ${fmtSecs(job.elapsed)}). See the Data library for the progress.`
+                : "Engine running — idle.";
+        box.append(text);
+        setTimeout(poll, job ? 3000 : 10000);
+      } catch (e) {
+        failures += 1;
+        box.className = "down";
+        box.textContent = `Data-platform not answering (${e.message || e}) — retrying…`;
+        setTimeout(poll, Math.min(30000, 1500 * 2 ** failures));
+      }
+    }
+    loadUrls();
+    poll();
+  </script>
+</body>
+</html>

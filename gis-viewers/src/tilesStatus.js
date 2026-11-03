@@ -5,6 +5,10 @@ import {formatElapsed} from "./uiHelpers.js";
 
 const RUNNING = new Set(["checking", "running"]);
 
+// The data-platform (downloads + data library) is local-only: it is not
+// proxied by the viewer and listens on 127.0.0.1 of the server by default.
+export const DATA_PLATFORM_HINT = "http://127.0.0.1:5100/ on the server machine";
+
 export function buildProgress(current) {
   if (!current) return "";
   const what = current.mode === "full" ? "elevation tiles + ArcGIS service" : "ArcGIS elevation service";
@@ -26,8 +30,8 @@ export function describeTiles(status) {
       return {kind: "info", text: `Building the elevation tiles (the data has none yet): ${progress}. The map appears by itself when this finishes.`};
     }
     if (auto.state === "blocked") return {kind: "warning", text: `No elevation tiles yet - automatic build ${auto.message}`};
-    if (auto.state === "error") return {kind: "warning", text: `No elevation tiles - the automatic build failed (${auto.message}). Check the job log on the fetch page (/fetch/).`};
-    return {kind: "warning", text: `No elevation tiles: ${published.reason || "nothing built yet"}. Build an area on the fetch page (/fetch/).`};
+    if (auto.state === "error") return {kind: "warning", text: `No elevation tiles - the automatic build failed (${auto.message}). Check the data library of the data-platform (${DATA_PLATFORM_HINT}).`};
+    return {kind: "warning", text: `No elevation tiles: ${published.reason || "nothing built yet"}. Download an area with the data-platform (${DATA_PLATFORM_HINT}).`};
   }
   if (running && auto.current) return {kind: "info", text: `Updating tiles: ${progress}`};
   if (auto.state === "blocked") return {kind: "warning", text: `Tile update ${auto.message}`};

@@ -15,7 +15,7 @@ import {makePlatformTerrainProvider} from "./cesiumTerrain.js";
 import {ReliefImageryProvider} from "./cesiumRelief.js";
 import {COLOR_RELIEF_OPACITY, HILLSHADE, MAP_BACKGROUND, colorReliefExpression, hillshadeExaggerationExpression} from "./relief.js";
 import {formatElapsed, isAbortError, templatesKey, withTimeout} from "./uiHelpers.js";
-import {describeTiles, pollDelay, tilesSignature} from "./tilesStatus.js";
+import {DATA_PLATFORM_HINT, describeTiles, pollDelay, tilesSignature} from "./tilesStatus.js";
 import {GOTO_HINT, findCatalogItem, formatLatLon, normalizeText, parseCoordinates, parsePlaces, placeLabel, searchPlaces, zoomForPopulation} from "./goto.js";
 import {cleanCamera, fromArcgisZoom, fromCesiumPitch, parseCameraHash, rangeForZoom, throttle, toArcgisZoom, toCesiumPitch, verticalFov, withCameraHash, zoomForRange} from "./camera.js";
 
@@ -51,7 +51,7 @@ app.innerHTML = `
       <div id="details" class="details hidden"></div>
       <div class="panel-heading imagery-heading"><h2>Imagery</h2></div>
       <select id="imagery-select" aria-label="Imagery set"><option value="">— none —</option></select>
-      <div id="imagery-info" class="imagery-info">No imagery sets yet — fetch one on the platform's /fetch/ page (Imagery tab).</div>
+      <div id="imagery-info" class="imagery-info">No imagery sets yet — download one with the data-platform (${DATA_PLATFORM_HINT}, Download data → Imagery).</div>
       <p class="attribution-note">Place search: offline <a href="https://www.geonames.org/" target="_blank" rel="noopener">GeoNames</a> cities (CC-BY 4.0).</p>
     </aside>
     <section id="map" aria-label="Geospatial viewers">
@@ -244,7 +244,7 @@ async function selectItem(item) {
   const b = itemBounds(item), t = terrainBounds();
   const outside = item?.kind !== "imagery" && b && t && (b[2] < t[0] || b[0] > t[2] || b[3] < t[1] || b[1] > t[3]);
   for (const view of ["maplibre", "cesium"]) {
-    setMapMessage(outside ? `${itemName(item)} is outside the current terrain build - MapLibre/Cesium show only the last built area. Rebuild it on the /fetch/ page to view it here; the ArcGIS view has it.` : "", view);
+    setMapMessage(outside ? `${itemName(item)} is outside the current terrain build - MapLibre/Cesium show only the last built area. Publish it in the data-platform's Data library (${DATA_PLATFORM_HINT}) to view it here; the ArcGIS view has it.` : "", view);
   }
   setBusyStatus(`${itemName(item)} selected · moving viewers`);
   const outcome = await syncViews();
@@ -295,7 +295,7 @@ function renderImageryPicker() {
   imagerySelect.value = selectedImagery?.name || "";
   imagerySelect.disabled = !sets.length;
   imageryInfo.textContent = !sets.length
-    ? "No imagery sets yet — fetch one on the platform's /fetch/ page (Imagery tab)."
+    ? `No imagery sets yet — download one with the data-platform (${DATA_PLATFORM_HINT}, Download data → Imagery).`
     : selectedImagery
       ? `${selectedImagery.tileCount ?? "?"} tiles · ${((Number(selectedImagery.bytes) || 0) / 1e6).toFixed(2)} MB · over-zoomed above z${selectedImagery.maxzoom ?? "?"} · ${selectedImagery.attribution || ""}`
       : `${sets.length} imagery set(s) available`;

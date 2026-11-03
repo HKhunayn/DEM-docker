@@ -14,44 +14,96 @@ Run only what you need: each app starts on its own and they share the named
 
 ```text
                         your ArcGIS / MapLibre / Cesium apps
-                                       |
+                                       |   (PUBLIC: tile serving only)
                                        v
- +------------------+  hand-off  +------------------------------------+
+ +------------------+  internal  +------------------------------------+
  | data-platform    |----------->| engine            host :5000       |
- | host :5100       | POST       |  nginx :80  - tile files (sendfile) |
- | DOWNLOADS only   | engine:8787|  FastAPI    - ImageServer metadata, |
- | fetch page,      | /api/jobs  |    tilemap, terrain.json, catalog,  |
- | saved areas,     |            |    tile status, BUILD jobs          |
- | DEM + imagery    |            |  builds: DEM -> lossless WebP +     |
- | downloads        |            |    ArcGIS Lerc (never downloads)    |
+ | 127.0.0.1:5100   | engine:8787|  nginx :80  - tile files (sendfile) |
+ | LOCAL ONLY       | /api/jobs  |    + read-only metadata; all else   |
+ | home, Download   | /api/      |    403/404 on the public port       |
+ | data, Data       | conversion |  FastAPI :8787 (internal) - build   |
+ | library, DEM +   |            |    jobs, conversion status          |
+ | imagery downloads|            |  builds: DEM -> lossless WebP +     |
+ |                  |            |    ArcGIS Lerc (never downloads)    |
  +--------+---------+            +-----------------+------------------+
           |   writes dem/, imagery/, catalog        |  reads dem/, writes tiles/
           +-------------------+---------------------+
                               v
                     volume dem-docker_gis-data
                               ^
- +------------------+         |  (no volume: proxies)
- | viewer :3100     |  /api /tiles /arcgis /health -> engine
- | MapLibre/ArcGIS/ |  /fetch/ /vendor/            -> data-platform
+ +------------------+         |  (no volume: proxies engine:80 only)
+ | viewer :3100     |  /api (GET only) /tiles /arcgis /health -> engine:80
+ | MapLibre/ArcGIS/ |  no /fetch, no data-platform proxy
  | Cesium           |
  +------------------+
 ```
 
 | App | Host port (`.env`) | Start alone | Does |
 | --- | --- | --- | --- |
-| `engine` | `GIS_ENGINE_PORT` = **5000** | `docker compose up -d engine` | serves every tile + metadata to apps, builds tiles (check → build → verify → publish); builds missing / newly downloaded areas on start-up and every 60 s while idle |
-| `data-platform` | `GIS_DATA_PORT` = **5100** | `docker compose up -d data-platform` | fetch page, saved areas, DEM and imagery downloads, ingest; hands each finished DEM download to the engine |
-| `viewer` | `GIS_VIEWER_PORT` = **3100** | `docker compose up -d viewer` (starts the engine too) | optional web viewer; talks to the engine only |
+| `engine` | `GIS_ENGINE_PORT` = **5000** (public, read-only) | `docker compose up -d engine` | serves every tile + metadata to apps, builds tiles (check → build → verify → publish); builds missing / newly downloaded areas on start-up and every 60 s while idle |
+| `data-platform` | `GIS_DATA_BIND`:`GIS_DATA_PORT` = **127.0.0.1:5100** (local only) | `docker compose up -d data-platform` | home page, Download data (fetch page), Data library (conversion status + Convert now), saved areas, DEM and imagery downloads, ingest; hands each finished DEM download to the engine |
+| `viewer` | `GIS_VIEWER_PORT` = **3100** | `docker compose up -d viewer` (starts the engine too) | optional web viewer; talks to the engine's public port only |
 
 **Point your apps at the engine:**
 
 - ArcGIS elevation: `http://<server-ip>:5000/arcgis/rest/services/<area>/ImageServer`
 - Terrarium WebP TileJSON (MapLibre/Cesium/deck.gl): `http://<server-ip>:5000/tiles/terrain.json`
-- API docs: `http://<server-ip>:5000/docs`
 
-Download new areas on the data-platform's fetch page:
-`http://<server-ip>:5100/fetch/` (also reachable through the viewer at
-`http://<server-ip>:3100/fetch/`). Optional web viewer: `http://<server-ip>:3100/`.
+**Manage the data on the server machine** (data-platform home page):
+`http://127.0.0.1:5100/` with two buttons - **Download data** (`/fetch/`) and
+**Data library** (`/library/`). Optional web viewer: `http://<server-ip>:3100/`.
+
+### Local-only control, public serving
+
+Only what serving tiles needs is public. The engine's nginx (:5000) passes
+just tile files, ArcGIS ImageServer metadata (`?f=json`) + tilemap,
+`/tiles/terrain.json`, imagery tiles/TileJSON, `/health` and the viewer's
+read-only GETs (`/api/catalog`, `/api/areas`, `/api/services`,
+`/api/imagery`, `/api/tiles/status`). Everything else on :5000 - build jobs,
+job status/logs/cancel, `/api/conversion*`, `/api/tiles/rebuild-missing`,
+`/docs`, `/openapi.json`, any POST/PUT/DELETE - answers **403/404**. The
+engine's FastAPI port (8787) is never published: the data-platform reaches it
+as `engine:8787` on the internal compose network. The data-platform itself is
+bound to `127.0.0.1` (`GIS_DATA_BIND`); to manage a remote server use an SSH
+tunnel (`ssh -L 5100:127.0.0.1:5100 user@server`) or, on a trusted LAN only,
+set `GIS_DATA_BIND=0.0.0.0` in `.env`. The viewer (:3100) proxies only the
+engine's public port (GET-only `/api`) and no longer the data-platform.
+
+### Data library (conversion status)
+
+`http://127.0.0.1:5100/library/` lists every saved elevation area:
+
+- **Source data** - the 1° DEM files the area needs vs. on disk (+ size);
+  "Download missing" starts the normal download job (cached files are
+  skipped; sea/void cells that do not exist at the source are not counted).
+- **ArcGIS (Lerc ImageServer)** and **MapLibre/Cesium (Terrarium WebP)** -
+  state (converted / converting / partly converted / stale / not converted;
+  for WebP also *covered by the published set of X* or *not published*),
+  **percent converted**, tiles done / expected, size on disk, public URL.
+  Expected = Σ over the zooms of the bbox tile range; done = tiles a resumed
+  build trusts (complete manifest of the current engine → 100 %; interrupted
+  forced rebuild → only its finished zooms; tiles without manifest / of an
+  older engine → stale, 0 %).
+- While the engine converts: step, elapsed time, live percent from the build
+  log (per-zoom totals + progress lines), written vs. skipped (already baked)
+  tiles. The page polls every 2 s while something runs, else every 15 s.
+- **Convert now** (with a confirmation saying what will happen) starts the
+  engine job that converts **only what is missing** - the same plan as the
+  automatic build: LERC-only when only the ArcGIS tiles are missing / partial /
+  stale, full (build + publish) only when the area's WebP set is missing; the
+  build resumes from its manifests, so baked tiles are skipped, never redone.
+  It is disabled (with the reason) while any conversion runs, when nothing is
+  missing ("fully converted") and when the engine is not running. Publishing a
+  non-primary area for MapLibre/Cesium is a separate button: only one area is
+  published at a time, so it replaces the current one (it asks first).
+
+The tile counts are made by the engine (it owns the tiles) in a background
+thread and cached in `stats/conversion-stats.json` on the volume (refreshed
+after each job, when manifests change, every 10 s while an area converts;
+"re-count tiles" forces it); requests never count files. Internal API:
+`GET engine:8787/api/conversion[/{name}]`, `POST .../api/conversion/{name}/convert`,
+proxied by the data-platform as `GET /api/library`,
+`POST /api/library/{name}/convert|download`.
 
 ### Hand-off: download -> build
 
@@ -65,7 +117,7 @@ Download new areas on the data-platform's fetch page:
    - **engine not running**: the area stays `downloaded` with the message
      *"engine not running - it builds this area when it starts"*; the engine
      builds it by itself on its next start (start-up + periodic check).
-3. The fetch page follows the whole pipeline - download → handed to engine →
+3. The fetch page (and the Data library) follows the whole pipeline - download → handed to engine →
    check → build → verify → publish, with step, elapsed time and log - through
    the platform's `/api/engine/...` proxy (no CORS, no internal address in the
    browser). When the engine is down it says so and keeps waiting.
@@ -106,15 +158,16 @@ owns port 5000).
 
 Stopping/recreating the engine interrupts a running build, the data-platform a
 running download (both resume: the engine rebuilds an interrupted full build
-by itself when it starts). The launchers check `/api/jobs/current` on the
-affected apps first and ask for confirmation; pass `-y` to skip the prompt.
+by itself when it starts). The launchers check the running job of the
+affected apps first (the engine's inside its container - its job API is not
+public) and ask for confirmation; pass `-y` to skip the prompt.
 `Run.bat` also finds Docker Desktop's `docker.exe` when it is not on `PATH`,
 and pauses with a hint on errors (e.g. Docker Desktop not running).
 
 All containers use `restart: unless-stopped` and json-file log rotation
-(5 x 20 MB). The viewer's nginx resolves `engine` / `data-platform` per
-request, so recreating either needs no viewer restart; with the data-platform
-stopped, `/fetch/` on the viewer shows a page saying so.
+(5 x 20 MB). The viewer's nginx resolves `engine` per request, so recreating
+it needs no viewer restart; `/fetch/` on the viewer only explains that the
+data-platform is local-only (`http://127.0.0.1:5100/` on the server).
 
 The DEM engine is bundled in `gis-data-platform/engine/` (the `heightmap-30m`
 `terrainhub.py` + `scripts/`, including the Lerc1 encoder sources) and baked
@@ -128,7 +181,7 @@ the viewer is hosted separately.
 | --- | --- |
 | `local-gis-data-platform` (Dockerfile target `platform`, `GIS_ROLE=platform`) | Python API + pinned runtime `requirements.txt` (fastapi, uvicorn, numpy, Pillow, rasterio, requests, remotezip; test tools are in `requirements-dev.txt`, not in the image), the `engine/` DEM toolchain with `lerc1enc` compiled from source, Leaflet 1.9.4 vendor assets (SHA-256 verified) |
 | `local-gis-engine` (target `engine`, `GIS_ROLE=engine`) | the same layers + Debian nginx (`nginx/nginx.conf`, `nginx/engine.conf`, `nginx/gis-tiles.conf`) + tini running uvicorn and nginx (`engine-entrypoint.sh`: if either exits, the container exits and Docker restarts it) |
-| `local-gis-viewer` | Vite build of the MapLibre / ArcGIS / CesiumJS viewer, served by nginx with `/api`, `/tiles`, `/arcgis`, `/health` proxied to the engine and `/fetch`, `/vendor` to the data-platform |
+| `local-gis-viewer` | Vite build of the MapLibre / ArcGIS / CesiumJS viewer, served by nginx with `/api` (GET only), `/tiles`, `/arcgis`, `/health` proxied to the engine's public port; no data-platform proxy |
 
 Runtime data (DEM tiles, pyramids, catalog) lives in the named `gis-data`
 volume and is never copied into an image.
@@ -208,8 +261,10 @@ built yet, one job at a time:
   (`terrainhub.py build --lerc-only`), which never replaces the published set.
 
 The DEMs are already in the volume, so nothing is downloaded. Progress: a banner
-in the viewer, `GET /api/tiles/status` or `/api/jobs/current` on the engine
-(:5000), or the engine line on the fetch page.
-`POST /api/tiles/rebuild-missing` runs the check again. Builds stop when the
+in the viewer, `GET /api/tiles/status` on the engine (:5000), or the Data
+library / engine line on the fetch page (data-platform).
+`POST /api/tiles/rebuild-missing` on the engine's internal API (`engine:8787`,
+not on the public port) or "Convert now" in the Data library runs the check
+again. Builds stop when the
 data disk has less than `GIS_AUTOBUILD_MIN_FREE_GB` (default 10) free;
 `GIS_AUTOBUILD=0` turns the automatic builds off.

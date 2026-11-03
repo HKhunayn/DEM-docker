@@ -53,7 +53,8 @@ STUB_TERRAINHUB = textwrap.dedent(
 
 # Modules that capture DATA_ROOT / ENGINE_ROOT at import time.
 PLATFORM_MODULES = ["app.config", "app.catalog", "app.handoff", "app.imagery", "app.jobs", "app.autobuild",
-                    "app.fetch_api", "app.build_api", "app.imagery_api"]
+                    "app.tilestats", "app.conversion", "app.fetch_api", "app.build_api", "app.imagery_api",
+                    "app.library_api"]
 
 
 @pytest.fixture()

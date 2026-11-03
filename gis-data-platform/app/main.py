@@ -26,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
-from . import build_api, fetch_api, imagery_api
+from . import build_api, fetch_api, imagery_api, library_api
 from .catalog import catalog_items, delete_item, find_item, ingest_file, item_path, load_catalog
 from .config import ROLE, TILE_ROOT
 from .terrain import TerrainSource
@@ -80,7 +80,12 @@ async def _engine_lifespan(_app: FastAPI) -> AsyncIterator[None]:
     if autobuild.enabled():
         autobuild.start(delay=float(os.environ.get("GIS_AUTOBUILD_DELAY_S", "5")))
         autobuild.start_periodic()
+    # conversion status (data-platform library page): keep the tile counts
+    # warm in the background so requests never count files themselves
+    from . import conversion
+    conversion.start_watch()     # GIS_CONVERSION_WATCH_S=0 disables it
     yield
+    conversion.stop_watch()
     autobuild.stop()
     _shutdown_jobs()
 
@@ -489,10 +494,13 @@ def create_app(role: str = ROLE) -> FastAPI:
             application.include_router(fetch_api.jobs_router, prefix=prefix, **hidden)
             application.include_router(fetch_api.areas_router, prefix=prefix, **hidden)
             application.include_router(imagery_api.router, prefix=prefix, **hidden)
+        application.include_router(library_api.router)
+        application.include_router(library_api.page_router)
         application.include_router(common)
         application.include_router(data)
         service = "gis-data-platform"
-        links = {"fetch": "/fetch/", "areas": "/api/areas", "jobs": "/api/jobs", "engine": "/api/engine/status"}
+        links = {"home": "/", "fetch": "/fetch/", "library": "/library/", "areas": "/api/areas",
+                 "jobs": "/api/jobs", "engine": "/api/engine/status", "libraryApi": "/api/library"}
     elif role == "engine":
         application = FastAPI(title="GIS engine (build + serve)", version=VERSION, lifespan=_engine_lifespan)
         application.include_router(serve)
@@ -502,8 +510,9 @@ def create_app(role: str = ROLE) -> FastAPI:
         application.include_router(imagery_api.serve_router)
         application.include_router(common)
         service = "gis-engine"
+        # public (port 5000) entry points only; the build/control API is internal
         links = {"terrain": "/tiles/terrain.json", "services": "/api/services", "catalog": "/api/catalog",
-                 "jobs": "/api/jobs", "tilesStatus": "/api/tiles/status"}
+                 "tilesStatus": "/api/tiles/status"}
     else:
         raise ValueError(f"unknown role {role!r}")
     application.add_middleware(
@@ -515,9 +524,16 @@ def create_app(role: str = ROLE) -> FastAPI:
     def health() -> dict[str, Any]:
         return {"status": "ok", "service": service, "role": role, "version": VERSION}
 
-    @application.get("/", include_in_schema=False)
-    def root() -> dict[str, Any]:
-        return {"service": application.title, "role": role, "docs": "/docs", "health": "/health", **links}
+    def info() -> dict[str, Any]:
+        out = {"service": application.title, "role": role, "health": "/health", **links}
+        if role == "platform":
+            out["docs"] = "/docs"
+        return out
+
+    # service info (JSON); on the data-platform "/" is the HTML home page
+    application.add_api_route("/api/info", info, methods=["GET"], include_in_schema=False)
+    if role == "engine":
+        application.add_api_route("/", info, methods=["GET"], include_in_schema=False)
 
     return application
 

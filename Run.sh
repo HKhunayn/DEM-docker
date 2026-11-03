@@ -1,7 +1,10 @@
 #!/usr/bin/env sh
 # DEM GIS stack via Docker Compose - three apps sharing one data volume:
-#   engine         builds + serves tiles (port GIS_ENGINE_PORT, default 5000)
-#   data-platform  downloads only, fetch page (GIS_DATA_PORT, default 5100)
+#   engine         builds + serves tiles (port GIS_ENGINE_PORT, default 5000;
+#                  PUBLIC: tiles + read-only metadata only)
+#   data-platform  home page, downloads, data library / conversion status
+#                  (GIS_DATA_PORT, default 5100; LOCAL: bound to 127.0.0.1
+#                  unless GIS_DATA_BIND=0.0.0.0)
 #   viewer         optional web viewer (GIS_VIEWER_PORT, default 3100)
 #
 #   ./Run.sh [-y] [up|down|logs|build|restart|status] [service...]
@@ -74,8 +77,10 @@ affects() {  # affects <service>: is it part of this command?
 }
 confirm_no_running_job() {
   running=""
-  if affects engine && fetch_url "http://127.0.0.1:$ENGINE_PORT/api/jobs/current" \
-      | grep -Eq '"state"[[:space:]]*:[[:space:]]*"running"'; then
+  # the engine's job API is internal (port 5000 answers 403): ask inside the container
+  if affects engine && docker compose exec -T engine python -c \
+      "import urllib.request as u; print(u.urlopen('http://127.0.0.1:8787/api/jobs/current?tail=0', timeout=3).read().decode())" \
+      2>/dev/null | grep -Eq '"state"[[:space:]]*:[[:space:]]*"running"'; then
     running="$running engine(build)"
   fi
   if affects data-platform && fetch_url "http://127.0.0.1:$DATA_PORT/api/jobs/current" \
@@ -114,17 +119,19 @@ print_urls() {
   printf '\n'
   if affects engine || affects viewer; then
     wait_healthy engine "http://127.0.0.1:$ENGINE_PORT/health"
-    printf 'Engine (apps connect here):\n'
+    printf 'Engine - PUBLIC tile serving (apps connect here; nothing else is public):\n'
     printf '  ArcGIS:  http://<this-host>:%s/arcgis/rest/services/<area>/ImageServer\n' "$ENGINE_PORT"
-    printf '  Terrain: http://127.0.0.1:%s/tiles/terrain.json\n' "$ENGINE_PORT"
-    printf '  API:     http://127.0.0.1:%s/docs\n' "$ENGINE_PORT"
+    printf '  Terrain: http://<this-host>:%s/tiles/terrain.json\n' "$ENGINE_PORT"
   fi
   if affects data-platform; then
     wait_healthy data-platform "http://127.0.0.1:$DATA_PORT/health"
-    printf 'Data-platform (downloads): http://127.0.0.1:%s/fetch/\n' "$DATA_PORT"
+    printf 'Data-platform - LOCAL only (this machine; GIS_DATA_BIND=0.0.0.0 opens it to the LAN):\n'
+    printf '  Home:          http://127.0.0.1:%s/\n' "$DATA_PORT"
+    printf '  Download data: http://127.0.0.1:%s/fetch/\n' "$DATA_PORT"
+    printf '  Data library:  http://127.0.0.1:%s/library/  (conversion status, Convert now)\n' "$DATA_PORT"
   fi
   if affects viewer; then
-    printf 'Viewer:  http://127.0.0.1:%s/\n' "$VIEWER_PORT"
+    printf 'Viewer:  http://<this-host>:%s/\n' "$VIEWER_PORT"
   fi
 }
 

@@ -96,6 +96,9 @@
                     border: 1px solid #d5d9de; border-radius: 8px; background: #fff; color: #374151; }
     .modes button.on { border-color: #2563eb; background: #eff6ff; color: #1d4ed8; }
     .modes button:disabled { opacity: .6; cursor: default; }
+    .topnav { margin: 0 0 10px; font-size: 12px; color: #6b7280; }
+    .topnav a { color: #2563eb; text-decoration: none; }
+    .topnav a:hover { text-decoration: underline; }
     #enginestatus { margin: 0 0 12px; padding: 7px 10px; border-radius: 8px; font-size: 12px;
                     background: #f3f4f6; color: #374151; }
     #enginestatus.up { background: #ecfdf5; color: #065f46; }
@@ -126,6 +129,7 @@
       </div>
     </div>
     <div id="panel">
+      <div class="topnav"><a href="/">← Home</a> · <b>Download data</b> · <a href="/library/">Data library (conversion status)</a></div>
       <div id="enginestatus" role="status" aria-live="polite">engine: checking…</div>
       <div class="modes" role="tablist" aria-label="data type">
         <button id="mode-elevation" class="on" type="button" data-mode="elevation">Elevation (DEM)</button>

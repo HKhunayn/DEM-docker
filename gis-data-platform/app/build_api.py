@@ -10,15 +10,22 @@ automatic build picks it up as soon as the engine is idle).
 Status/history/cancel: /api/jobs, /api/jobs/current, /api/jobs/{id},
 /api/jobs/{id}/cancel (shared router in fetch_api.py); per area:
 GET /api/build/{name}.
+
+Conversion status (data-platform library page, through its proxy):
+GET /api/conversion, GET /api/conversion/{name}, POST /api/conversion/refresh,
+POST /api/conversion/{name}/convert {"publish": false} - converts only what is
+missing (app/conversion.py). All of these are INTERNAL: the engine's public
+nginx (port 5000) answers 403 for them; the data-platform calls engine:8787.
 """
 from __future__ import annotations
 
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from . import autobuild, catalog, jobs
+from . import autobuild, catalog, conversion, jobs
 
 router = APIRouter()
 
@@ -90,3 +97,58 @@ def build_state(name: str, tail: int = 30) -> dict[str, Any]:
         "published": status.get("published"),
         "autobuild": {k: auto.get(k) for k in ("state", "message", "current", "intervalS")},
     }
+
+
+# ---- conversion status (internal; proxied by the data-platform) -------------
+
+class ConvertInput(BaseModel):
+    publish: bool = False
+
+
+def _no_store(payload: dict[str, Any]) -> JSONResponse:
+    from .main import _finite
+    response = JSONResponse(_finite(payload))
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.get("/api/conversion")
+def conversion_overview() -> JSONResponse:
+    """Per area: ArcGIS + WebP state, percent, tiles done/expected, size,
+    live job progress and what Convert now would do. Never blocks on disk
+    counting (cached; ``measured.measuring`` while a count runs)."""
+    return _no_store(conversion.overview())
+
+
+@router.post("/api/conversion/refresh", status_code=202)
+def conversion_refresh() -> dict[str, Any]:
+    """Re-count every area's tiles in the background."""
+    n = conversion.measurer().invalidate()
+    conversion.overview()
+    return {"state": "measuring", "invalidated": n}
+
+
+@router.get("/api/conversion/{name}")
+def conversion_area(name: str) -> JSONResponse:
+    info = conversion.overview(name)
+    if not info["areas"]:
+        raise HTTPException(status_code=404, detail=f"no saved elevation area '{name}'")
+    return _no_store({**info, "area": info["areas"][0]})
+
+
+@router.post("/api/conversion/{name}/convert", status_code=202)
+def conversion_convert(name: str, body: ConvertInput | None = None) -> dict[str, Any]:
+    """Convert only what is missing for this area (lerc-only when only the
+    ArcGIS tiles are missing/partial/stale, full when its WebP set is; with
+    publish=true a non-primary area is built + published, replacing the
+    single published set). 409 when busy or nothing is missing."""
+    try:
+        return conversion.start_conversion(name, publish=bool(body and body.publish))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except (conversion.BusyError, jobs.JobRunningError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except conversion.NothingToDo as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except catalog.NameConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))

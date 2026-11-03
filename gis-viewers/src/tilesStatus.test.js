@@ -16,10 +16,15 @@ test("empty volume being built says so with progress", () => {
   assert.equal(pollDelay(building), 5000);
 });
 
-test("nothing published and no automatic build points to the fetch page", () => {
+test("nothing published and no automatic build points to the local data-platform", () => {
   const banner = describeTiles({published: {ok: false, reason: "nothing published"}, autobuild: {state: "idle"}});
   assert.equal(banner.kind, "warning");
-  assert.match(banner.text, /nothing published.*fetch page/);
+  assert.match(banner.text, /nothing published.*data-platform \(http:\/\/127\.0\.0\.1:5100\/ on the server machine\)/);
+  // the viewer no longer proxies the data-platform: never point at /fetch/
+  assert.doesNotMatch(banner.text, /\/fetch\//);
+  const failed = describeTiles({published: {ok: false}, autobuild: {state: "error", message: "x"}});
+  assert.doesNotMatch(failed.text, /\/fetch\//);
+  assert.match(failed.text, /data library/);
 });
 
 test("low disk and failures are warnings", () => {

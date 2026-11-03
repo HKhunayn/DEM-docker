@@ -4,8 +4,10 @@ cd /d "%~dp0"
 
 rem ============================================================
 rem  DEM GIS stack - three apps sharing one data volume:
-rem    engine         builds + serves tiles   (GIS_ENGINE_PORT, default 5000)
-rem    data-platform  downloads only          (GIS_DATA_PORT,   default 5100)
+rem    engine         builds + serves tiles   (GIS_ENGINE_PORT, default 5000, PUBLIC:
+rem                                             tiles + read-only metadata only)
+rem    data-platform  home, downloads, data   (GIS_DATA_PORT,   default 5100, LOCAL:
+rem                   library (conversion)     127.0.0.1 unless GIS_DATA_BIND=0.0.0.0)
 rem    viewer         optional web viewer     (GIS_VIEWER_PORT, default 3100)
 rem
 rem    Docker (preferred) : Run.bat [-y] [up|down|logs|build|restart|status] [service ...]
@@ -153,6 +155,17 @@ if not defined SERVICES (
 echo  %SERVICES% | findstr /i /c:" %~1" >nul 2>&1 && set "AFFECTS=1"
 exit /b 0
 
+rem :engine_job_running -> JOB_RUNNING=1 when the engine runs a build. Its job
+rem API is internal (the public port 5000 answers 403), so ask inside the
+rem container (127.0.0.1:8787).
+:engine_job_running
+set "JOB_RUNNING=0"
+set "JOB_TMP=%TEMP%\gis-engine-job-%RANDOM%.json"
+docker compose exec -T engine python -c "import urllib.request as u; print(u.urlopen('http://127.0.0.1:8787/api/jobs/current?tail=0', timeout=3).read().decode())" > "%JOB_TMP%" 2>nul
+if exist "%JOB_TMP%" findstr /c:"\"state\":\"running\"" "%JOB_TMP%" >nul 2>&1 && set "JOB_RUNNING=1"
+if exist "%JOB_TMP%" del /q "%JOB_TMP%" >nul 2>&1
+exit /b 0
+
 rem :job_running URL -> JOB_RUNNING=1 when that app reports a running job.
 :job_running
 set "JOB_RUNNING=0"
@@ -169,7 +182,7 @@ rem when the user declines.
 :check_running_job
 set "RUNNING_ON="
 call :affects engine
-if "%AFFECTS%"=="1" call :job_running "http://127.0.0.1:%ENGINE_PORT%/api/jobs/current"
+if "%AFFECTS%"=="1" call :engine_job_running
 if "%AFFECTS%"=="1" if "%JOB_RUNNING%"=="1" set "RUNNING_ON=%RUNNING_ON% engine(build, port %ENGINE_PORT%)"
 call :affects data-platform
 if "%AFFECTS%"=="1" call :job_running "http://127.0.0.1:%DATA_PORT%/api/jobs/current"
@@ -211,18 +224,20 @@ call :affects viewer
 if "%AFFECTS%"=="1" set "SHOW_ENGINE=1"
 if "%SHOW_ENGINE%"=="1" (
   call :wait_health engine "http://127.0.0.1:%ENGINE_PORT%/health"
-  echo Engine ^(apps connect here^):
+  echo Engine - PUBLIC tile serving ^(apps connect here; nothing else is public^):
   echo   ArcGIS:  http://^<this-host^>:%ENGINE_PORT%/arcgis/rest/services/^<area^>/ImageServer
-  echo   Terrain: http://127.0.0.1:%ENGINE_PORT%/tiles/terrain.json
-  echo   API:     http://127.0.0.1:%ENGINE_PORT%/docs
+  echo   Terrain: http://^<this-host^>:%ENGINE_PORT%/tiles/terrain.json
 )
 call :affects data-platform
 if "%AFFECTS%"=="1" (
   call :wait_health data-platform "http://127.0.0.1:%DATA_PORT%/health"
-  echo Data-platform ^(downloads^): http://127.0.0.1:%DATA_PORT%/fetch/
+  echo Data-platform - LOCAL only ^(this machine; GIS_DATA_BIND=0.0.0.0 opens it to the LAN^):
+  echo   Home:          http://127.0.0.1:%DATA_PORT%/
+  echo   Download data: http://127.0.0.1:%DATA_PORT%/fetch/
+  echo   Data library:  http://127.0.0.1:%DATA_PORT%/library/   ^(conversion status, Convert now^)
 )
 call :affects viewer
-if "%AFFECTS%"=="1" echo Viewer:  http://127.0.0.1:%VIEWER_PORT%/
+if "%AFFECTS%"=="1" echo Viewer:  http://^<this-host^>:%VIEWER_PORT%/
 exit /b 0
 
 :aborted
