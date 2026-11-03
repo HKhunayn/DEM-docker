@@ -25,7 +25,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from . import autobuild, catalog, conversion, jobs
+from . import autobuild, catalog, conversion, jobs, settings
 
 router = APIRouter()
 
@@ -152,3 +152,45 @@ def conversion_convert(name: str, body: ConvertInput | None = None) -> dict[str,
         raise HTTPException(status_code=409, detail=str(exc))
     except catalog.NameConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.get("/api/runtime")
+def runtime() -> dict[str, Any]:
+    """The engine container's limits/usage + what a build started now would
+    use (INTERNAL: the data-platform Settings page reads it via engine:8787)."""
+    info = settings.runtime()
+    info["build"] = estimate_build(info)
+    info["autobuild"] = {"enabled": autobuild.enabled(), "intervalS": autobuild.interval_s(),
+                         "minFreeGB": autobuild.min_free_gb()}
+    info["job"] = jobs.current_job(tail=0)
+    info["settings"] = settings.effective()     # with the engine container's .env
+    return info
+
+
+def estimate_build(info: dict[str, Any]) -> dict[str, Any]:
+    """Mirror of engine/scripts/pool_runner.default_workers() with the saved
+    settings, so the page can show the effect before a build starts."""
+    gb = 1024 ** 3
+    cpus = info.get("cpuCount") or 4
+    max_workers = int(settings.get("buildWorkers"))
+    high = float(settings.get("buildMemHigh"))
+    per_worker = float(settings.get("buildWorkerGB")) * gb
+    budget = float(settings.get("buildMemBudgetGB")) * gb
+    used = info.get("memoryUsed") or 0
+    limits = []
+    if info.get("vmMemoryTotal"):
+        limits.append(("Docker VM RAM", info["vmMemoryTotal"],
+                       info["vmMemoryTotal"] - (info.get("vmMemoryAvailable") or 0)))
+    if info.get("memoryLimit"):
+        limits.append(("engine container limit", info["memoryLimit"], used))
+    if budget > 0:
+        limits.append(("build RAM limit (setting)", budget, used))
+    cap = min(cpus, max_workers) if max_workers > 0 else cpus
+    if not limits:
+        return {"workers": cap, "limitBy": "cpu", "limit": None}
+    name, limit, lused = min(limits, key=lambda item: item[1] * high - item[2])
+    fit = int(max(0.0, limit * high - lused) // per_worker)
+    workers = max(1, min(cap, fit))
+    by = name if fit < cap else ("max build workers (setting)" if max_workers > 0 and max_workers < cpus else "CPU count")
+    return {"workers": workers, "limitBy": by, "limit": limit, "pauseAbove": limit * high,
+            "perWorker": per_worker, "cpuCount": cpus}

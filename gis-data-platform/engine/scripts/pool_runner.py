@@ -24,8 +24,10 @@ one bad tile from killing a multi-hour build:
     quarantined as failed. Tile writes are atomic and resumable, so re-running
     a chunk is safe.
 
-Tunables (env): BUILD_WORKER_GB (2.0), BUILD_MEM_HIGH (0.75),
-BUILD_RECYCLE_CHUNKS (100), BUILD_MAX_FAIL_FRAC (0.01).
+Tunables (env, set from the data-platform Settings page): BUILD_WORKER_GB
+(2.0), BUILD_MEM_HIGH (0.75), BUILD_RECYCLE_CHUNKS (100), BUILD_MAX_FAIL_FRAC
+(0.01), BUILD_MEM_BUDGET_GB (0 = container/VM limit), BUILD_MAX_WORKERS (0 =
+CPU count).
 """
 
 import multiprocessing as mp
@@ -41,6 +43,10 @@ PER_WORKER_BYTES = int(float(os.environ.get("BUILD_WORKER_GB", "2.0")) * GB)
 HIGH_WATER = float(os.environ.get("BUILD_MEM_HIGH", "0.75"))
 RECYCLE = int(os.environ.get("BUILD_RECYCLE_CHUNKS", "100"))
 MAX_FAIL_FRAC = float(os.environ.get("BUILD_MAX_FAIL_FRAC", "0.01"))
+# Soft limits from the data-platform Settings page (0 = off): a RAM budget
+# inside the container limit, and a cap on the worker count.
+MEM_BUDGET_BYTES = int(float(os.environ.get("BUILD_MEM_BUDGET_GB", "0") or 0) * GB)
+MAX_WORKERS = int(float(os.environ.get("BUILD_MAX_WORKERS", "0") or 0))
 MIN_FAIL_ABORT = 5      # never abort on fewer failures than this
 CHUNK = 64
 MAX_RESTARTS = 10       # pool deaths outside isolation before giving up
@@ -104,10 +110,12 @@ def mem_candidates():
         return []
     candidates = [(total - avail, total)]
     cg_max = _read_cgroup_int("/sys/fs/cgroup/memory.max")
-    if cg_max:
-        used = cgroup_used()
-        if used is not None:
-            candidates.append((used, cg_max))
+    cg_used = cgroup_used() if cg_max or MEM_BUDGET_BYTES else None
+    if cg_max and cg_used is not None:
+        candidates.append((cg_used, cg_max))
+    if MEM_BUDGET_BYTES > 0:
+        # the budget counts this container's memory (else the VM's used RAM)
+        candidates.append((cg_used if cg_used is not None else total - avail, MEM_BUDGET_BYTES))
     return candidates
 
 
@@ -125,6 +133,8 @@ def mem_frac():
 def default_workers() -> int:
     """Workers that fit under HIGH_WATER of the tightest limit (VM or cgroup)."""
     cpus = os.cpu_count() or 4
+    if MAX_WORKERS > 0:
+        cpus = min(cpus, MAX_WORKERS)
     c = mem_candidates()
     if not c:
         return cpus

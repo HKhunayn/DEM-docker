@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import catalog
+from . import catalog, settings
 from .config import (  # noqa: F401  (re-exported)
     DEM_ROOT,
     ENGINE_ROOT,
@@ -66,6 +66,11 @@ DEFAULT_TAIL = 200
 TERM_GRACE_S = 10.0            # SIGTERM -> SIGKILL grace for the engine group
 SHUTDOWN_GRACE_S = 5.0         # shorter: docker stop SIGKILLs after 10 s
 IDLE_TIMEOUT_S = float(os.environ.get("GIS_JOB_IDLE_TIMEOUT_S", "1800"))  # no-output watchdog
+
+
+def idle_timeout_s() -> float:
+    """Settings page value, else GIS_JOB_IDLE_TIMEOUT_S / 1800 (live)."""
+    return float(settings.saved_or("jobIdleTimeoutS", IDLE_TIMEOUT_S))
 PROVIDER_CACHE_TTL_S = 300.0
 STATES = ("queued", "running", "done", "error", "cancelled", "interrupted")
 ACTIVE_STATES = ("queued", "running")
@@ -528,9 +533,8 @@ def _start_elevation(name, bbox, provider, minzoom, maxzoom, save_area, mode, or
 
 def _watchdog(job: dict[str, Any]) -> None:
     """Terminate the engine when it prints nothing for IDLE_TIMEOUT_S."""
-    timeout = IDLE_TIMEOUT_S
-    interval = max(0.1, min(30.0, timeout / 10))
-    while not job["_stop"].wait(interval):
+    while not job["_stop"].wait(max(0.1, min(30.0, idle_timeout_s() / 10))):
+        timeout = idle_timeout_s()
         with _LOCK:
             proc = job.get("_proc")
             idle = time.monotonic() - job["_last_output"]
@@ -615,7 +619,7 @@ def _run_job(
                 encoding="utf-8",
                 errors="replace",
                 # unbuffered: live log lines, and the watchdog sees real progress
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                env={**os.environ, **settings.job_env(), "PYTHONUNBUFFERED": "1"},
                 **_popen_group_kwargs(),
             )
             with _LOCK:
@@ -667,7 +671,7 @@ def _run_job(
         elif abort == "stalled":
             outcome = "error"
             error = (f"{job['step']} step stalled: the engine printed nothing for "
-                     f"{_fmt_duration(IDLE_TIMEOUT_S)} and was terminated")
+                     f"{_fmt_duration(idle_timeout_s())} and was terminated")
         elif failed_step == "publish":
             outcome = "done"
             warning = (f"publish step failed (exit {failed_rc}); the new build was kept but "
@@ -812,13 +816,14 @@ def start_imagery_job(
     minzoom: int = 0,
     maxzoom: int = 1,
     save_area: bool = True,
+    options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from . import imagery
 
     global _CURRENT_ID
     total = imagery.count_tiles(bbox, minzoom, maxzoom)
-    if total > imagery.MAX_TILES_PER_JOB:
-        raise ValueError(f"{total} tiles requested; limit is {imagery.MAX_TILES_PER_JOB} per job")
+    if total > imagery.max_tiles_per_job():
+        raise ValueError(f"{total} tiles requested; limit is {imagery.max_tiles_per_job()} per job")
     existing = imagery.set_provider(name)
     if existing and existing != provider:
         raise catalog.NameConflictError(
@@ -826,6 +831,9 @@ def start_imagery_job(
             f"delete it first (DELETE /api/imagery/{name}) or choose another name"
         )
     catalog.check_area_provider(name, provider, kind="imagery")
+    available, reason = imagery.provider_status(provider)
+    if not available:
+        raise ValueError(f"{provider} is not available: {reason}")
     with _LOCK:
         _check_can_start()
         dataset = _imagery_dataset(name, provider, bbox, minzoom, maxzoom, "building")
@@ -833,6 +841,8 @@ def start_imagery_job(
                                    maxzoom=maxzoom, dataset=dataset, kind="imagery") if save_area else None
         job = _new_job("imagery", name, provider, bbox, minzoom, maxzoom,
                        area["id"] if area else None, IMAGERY_STEPS)
+        if options:
+            job["options"] = {k: v for k, v in options.items() if v is not None}
         _register(job)
         _CURRENT_ID = job["id"]
         snap = _snapshot(job)
@@ -870,7 +880,8 @@ def _run_imagery_job(job_id: str) -> None:
             entry["state"] = "running"
         result = imagery.download_set(job["name"], job["bbox"], job["provider"],
                                       job["minzoom"], job["maxzoom"],
-                                      lambda line: _append_log(job, line), stop=job["_stop"])
+                                      lambda line: _append_log(job, line), stop=job["_stop"],
+                                      options=job.get("options"))
         outcome = "done"
         entry.update(state="done", returncode=0)
     except BaseException as exc:  # noqa: BLE001

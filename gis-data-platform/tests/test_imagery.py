@@ -5,7 +5,7 @@ import time
 
 from PIL import Image
 
-WORLD = {"name": "world_test", "provider": "s2cloudless", "minzoom": 0, "maxzoom": 1}
+WORLD = {"name": "world_test", "provider": "s2cloudless2024", "minzoom": 0, "maxzoom": 1}
 
 
 def _jpeg(color):
@@ -42,7 +42,7 @@ def wait_done(client, job_id, timeout=20.0):
 def test_imagery_providers_listed(client):
     data = client.get("/api/imagery/providers").json()
     ids = {p["id"] for p in data["providers"]}
-    assert {"s2cloudless", "bluemarble"} <= ids
+    assert ids == {"s2-earthsearch", "s2cloudless2024", "bluemarble"}
     assert all("url" not in p for p in data["providers"])
 
 
@@ -217,9 +217,9 @@ def test_imagery_set_provider_clash_and_delete(client, monkeypatch):
     wait_done(client, client.post("/api/imagery/jobs", json={**WORLD, "maxzoom": 0}).json()["id"])
     clash = client.post("/api/imagery/jobs", json={**WORLD, "maxzoom": 0, "provider": "bluemarble"})
     assert clash.status_code == 409
-    assert "s2cloudless" in clash.json()["detail"] and "delete it first" in clash.json()["detail"]
+    assert "s2cloudless2024" in clash.json()["detail"] and "delete it first" in clash.json()["detail"]
     imagery = sys.modules["app.imagery"]
-    assert imagery.get_set("world_test")["provider"] == "s2cloudless"
+    assert imagery.get_set("world_test")["provider"] == "s2cloudless2024"
 
     assert client.delete("/api/imagery/world_test").status_code == 200
     assert not imagery.set_dir("world_test").exists()

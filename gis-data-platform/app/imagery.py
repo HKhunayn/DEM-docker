@@ -29,25 +29,42 @@ from typing import Any, Callable
 from .config import IMAGERY_ROOT
 
 MERCATOR_MAX_LAT = 85.05112878
-MAX_TILES_PER_JOB = 50_000
+MAX_TILES_PER_JOB = 50_000   # default; Settings page "Max imagery tiles per job"
+
+
+def max_tiles_per_job() -> int:
+    from . import settings
+    value, source = settings.resolve("maxImageryTiles")
+    return MAX_TILES_PER_JOB if source == "default" else int(value)
 USER_AGENT = "gis-data-platform/0.1 (local open GIS platform)"
 MAX_TILE_BYTES = 4 * 1024 * 1024
 HTTP_TIMEOUT_S = 30.0
 PROVIDER_MARKER = ".provider"  # written when a download starts, before imagery.json exists
 
+from . import s2mosaic  # noqa: E402  (raw Sentinel-2 scenes, mosaicked locally)
+
+# Kept: the providers that cover the whole world incl. the Middle East and
+# looked right there. Order = fetch-page order; the first is the default.
+#   s2-earthsearch  ~10 m, recent, open licence (built locally, slower)
+#   s2cloudless2024 ~10 m ready tiles, fast, NON-COMMERCIAL
+#   bluemarble      ~500 m, whole globe incl. oceans (world / low zoom)
+# Dropped: s2cloudless 2016 (washed out pale yellow over deserts), Planetary
+# Computer + Copernicus Data Space (same scenes as Earth Search; broken
+# granules / account + slow JP2). Sets fetched with them keep being served.
 PROVIDERS: dict[str, dict[str, Any]] = {
-    "s2cloudless": {
-        "label": "Sentinel-2 cloudless 2016 (EOX) — ~10 m, true colour",
-        "license": "CC BY 4.0 — attribution, commercial use OK",
+    **s2mosaic.SCENE_PROVIDERS,
+    "s2cloudless2024": {
+        "label": "Sentinel-2 cloudless 2024 (EOX) — ~10 m, ready tiles, fast (non-commercial)",
+        "license": "CC BY-NC-SA 4.0 — non-commercial",
         "attribution": "Sentinel-2 cloudless - https://s2maps.eu by EOX IT Services GmbH "
-                       "(Contains modified Copernicus Sentinel data 2016)",
+                       "(Contains modified Copernicus Sentinel data 2024)",
         "source": "tiles.maps.eox.at (WMTS, GoogleMapsCompatible)",
-        "url": "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless_3857/default/g/{z}/{y}/{x}.jpg",
+        "url": "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2024_3857/default/g/{z}/{y}/{x}.jpg",
         "maxzoom": 15,
         "format": "jpg",
     },
     "bluemarble": {
-        "label": "NASA Blue Marble (GIBS) — ~500 m, shaded relief + bathymetry",
+        "label": "NASA Blue Marble (GIBS) — ~500 m, whole globe incl. oceans, for world view",
         "license": "Public domain (NASA)",
         "attribution": "NASA Earth Observatory / GIBS Blue Marble",
         "source": "gibs.earthdata.nasa.gov (WMTS, GoogleMapsCompatible_Level8)",
@@ -57,6 +74,13 @@ PROVIDERS: dict[str, dict[str, Any]] = {
         "format": "jpg",
     },
 }
+
+def provider_status(provider: str) -> tuple[bool, str]:
+    """(available, reason) - scene providers may need credentials."""
+    if PROVIDERS.get(provider, {}).get("kind") == "scenes":
+        return s2mosaic.provider_status(provider)
+    return True, ""
+
 
 _META_LOCK = threading.Lock()
 
@@ -178,24 +202,37 @@ def download_set(
     minzoom: int,
     maxzoom: int,
     log: Callable[[str], None],
-    workers: int = 6,
+    workers: int | None = None,
     stop: threading.Event | None = None,
+    options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Download (resumable: existing tiles are kept) and write imagery.json.
 
     Setting `stop` cancels the pending downloads and raises RuntimeError.
+    `options` (scene providers only): dateFrom, dateTo, maxCloud.
     """
     info = PROVIDERS[provider]
     bbox = clamp_bbox(list(bbox))
     total = count_tiles(bbox, minzoom, maxzoom)
-    if total > MAX_TILES_PER_JOB:
-        raise ValueError(f"{total} tiles requested; the limit is {MAX_TILES_PER_JOB} per job "
+    if total > max_tiles_per_job():
+        raise ValueError(f"{total} tiles requested; the limit is {max_tiles_per_job()} per job "
                          "(reduce the area or the max zoom)")
     root = set_dir(name)
     root.mkdir(parents=True, exist_ok=True)
     (root / PROVIDER_MARKER).write_text(provider, encoding="utf-8")
     ext = info["format"]
     log(f"imagery '{name}': {provider} z{minzoom}-{maxzoom}, {total} tile(s), bbox {bbox}")
+    if info.get("kind") == "scenes":
+        opts = options or {}
+        built = s2mosaic.build_set(root, provider, bbox, minzoom, maxzoom, tile_range, log, stop=stop,
+                                   date_from=opts.get("dateFrom"), date_to=opts.get("dateTo"),
+                                   max_cloud=opts.get("maxCloud"))
+        tiles, size = _count_set(root)
+        meta = _set_meta(name, provider, info, bbox, minzoom, maxzoom, ext, tiles, size, 0)
+        meta.update(attribution=built.pop("attribution"), mosaic=built)
+        _write_meta(root, meta)
+        log(f"WROTE {tiles} imagery tiles ({size / 1e6:.2f} MB) from {built['scenes']} scene(s) -> {root}")
+        return {"tiles": tiles, "downloaded": tiles, "skipped": 0, "failed": 0, "bytes": size}
 
     pending = []
     skipped = 0
@@ -216,6 +253,9 @@ def download_set(
             return 0
         return _fetch_one(url, target)
 
+    if workers is None:
+        from . import settings
+        workers = int(settings.get("imageryWorkers"))
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         futures = {pool.submit(fetch, url, target): url for url, target in pending}
         step = max(1, len(futures) // 20)
@@ -235,9 +275,32 @@ def download_set(
             if (done + failed) % step == 0 or done + failed == len(futures):
                 log(f"  downloaded {done + failed}/{len(futures)} ({downloaded / 1e6:.2f} MB)")
 
-    tiles = sum(1 for _ in root.rglob(f"*.{ext}"))
-    size = sum(p.stat().st_size for p in root.rglob(f"*.{ext}"))
-    meta = {
+    tiles, size = _count_set(root)
+    meta = _set_meta(name, provider, info, bbox, minzoom, maxzoom, ext, tiles, size, failed)
+    _write_meta(root, meta)
+    log(f"WROTE {tiles} imagery tiles ({size / 1e6:.2f} MB) -> {root}")
+    if failed:
+        raise RuntimeError(f"{failed} tile(s) failed to download: {errors[0]}")
+    return {"tiles": tiles, "downloaded": done, "skipped": skipped, "failed": failed, "bytes": size}
+
+
+TILE_EXTS = ("jpg", "png", "webp")   # same order as nginx try_files
+
+
+def _count_set(root: Path) -> tuple[int, int]:
+    files = [p for ext in TILE_EXTS for p in root.rglob(f"*.{ext}")]
+    return len(files), sum(p.stat().st_size for p in files)
+
+
+def _write_meta(root: Path, meta: dict[str, Any]) -> None:
+    with _META_LOCK:
+        temp = root / f"imagery.json.{uuid.uuid4().hex}.tmp"
+        temp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        os.replace(temp, root / "imagery.json")
+
+
+def _set_meta(name, provider, info, bbox, minzoom, maxzoom, ext, tiles, size, failed) -> dict[str, Any]:
+    return {
         "name": name,
         "kind": "imagery",
         "provider": provider,
@@ -256,14 +319,6 @@ def download_set(
         "failed": failed,
         "updated": _now(),
     }
-    with _META_LOCK:
-        temp = root / f"imagery.json.{uuid.uuid4().hex}.tmp"
-        temp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        os.replace(temp, root / "imagery.json")
-    log(f"WROTE {tiles} imagery tiles ({size / 1e6:.2f} MB) -> {root}")
-    if failed:
-        raise RuntimeError(f"{failed} tile(s) failed to download: {errors[0]}")
-    return {"tiles": tiles, "downloaded": done, "skipped": skipped, "failed": failed, "bytes": size}
 
 
 # ---- catalog of local sets -------------------------------------------------------
@@ -360,23 +415,21 @@ def tile(name: str, z: int, x: int, y: int) -> tuple[bytes, str] | None:
         return None
     if z < 0 or z > 24 or not (0 <= x < 2 ** z and 0 <= y < 2 ** z):
         return transparent_png(), "image/png"
-    ext = meta.get("format", "jpg")
-    mime = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
     root = set_dir(name)
     try:
         maxzoom = int(meta["maxzoom"])
     except (KeyError, TypeError, ValueError):
         return transparent_png(), "image/png"
     if z <= maxzoom:
-        path = root / str(z) / str(x) / f"{y}.{ext}"
+        path = _tile_file(root, z, x, y)
         try:
-            return path.read_bytes(), mime
-        except OSError:
+            return path.read_bytes(), _MIME[path.suffix[1:]]
+        except (OSError, AttributeError):
             return transparent_png(), "image/png"
     shift = z - maxzoom
     ax, ay = x >> shift, y >> shift
-    parent = root / str(maxzoom) / str(ax) / f"{ay}.{ext}"
-    if not parent.is_file():
+    parent = _tile_file(root, maxzoom, ax, ay)
+    if parent is None:
         return transparent_png(), "image/png"
     from PIL import Image
     scale = 2 ** shift
@@ -384,12 +437,27 @@ def tile(name: str, z: int, x: int, y: int) -> tuple[bytes, str] | None:
     ox, oy = (x - (ax << shift)) * size, (y - (ay << shift)) * size
     try:
         with Image.open(parent) as image:
-            image = image.convert("RGB")
+            alpha = image.mode in ("RGBA", "LA", "PA") or "transparency" in image.info
+            image = image.convert("RGBA" if alpha else "RGB")
             # float box: works even when the ancestor footprint is < 1 px
             crop = image.resize((256, 256), Image.BILINEAR, box=(ox, oy, ox + size, oy + size))
         buffer = io.BytesIO()
+        if alpha:   # partially covered ancestor: keep the transparency
+            crop.save(buffer, format="WEBP", quality=85)
+            return buffer.getvalue(), "image/webp"
         crop.save(buffer, format="JPEG", quality=88)
     except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
         # corrupt/truncated ancestor tile: degrade to transparent, not a 500
         return transparent_png(), "image/png"
     return buffer.getvalue(), "image/jpeg"
+
+
+_MIME = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
+
+
+def _tile_file(root: Path, z: int, x: int, y: int) -> Path | None:
+    for ext in TILE_EXTS:
+        path = root / str(z) / str(x) / f"{y}.{ext}"
+        if path.is_file():
+            return path
+    return None

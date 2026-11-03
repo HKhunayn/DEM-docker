@@ -85,7 +85,6 @@ let arcgisElevationLayer = null;
 let arcgisElevationUrl = null;
 let cesiumImageryLayer = null;
 let cesiumReliefLayer = null;
-let cesiumReliefColour = null;
 let appliedTerrainKey = null;
 let loading = false;
 let selectionToken = 0;
@@ -329,8 +328,11 @@ function applyMapLibreImagery() {
     bounds: Array.isArray(set.bounds) ? set.bounds : undefined,
     attribution: set.attribution || "",
   });
-  // Below the hillshade so relief still reads over the imagery.
-  maplibre.addLayer({id: "satellite", type: "raster", source: "satellite"}, "relief");
+  // Above the colour relief AND the hillshade: where the set has tiles the
+  // imagery is shown as-is (it already carries real light/shadow); the DEM
+  // relief only shows around it. Below the outside mask (hidden with imagery).
+  maplibre.addLayer({id: "satellite", type: "raster", source: "satellite"},
+                    maplibre.getLayer(OUTSIDE_LAYER.id) ? OUTSIDE_LAYER.id : undefined);
 }
 
 function applyArcGISImagery() {
@@ -351,16 +353,14 @@ function applyCesiumImagery() {
   const url = imageryTemplate(set, platform);
   if (url) {
     const bounds = Array.isArray(set.bounds) && set.bounds.length === 4 ? set.bounds : null;
-    // Index 0: under the client-side relief drape.
+    // On top of the relief drape (like MapLibre): inside the set the imagery
+    // is shown as-is, the colour relief only shows around it.
     cesiumImageryLayer = cesiumViewer.imageryLayers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({
       url, maximumLevel: set.maxzoom ?? 18,
       rectangle: bounds ? Cesium.Rectangle.fromDegrees(...bounds) : undefined,
       credit: set.attribution || undefined,
-    }), 0);
+    }));
   }
-  // With imagery the relief drape switches to shade-only (like MapLibre,
-  // where the imagery covers the colour ramp but not the hillshade).
-  if (cesiumReliefColour !== !url) setCesiumRelief();
   cesiumViewer.scene.requestRender();
 }
 
@@ -436,8 +436,9 @@ function resetMapLibreRelief(terrain) {
   for (const id of [HILLSHADE_LAYER.id, COLOR_RELIEF_LAYER.id]) if (maplibre.getLayer(id)) maplibre.removeLayer(id);
   if (maplibre.getSource("relief")) maplibre.removeSource("relief");
   maplibre.addSource("relief", reliefSource(terrain, terrainMaxzoom()));
-  maplibre.addLayer(COLOR_RELIEF_LAYER, maplibre.getLayer("satellite") ? "satellite" : undefined);
-  maplibre.addLayer(HILLSHADE_LAYER, OUTSIDE_LAYER.id);
+  const above = maplibre.getLayer("satellite") ? "satellite" : OUTSIDE_LAYER.id;
+  maplibre.addLayer(COLOR_RELIEF_LAYER, above);
+  maplibre.addLayer(HILLSHADE_LAYER, above);
   maplibre.getSource("outside")?.setData(outsideMask());
 }
 
@@ -502,15 +503,13 @@ async function createArcGIS() {
 }
 
 // Hypsometric colour + multidirectional hillshade computed in the browser
-// from the Terrarium elevation tiles (same ramp/lights as MapLibre). Colour is
-// dropped (shade only) while an imagery set is shown underneath.
+// from the Terrarium elevation tiles (same ramp/lights as MapLibre). An
+// imagery set is drawn above it, so it never tints the imagery.
 function setCesiumRelief() {
   if (!cesiumViewer) return;
   if (cesiumReliefLayer) { cesiumViewer.imageryLayers.remove(cesiumReliefLayer, true); cesiumReliefLayer = null; }
-  const colour = !imageryTemplate(selectedImagery, platform);
-  cesiumReliefColour = colour;
   try {
-    // Added on top, so an imagery set (inserted at index 0) stays underneath.
+    // Index 0: under the imagery set.
     cesiumReliefLayer = cesiumViewer.imageryLayers.addImageryProvider(new ReliefImageryProvider({
       template: terrainTemplates()[0],
       // Only shade where the platform has DEM coverage (outside it the
@@ -519,8 +518,8 @@ function setCesiumRelief() {
       // Cesium over-zooms the maxzoom relief beyond it.
       maxzoom: terrainMaxzoom(),
       tileSize: state?.terrain?.tileSize || 256,
-      colour,
-    }));
+      colour: true,
+    }), 0);
   } catch (error) {
     setMapMessage(`Cesium relief error: ${formatError(error)}`, "cesium");
   }
@@ -623,7 +622,7 @@ async function startViewers() {
       await createCesium();
       setViewerFailure("cesium", "");
     } catch (error) {
-      destroyQuietly(cesiumViewer); cesiumViewer = null; cesiumImageryLayer = null; cesiumReliefLayer = null; cesiumReliefColour = null;
+      destroyQuietly(cesiumViewer); cesiumViewer = null; cesiumImageryLayer = null; cesiumReliefLayer = null;
       setViewerFailure("cesium", `CesiumJS failed to start: ${formatError(error)}`);
       failures.push("CesiumJS");
     }

@@ -26,7 +26,6 @@ only read the cache (``measuring`` while a count runs).
 from __future__ import annotations
 
 import logging
-import os
 import re
 import threading
 import time
@@ -536,10 +535,8 @@ def _watch(interval: float) -> None:
 def start_watch(interval: float | None = None) -> bool:
     global _WATCH
     if interval is None:
-        try:
-            interval = float(os.environ.get("GIS_CONVERSION_WATCH_S", "15"))
-        except ValueError:
-            interval = 15.0
+        from . import settings
+        interval = float(settings.get("conversionWatchS"))
     if interval <= 0:
         return False
     if _WATCH is not None and _WATCH.is_alive():

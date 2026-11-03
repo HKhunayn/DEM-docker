@@ -6,7 +6,8 @@ fallback (nginx serves the stored tiles; FastAPI over-zooms / crops).
 """
 from __future__ import annotations
 
-from typing import Any, Literal
+from datetime import date
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
@@ -21,10 +22,21 @@ serve_router = APIRouter()  # engine
 class ImageryJobInput(BaseModel):
     name: str = Field(default="world_imagery", min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
     bbox: tuple[float, float, float, float] = (-180.0, -85.05112878, 180.0, 85.05112878)
-    provider: Literal["s2cloudless", "bluemarble"] = "s2cloudless"
+    provider: str = "s2-earthsearch"
     minzoom: int = Field(default=0, ge=0, le=18)
     maxzoom: int = Field(default=1, ge=0, le=18)
     saveArea: bool = True
+    # Raw-scene providers (s2-*): acquisition window + scene cloud limit.
+    dateFrom: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    dateTo: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    maxCloud: float | None = Field(default=None, ge=0, le=100)
+
+    @field_validator("provider")
+    @classmethod
+    def _check_provider(cls, value):
+        if value not in imagery.PROVIDERS:
+            raise ValueError(f"unknown provider; one of: {', '.join(imagery.PROVIDERS)}")
+        return value
 
     @field_validator("bbox")
     @classmethod
@@ -41,7 +53,21 @@ class ImageryJobInput(BaseModel):
         limit = imagery.PROVIDERS[self.provider]["maxzoom"]
         if self.maxzoom > limit:
             raise ValueError(f"{self.provider} provides tiles up to z{limit}")
+        dates = []
+        for value in (self.dateFrom, self.dateTo):
+            if value is not None:
+                try:
+                    dates.append(date.fromisoformat(value))
+                except ValueError:
+                    raise ValueError(f"invalid date {value!r}") from None
+        if len(dates) == 2 and dates[0] > dates[1]:
+            raise ValueError("dateFrom must be <= dateTo")
         return self
+
+    def options(self) -> dict[str, Any] | None:
+        if imagery.PROVIDERS[self.provider].get("kind") != "scenes":
+            return None
+        return {"dateFrom": self.dateFrom, "dateTo": self.dateTo, "maxCloud": self.maxCloud}
 
 
 def _base(request: Request) -> str:
@@ -75,10 +101,16 @@ def _tilejson(meta: dict[str, Any], base: str) -> dict[str, Any]:
 
 @router.get("/api/imagery/providers")
 def imagery_providers() -> dict[str, Any]:
-    return {"providers": [
-        {"id": pid, **{k: v for k, v in info.items() if k != "url"}, "available": True, "reason": ""}
-        for pid, info in imagery.PROVIDERS.items()
-    ]}
+    out = []
+    for pid, info in imagery.PROVIDERS.items():
+        available, reason = imagery.provider_status(pid)
+        public = {k: v for k, v in info.items() if k in _PUBLIC_KEYS}
+        public.setdefault("kind", "tiles")
+        out.append({"id": pid, **public, "available": available, "reason": reason})
+    return {"providers": out}
+
+
+_PUBLIC_KEYS = ("label", "license", "attribution", "source", "maxzoom", "format", "kind")
 
 
 @router.post("/api/imagery/jobs", status_code=202)
@@ -87,6 +119,7 @@ def start_imagery_job(body: ImageryJobInput) -> dict[str, Any]:
         return jobs.start_imagery_job(
             name=body.name, bbox=list(body.bbox), provider=body.provider,
             minzoom=body.minzoom, maxzoom=body.maxzoom, save_area=body.saveArea,
+            options=body.options(),
         )
     except (jobs.JobRunningError, catalog.NameConflictError) as exc:
         raise HTTPException(status_code=409, detail=str(exc))

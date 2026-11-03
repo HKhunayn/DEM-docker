@@ -129,7 +129,7 @@
       </div>
     </div>
     <div id="panel">
-      <div class="topnav"><a href="/">← Home</a> · <b>Download data</b> · <a href="/library/">Data library (conversion status)</a></div>
+      <div class="topnav"><a href="/">← Home</a> · <b>Download data</b> · <a href="/library/">Data library (conversion status)</a> · <a href="/settings/">Settings</a></div>
       <div id="enginestatus" role="status" aria-live="polite">engine: checking…</div>
       <div class="modes" role="tablist" aria-label="data type">
         <button id="mode-elevation" class="on" type="button" data-mode="elevation">Elevation (DEM)</button>
@@ -179,6 +179,12 @@
       <div id="providers"><div class="loading">loading providers…</div></div>
       <div class="note" id="providernote">FABDEM is <b>non-commercial</b> (CC BY-NC-SA). Use Copernicus for
         commercial products.</div>
+      <div id="sceneopts" class="grid" style="display:none; margin-top:8px">
+        <div><small>scenes from (date)</small><input id="datefrom" type="date"></div>
+        <div><small>scenes to (date)</small><input id="dateto" type="date"></div>
+        <div><small>max scene cloud %</small><input id="maxcloud" type="number" value="20" min="0" max="100" step="1"></div>
+        <div><small style="color:#6b7280">raw Sentinel-2 scenes are mosaicked locally: per-pixel median of the 5 clearest, cloud-masked</small></div>
+      </div>
 
       <h2>3 · Detail</h2>
       <div class="grid">
@@ -278,7 +284,8 @@
       imagery: {
         title: "Fetch imagery",
         sub: "Shift+drag on the map, use “Draw box”, or “whole world” to select the area. The data-platform downloads open XYZ imagery tiles into a local tile set; the engine serves it to all three viewers.",
-        note: "Sentinel-2 cloudless 2016 is CC BY 4.0; NASA Blue Marble is public domain. Tiles are stored as delivered (JPEG), no re-encoding.",
+        note: "<b>Recommended:</b> Sentinel-2 L2A via Earth Search — ~10 m, recent, open (commercial OK with attribution), worldwide land; built locally (~1 min per block of 64 max-zoom tiles, 3 blocks at a time). Sentinel-2 cloudless 2024 is fast ready tiles but <b>non-commercial</b> (CC BY-NC-SA 4.0). NASA Blue Marble (public domain) covers oceans too, for world/low-zoom views.",
+
         namehint: "imagery set name (served by the engine at /tiles/imagery-sets/<name>; picked up by the viewers)",
         go: "Fetch imagery", zooms: [0, 1], maxzoomMin: 0, maxzoomMax: 15,
       },
@@ -418,8 +425,10 @@
         return;
       }
       const firstAvailable = (providers.find((p) => p.available) || {}).id;
+      const isScenes = (id) => (providers.find((p) => p.id === id) || {}).kind === "scenes";
       const sel = (selected && providers.some((p) => p.id === selected)) ? selected
-        : (firstAvailable || (mode === "imagery" ? "s2cloudless" : "copernicus"));
+        : (firstAvailable || (mode === "imagery" ? "s2-earthsearch" : "copernicus"));
+      $("sceneopts").style.display = mode === "imagery" && isScenes(sel) ? "" : "none";
       box.replaceChildren(...providers.map((p) => {
         const input = h("input", { type: "radio", name: "provider", value: p.id });
         input.checked = p.id === sel;
@@ -434,7 +443,7 @@
     }
     function selectedProvider() {
       const el = document.querySelector("input[name=provider]:checked");
-      return el ? el.value : (mode === "imagery" ? "s2cloudless" : "copernicus");
+      return el ? el.value : (mode === "imagery" ? "s2-earthsearch" : "copernicus");
     }
     async function loadProviders(kind) {
       const path = kind === "imagery" ? "api/imagery/providers" : "api/fetch/providers";
@@ -522,6 +531,10 @@
         line(`imagery tiles to download: ${tiles} (z${zmin}–${zmax})`);
         line(`download size: ~${Math.max(0.1, tiles * 0.02).toFixed(1)} MB (≈20 KB/tile JPEG)`);
         if (tiles > 50000) line("over the 50,000 tiles/job limit", "over");
+        if (prov && prov.kind === "scenes") {
+          const maxTiles = tileCount(b, zmax, zmax);
+          line(`built locally from raw scenes: ~${Math.max(1, Math.ceil(maxTiles / 64))} block(s), roughly ${fmtSecs(Math.ceil(Math.max(1, maxTiles / 64) / 3) * 60000)} (~1 min per block, 3 at a time)`);
+        }
         if (prov && prov.maxzoom != null && zmax > prov.maxzoom) line(`max zoom exceeds provider limit z${prov.maxzoom}`, "over");
       } else {
         line(`source tiles to download: ${deg} (1°×1°)`);
@@ -1114,6 +1127,11 @@
         name: sanitizeName($("name").value),
         saveArea: true,
       };
+      if (mode === "imagery" && (providers.find((p) => p.id === body.provider) || {}).kind === "scenes") {
+        if ($("datefrom").value) body.dateFrom = $("datefrom").value;
+        if ($("dateto").value) body.dateTo = $("dateto").value;
+        if ($("maxcloud").value !== "") body.maxCloud = +$("maxcloud").value;
+      }
       lastName = body.name;
       $("name").value = body.name;
       setBanner("info", `starting “${body.name}”…`);

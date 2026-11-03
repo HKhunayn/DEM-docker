@@ -152,6 +152,29 @@ The engine CLI (`terrainhub.py fetch|build|verify|serve`) resolves the same
 Each job auto-saves its area and back-fills the dataset metadata when it
 finishes; the fetch page's "Saved areas" selector reloads any saved bbox.
 
+## Settings page
+
+`http://127.0.0.1:5100/settings/` (menu: **Settings**) edits the engine's and
+the data-platform's parameters without touching `.env`:
+
+| Group | Settings | Applies |
+| --- | --- | --- |
+| Engine — tile builds | build RAM limit (soft, inside the container limit), max workers, RAM per worker, memory high-water mark, GDAL cache, worker recycling, failure abort fraction, progress interval, silent-job timeout | next build (timeout: live) |
+| Engine — automatic conversion | on/off, check interval, minimum free disk, library refresh | live (refresh: restart) |
+| Data-platform — downloads | imagery parallel downloads, Sentinel-2 parallel blocks / default cloud / default days / scenes per pixel, max imagery tiles per job | next download |
+
+Values are saved in `data/settings/settings.json` on the shared volume and
+read by both containers. Precedence: saved › environment (`.env` /
+docker-compose; for engine settings the engine container's) › default. The
+page also shows live RAM / CPU / disk of both containers and how many build
+workers a build started now would use. Hard Docker limits
+(`GIS_ENGINE_MEM_LIMIT`, `GIS_DATA_MEM_LIMIT`, `cpus`) can't be changed from
+inside a container: set them in `.env` and recreate the container (the page
+explains how).
+
+API: `GET /api/settings`, `PUT /api/settings {"values": {key: value|null}, "reset": [key]}`,
+`GET /api/settings/runtime` (engine part via the internal `GET /api/runtime`, 403 on the public port).
+
 ## Imagery fetch
 
 The fetch page has an **Imagery** tab: pick an area (or **whole world**), a
@@ -161,11 +184,30 @@ downloaded as delivered by the provider (JPEG, Web Mercator XYZ) into
 
 | Provider | Max zoom | Licence |
 | --- | --- | --- |
-| `s2cloudless` — EOX Sentinel-2 cloudless 2016 | 15 | CC BY 4.0 |
-| `bluemarble` — NASA GIBS Blue Marble | 8 | public domain |
+| `s2-earthsearch` (default, recommended) — raw Sentinel-2 L2A, AWS Earth Search (Element 84), built locally | 15 | Copernicus open data (commercial OK, attribution) |
+| `s2cloudless2024` — EOX Sentinel-2 cloudless 2024 (colour-balanced) | 15 | CC BY-NC-SA 4.0 (non-commercial) |
+| `bluemarble` — NASA GIBS Blue Marble (whole globe incl. oceans) | 8 | public domain |
 
-- `GET  /api/imagery/providers` — imagery providers.
-- `POST /api/imagery/jobs` — `{name, bbox[4], provider, minzoom, maxzoom, saveArea}` (202; 409 while any job runs; 400 above 50,000 tiles). Poll with `GET /api/jobs/{id}`.
+Dropped after testing: EOX cloudless 2016 (washed out over deserts), Microsoft
+Planetary Computer and Copernicus Data Space (same ESA scenes as Earth Search;
+broken granules / account + slow JPEG2000 reads). Sets already fetched with a
+dropped provider are still served; re-fetching them needs a kept provider.
+
+The raw-scene provider (`s2-earthsearch`, worldwide on land ~56°S–84°N; open ocean is not
+imaged) builds the set locally instead of copying tiles (`app/s2mosaic.py`):
+per block of 8×8 max-zoom tiles the STAC catalogue is searched (paged) for
+scenes in `dateFrom..dateTo` (default: last 365 days) under `maxCloud` %
+(default 20), red/green/blue + SCL are warped into the Web-Mercator grid
+(COG/JP2 overviews below z14), and each pixel is the median of up to 5 clear
+samples (SCL cloud/shadow/cirrus/saturated masked; scenes are read
+coverage-first so every orbit/granule over the block contributes; broken
+granules are skipped). One colour stretch per set (white = 98th percentile
+of clear vegetation/bare-soil reflectance, 0.18–0.60, soft shoulder). Full tiles are JPEG, edge
+tiles WebP with alpha. Resumable per block (`.blocks-done`). Measured here:
+~25–60 s per block per worker, 3 workers, ≤1.1 GB RSS.
+
+- `GET  /api/imagery/providers` — imagery providers (`kind`: `tiles` or `scenes`, `available`/`reason`).
+- `POST /api/imagery/jobs` — `{name, bbox[4], provider, minzoom, maxzoom, saveArea, dateFrom?, dateTo?, maxCloud?}` (202; 409 while any job runs; 400 above 50,000 tiles). Poll with `GET /api/jobs/{id}`.
 - `GET  /api/imagery` — local imagery sets as TileJSON; `DELETE /api/imagery/{name}`.
 - `GET  /tiles/imagery-sets/{name}.json` — TileJSON; `GET /tiles/imagery-sets/{name}/{z}/{x}/{y}` — tile. Above the set's maxzoom the platform over-zooms server-side (needed by ArcGIS `WebTileLayer`); outside the set: transparent PNG.
 

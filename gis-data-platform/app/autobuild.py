@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import shutil
 import threading
@@ -39,7 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import catalog, jobs
+from . import catalog, jobs, settings
 from .config import ENGINE_ROOT, TILE_ROOT
 
 log = logging.getLogger(__name__)
@@ -58,22 +57,21 @@ _FAILED: set[str] = set()       # area names whose last automatic build failed
 PENDING_STATES = ("downloaded", "interrupted", "queued")
 
 
+# Settings page (data/settings/settings.json) > env (.env) > default; read on
+# every use, so a change applies without restarting the engine.
 def enabled() -> bool:
-    return os.environ.get("GIS_AUTOBUILD", "1") not in ("0", "false", "no", "off")
+    return bool(settings.get("autobuild"))
 
 
 def interval_s() -> float:
-    try:
-        return float(os.environ.get("GIS_AUTOBUILD_INTERVAL_S", "60"))
-    except ValueError:
-        return 60.0
+    return float(settings.get("autobuildIntervalS"))
 
 
 def min_free_gb() -> float:
-    try:
-        return float(os.environ.get("GIS_AUTOBUILD_MIN_FREE_GB", "10"))
-    except ValueError:
-        return 10.0
+    return float(settings.get("autobuildMinFreeGB"))
+
+
+DISABLED_POLL_S = 15.0   # periodic thread: how often it re-reads the settings while off
 
 
 def _now() -> str:
@@ -429,14 +427,21 @@ def start(delay: float = 0.0, skip_failed: bool = False) -> bool:
     return True
 
 
-def _periodic(interval: float) -> None:
+def _periodic(interval: float | None) -> None:
     """Every `interval` s while idle (or soon after wake()): start a pass when
-    something needs building - areas downloaded while the engine runs."""
+    something needs building - areas downloaded while the engine runs.
+    interval None = follow the settings live (on/off and the interval)."""
     while not _STOP.is_set():
-        woke = _WAKE.wait(interval)
+        every = interval if interval is not None else interval_s()
+        if interval is None and (not enabled() or every <= 0):
+            _STOP.wait(DISABLED_POLL_S)
+            continue
+        woke = _WAKE.wait(every)
         if _STOP.is_set():
             return
         _WAKE.clear()
+        if interval is None and not enabled():
+            continue
         try:
             # a queued hand-off waits for the running build / pass to end
             while woke and not _STOP.is_set() and (_pass_running() or _jobs_busy()):
@@ -451,10 +456,10 @@ def _periodic(interval: float) -> None:
 
 
 def start_periodic(interval: float | None = None) -> bool:
-    """Start the periodic check thread (once); False when disabled/running."""
+    """Start the periodic check thread (once); False when running or a fixed
+    interval <= 0. interval None = live from the settings (always starts)."""
     global _PERIODIC
-    interval = interval_s() if interval is None else interval
-    if interval <= 0:
+    if interval is not None and interval <= 0:
         return False
     with _LOCK:
         if _PERIODIC is not None and _PERIODIC.is_alive():

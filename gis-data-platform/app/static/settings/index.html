@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>GIS data platform — engine settings</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; font: 13px/1.5 system-ui, sans-serif; color: #1a1a1a; background: #f3f5f8; }
+    nav { display: flex; gap: 4px; align-items: center; padding: 10px 24px; background: #fff;
+          border-bottom: 1px solid #d5d9de; position: sticky; top: 0; z-index: 10; }
+    nav b { margin-right: 14px; font-size: 14px; }
+    nav a { padding: 5px 10px; border-radius: 6px; color: #374151; text-decoration: none; font-size: 14px; }
+    nav a:hover { background: #eff6ff; color: #1d4ed8; }
+    nav a.on { background: #eff6ff; color: #1d4ed8; font-weight: 600; }
+    main { max-width: 1080px; margin: 0 auto; padding: 20px 24px 120px; }
+    h1 { font-size: 20px; margin: 0 0 2px; }
+    .sub { color: #6b7280; margin: 0 0 14px; }
+    h2 { font-size: 15px; margin: 0 0 2px; }
+    .gdesc { color: #6b7280; font-size: 12px; margin: 0 0 10px; }
+    .card { background: #fff; border: 1px solid #d5d9de; border-radius: 12px; padding: 14px 16px; margin-bottom: 14px; }
+    #banner { margin: 0 0 12px; padding: 10px 12px; border-radius: 8px; display: none; white-space: pre-line; }
+    #banner.ok { display: block; background: #dcfce7; color: #166534; }
+    #banner.err { display: block; background: #fee2e2; color: #991b1b; }
+    #banner.warn { display: block; background: #fef3c7; color: #92400e; }
+    #banner.info { display: block; background: #eff6ff; color: #1e3a8a; }
+    .spinner { width: 14px; height: 14px; border-radius: 50%; border: 2px solid #c7d2fe; border-top-color: #2563eb;
+               animation: spin .9s linear infinite; flex: none; display: inline-block; vertical-align: -2px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #overlay { position: fixed; inset: 0; background: rgba(243,245,248,.75); display: none; align-items: center;
+               justify-content: center; z-index: 40; font-size: 14px; gap: 10px; }
+    #overlay.on { display: flex; }
+    /* runtime */
+    .rt { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .rt .box { border: 1px solid #e5e7eb; border-radius: 10px; padding: 10px 12px; }
+    .rt h3 { margin: 0 0 6px; font-size: 13px; display: flex; justify-content: space-between; gap: 8px; }
+    .bar { position: relative; height: 16px; border-radius: 8px; background: #e5e7eb; overflow: hidden; margin: 3px 0 6px; }
+    .bar > i { position: absolute; inset: 0 auto 0 0; background: #22c55e; transition: width .6s; }
+    .bar.warm > i { background: #f59e0b; } .bar.hot > i { background: #ef4444; }
+    .bar > b { position: absolute; top: 0; bottom: 0; width: 2px; background: #1f2937; opacity: .55; }
+    .bar > span { position: absolute; inset: 0; text-align: center; font-size: 11px; font-weight: 700; line-height: 16px; }
+    .kv { font-size: 12px; color: #374151; margin: 2px 0; }
+    .kv b { font-weight: 600; }
+    .dim { color: #6b7280; }
+    .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 700; }
+    .pill.up { background: #dcfce7; color: #166534; } .pill.down { background: #fef3c7; color: #92400e; }
+    .pill.busy { background: #dbeafe; color: #1d4ed8; }
+    .estimate { margin-top: 8px; padding: 8px 10px; border-radius: 8px; background: #eff6ff; color: #1e3a8a; font-size: 12px; }
+    code { background: #f3f4f6; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+    /* settings rows */
+    .set { display: grid; grid-template-columns: minmax(220px, 1.1fr) 230px minmax(200px, 1.4fr); gap: 6px 14px;
+           align-items: start; padding: 10px 0; border-top: 1px solid #eef0f3; }
+    .set:first-of-type { border-top: 0; }
+    .set.changed { background: #fffbeb; margin: 0 -16px; padding: 10px 16px; }
+    .set.bad { background: #fef2f2; margin: 0 -16px; padding: 10px 16px; }
+    .lbl { font-weight: 600; }
+    .meta { font-size: 11px; color: #6b7280; margin-top: 2px; }
+    .tag { display: inline-block; padding: 0 7px; border-radius: 9px; font-size: 10.5px; font-weight: 700; margin-right: 4px; }
+    .t-saved { background: #ede9fe; color: #5b21b6; } .t-env { background: #e0f2fe; color: #075985; }
+    .t-default { background: #f3f4f6; color: #4b5563; }
+    .t-live { background: #dcfce7; color: #166534; } .t-next-job { background: #dbeafe; color: #1d4ed8; }
+    .t-restart { background: #ffedd5; color: #9a3412; }
+    .ctl { display: flex; gap: 6px; align-items: center; }
+    .ctl input[type=number] { width: 120px; padding: 6px 8px; border: 1px solid #d5d9de; border-radius: 6px; font: inherit; }
+    .ctl input[type=number]:focus { outline: 2px solid #93c5fd; border-color: #60a5fa; }
+    .ctl .unit { color: #6b7280; font-size: 12px; }
+    .switch { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+    .help { font-size: 12px; color: #4b5563; }
+    .err { color: #b91c1c; font-size: 12px; margin-top: 2px; }
+    .reset { padding: 2px 7px; font-size: 11px; color: #6b7280; background: #fff; border: 1px solid #d5d9de; border-radius: 6px;
+             cursor: pointer; }
+    .reset:hover { color: #1d4ed8; border-color: #93c5fd; }
+    /* sticky save bar */
+    #savebar { position: fixed; left: 0; right: 0; bottom: 0; background: #fff; border-top: 1px solid #d5d9de;
+               padding: 10px 24px; display: flex; gap: 10px; align-items: center; justify-content: center; z-index: 20;
+               box-shadow: 0 -4px 14px rgba(0,0,0,.06); }
+    #savestate { color: #6b7280; min-width: 240px; }
+    #savestate.dirty { color: #92400e; font-weight: 600; }
+    .primary { padding: 8px 16px; font: inherit; font-weight: 700; color: #fff; background: #2563eb; border: 0;
+               border-radius: 8px; cursor: pointer; }
+    .primary:hover { background: #1d4ed8; }
+    .primary:disabled { background: #9ca3af; cursor: default; }
+    .secondary { padding: 7px 12px; font: inherit; font-weight: 600; color: #374151; background: #fff;
+                 border: 1px solid #d5d9de; border-radius: 8px; cursor: pointer; }
+    .secondary:disabled { opacity: .55; cursor: default; }
+    ol.how { margin: 6px 0 0 18px; padding: 0; font-size: 12px; }
+    ol.how li { margin: 2px 0; }
+    @media (max-width: 860px) { .rt { grid-template-columns: 1fr; } .set { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <nav>
+    <b>GIS data platform</b>
+    <a href="/">Home</a>
+    <a href="/fetch/">Download data</a>
+    <a href="/library/">Data library</a>
+    <a href="/settings/" class="on">Settings</a>
+  </nav>
+  <div id="overlay" role="status" aria-live="polite"><span class="spinner"></span><span id="overlaytext">loading settings…</span></div>
+  <main>
+    <h1>Engine settings</h1>
+    <p class="sub">Resources and behaviour of the engine (tile builds, automatic conversion) and of the data-platform's
+      downloads. Saved on the shared data volume and read by both apps — no restart needed unless a setting says so.</p>
+    <div id="banner" role="status" aria-live="polite"></div>
+
+    <section class="card">
+      <h2>Live resources</h2>
+      <p class="gdesc" id="rtupdated">reading container limits…</p>
+      <div class="rt">
+        <div class="box" id="rt-engine"><span class="spinner"></span> engine…</div>
+        <div class="box" id="rt-platform"><span class="spinner"></span> data-platform…</div>
+      </div>
+      <details style="margin-top:10px">
+        <summary><b>Change a container's hard RAM / CPU limit</b> <span class="dim">(Docker limit, needs a restart)</span></summary>
+        <p class="help" style="margin:6px 0 0">A container cannot change its own Docker limit, so these are set on the
+          host. The <b>Build RAM limit</b> below works inside that limit without a restart — use it for day-to-day tuning.</p>
+        <ol class="how">
+          <li>Edit <code>.env</code> next to <code>docker-compose.yml</code>: <code>GIS_ENGINE_MEM_LIMIT=24g</code> (engine) or
+            <code>GIS_DATA_MEM_LIMIT=3g</code> (data-platform). For a CPU cap, uncomment <code>cpus:</code> under the engine in
+            <code>docker-compose.yml</code>.</li>
+          <li>Apply: <code>Run.bat up engine</code> (or <code>docker compose up -d engine</code>). Wait for a running build to
+            finish first — recreating the engine stops it (it resumes on the next build).</li>
+          <li>The Docker VM's total RAM (shown above) is the ceiling of every limit; raise it in
+            <code>%UserProfile%\.wslconfig</code> (<code>[wsl2] memory=32GB</code>) and run <code>wsl --shutdown</code>.</li>
+        </ol>
+      </details>
+    </section>
+
+    <div id="groups"></div>
+    <p class="dim" style="font-size:12px">Saved in <code id="path">…</code>. Precedence: saved here › <code>.env</code> /
+      docker-compose environment › built-in default. “Reset” returns a setting to the <code>.env</code> / default value.</p>
+  </main>
+  <div id="savebar">
+    <span id="savestate">no changes</span>
+    <button id="discard" class="secondary" type="button" disabled>Discard changes</button>
+    <button id="resetall" class="secondary" type="button">Reset all to defaults</button>
+    <button id="save" class="primary" type="button" disabled>Save</button>
+  </div>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const GB = 1024 ** 3;
+    const APPLIES = { "live": "applies now", "next-job": "next job", "restart": "after restart" };
+    const SOURCES = { saved: "saved here", env: "from .env", default: "default" };
+    let model = null;           // last GET /api/settings
+    const edits = new Map();    // key -> edited value (string for numbers, bool for switches)
+    const resets = new Set();   // keys to reset to env/default on save
+    let busy = false;
+    let engineJob = null;
+
+    function h(tag, props = {}, ...kids) {
+      const el = document.createElement(tag);
+      for (const [k, v] of Object.entries(props)) {
+        if (k === "text") el.textContent = v;
+        else if (k === "className") el.className = v;
+        else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+        else if (v !== undefined && v !== null && v !== false) el.setAttribute(k, v === true ? "" : v);
+      }
+      for (const kid of kids) if (kid !== null && kid !== undefined && kid !== false) el.append(kid);
+      return el;
+    }
+    function setBanner(kind, text) { const b = $("banner"); b.className = kind || ""; b.textContent = text || ""; }
+    function overlay(on, text) { $("overlay").classList.toggle("on", on); if (text) $("overlaytext").textContent = text; }
+    const fmtGB = (b) => b == null ? "—" : `${(b / GB).toFixed(b >= 10 * GB ? 0 : 1)} GB`;
+    function fmtSecs(s) {
+      s = Math.max(0, Math.round(Number(s) || 0));
+      return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`;
+    }
+    async function api(path, opts = {}) {
+      const r = await fetch(path, { cache: "no-store", ...opts });
+      let body = null;
+      try { body = await r.json(); } catch (_) { /* not JSON */ }
+      if (!r.ok) throw new Error((body && (typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail))) || `HTTP ${r.status}`);
+      return body;
+    }
+
+    // ---- live resources --------------------------------------------------------
+    function memBar(used, limit, pause) {
+      if (!limit) return h("div", { className: "kv dim", text: "no limit reported" });
+      const frac = Math.min(1, (used || 0) / limit);
+      const bar = h("div", { className: `bar ${frac > 0.85 ? "hot" : frac > 0.65 ? "warm" : ""}` },
+        h("i", { style: `width:${(frac * 100).toFixed(1)}%` }),
+        h("span", { text: `${fmtGB(used)} of ${fmtGB(limit)} (${Math.round(frac * 100)}%)` }));
+      if (pause) bar.append(h("b", { style: `left:${Math.min(100, pause / limit * 100).toFixed(1)}%`, title: "builds pause new work above this line" }));
+      return bar;
+    }
+    function boxFor(title, rt, extra) {
+      const box = [h("h3", {}, h("span", { text: title }), extra || "")];
+      if (!rt) return box;
+      const limit = rt.memoryLimit || rt.vmMemoryTotal;
+      box.push(h("div", { className: "kv" }, h("b", { text: "RAM (container) " }),
+        rt.memoryLimit ? `limit ${fmtGB(rt.memoryLimit)}` : `no container limit — Docker VM RAM ${fmtGB(rt.vmMemoryTotal)}`));
+      box.push(memBar(rt.memoryUsed, limit, rt.build && rt.build.pauseAbove && rt.build.limit === limit ? rt.build.pauseAbove : null));
+      box.push(h("div", { className: "kv" }, h("b", { text: "Docker VM RAM " }),
+        `${fmtGB(rt.vmMemoryTotal)} total, ${fmtGB(rt.vmMemoryAvailable)} available`));
+      box.push(h("div", { className: "kv" }, h("b", { text: "CPU " }),
+        rt.cpuQuota ? `${rt.cpuQuota} of ${rt.cpuCount} cores (Docker cpus limit)` : `${rt.cpuCount} cores (no cap)`));
+      if (rt.disk) box.push(h("div", { className: "kv" }, h("b", { text: "Data disk " }),
+        `${fmtGB(rt.disk.free)} free of ${fmtGB(rt.disk.total)}`));
+      return box;
+    }
+    let rtFailures = 0;
+    async function loadRuntime() {
+      try {
+        const r = await api("/api/settings/runtime");
+        rtFailures = 0;
+        const e = r.engine;
+        engineJob = e && e.job && ["running", "queued"].includes(e.job.state) ? e.job : null;
+        const pill = !e ? h("span", { className: "pill down", text: "not running" })
+          : engineJob ? h("span", { className: "pill busy", text: `building ${engineJob.name}` })
+          : h("span", { className: "pill up", text: "idle" });
+        const ebox = $("rt-engine");
+        ebox.replaceChildren(...boxFor("Engine", e, pill));
+        if (!e) ebox.append(h("div", { className: "kv dim", text: r.engineMessage || "engine not reachable" }));
+        if (e && e.build) {
+          const b = e.build;
+          ebox.append(h("div", { className: "estimate" },
+            h("b", { text: `A build started now would use ${b.workers} worker${b.workers === 1 ? "" : "s"}` }),
+            ` — limited by ${b.limitBy}` + (b.limit ? ` (pause above ${fmtGB(b.pauseAbove)}, ${fmtGB(b.perWorker)} per worker)` : "") + "." +
+            (engineJob ? `\nThe running build (${fmtSecs(engineJob.elapsed)}) keeps the settings it started with.` : "")));
+          ebox.lastChild.style.whiteSpace = "pre-line";
+        }
+        $("rt-platform").replaceChildren(...boxFor("Data-platform (downloads)", r.platform,
+          h("span", { className: "pill up", text: "running" })));
+        $("rtupdated").textContent = `updated ${new Date().toLocaleTimeString()} · refreshes every 5 s`;
+        setTimeout(loadRuntime, 5000);
+      } catch (err) {
+        rtFailures += 1;
+        $("rtupdated").textContent = `could not read the container limits (${err.message}) — retrying…`;
+        setTimeout(loadRuntime, Math.min(30000, 2000 * 2 ** rtFailures));
+      }
+    }
+
+    // ---- settings --------------------------------------------------------------
+    function itemByKey(key) {
+      for (const g of model.groups) for (const it of g.items) if (it.key === key) return it;
+      return null;
+    }
+    function shown(it) {
+      if (edits.has(it.key)) return edits.get(it.key);
+      if (resets.has(it.key)) return it.fallback;
+      return it.value;
+    }
+    function validate(it, raw) {
+      if (it.type === "bool") return null;
+      if (raw === "" || raw === null || raw === undefined) return "enter a value";
+      const v = Number(raw);
+      if (!Number.isFinite(v)) return "not a number";
+      if (it.type === "int" && !Number.isInteger(v)) return "whole numbers only";
+      if (it.min != null && v < it.min) return `minimum ${it.min}`;
+      if (it.max != null && v > it.max) return `maximum ${it.max}`;
+      return null;
+    }
+    function errors() {
+      const out = [];
+      for (const [key, raw] of edits) { const it = itemByKey(key); const e = it && validate(it, raw); if (e) out.push(`${it.label}: ${e}`); }
+      return out;
+    }
+    function isChanged(it) {
+      if (resets.has(it.key)) return it.source === "saved";
+      if (!edits.has(it.key)) return false;
+      const raw = edits.get(it.key);
+      return it.type === "bool" ? raw !== it.value : Number(raw) !== Number(it.value);
+    }
+    function changedKeys() {
+      const keys = [];
+      for (const g of model.groups) for (const it of g.items) if (isChanged(it)) keys.push(it.key);
+      return keys;
+    }
+    function updateBar() {
+      const n = model ? changedKeys().length : 0;
+      const errs = model ? errors() : [];
+      $("savestate").textContent = errs.length ? `fix ${errs.length} value${errs.length > 1 ? "s" : ""} before saving`
+        : n ? `${n} unsaved change${n > 1 ? "s" : ""}` : "no changes";
+      $("savestate").className = n || errs.length ? "dirty" : "";
+      $("save").disabled = busy || !n || errs.length > 0;
+      $("discard").disabled = busy || (!edits.size && !resets.size);
+      $("resetall").disabled = busy;
+    }
+    function row(it) {
+      const err = h("div", { className: "err" });
+      const value = shown(it);
+      let control;
+      if (it.type === "bool") {
+        const box = h("input", { type: "checkbox" });
+        box.checked = Boolean(value);
+        box.addEventListener("change", () => { resets.delete(it.key); edits.set(it.key, box.checked); refreshRow(); });
+        control = h("label", { className: "switch" }, box, h("span", { text: box.checked ? "on" : "off" }));
+      } else {
+        const input = h("input", { type: "number", step: it.step ?? "any", min: it.min, max: it.max });
+        input.value = value;
+        input.addEventListener("input", () => { resets.delete(it.key); edits.set(it.key, input.value); refreshRow(true); });
+        control = h("span", { className: "ctl" }, input, h("span", { className: "unit", text: it.unit || "" }));
+      }
+      const fallbackText = it.type === "bool" ? (it.fallback ? "on" : "off") : `${it.fallback} ${it.unit || ""}`.trim();
+      const resetBtn = h("button", { className: "reset", type: "button", title: `back to ${fallbackText}`,
+        onclick: () => { edits.delete(it.key); resets.add(it.key); render(); } }, "Reset");
+      const src = resets.has(it.key) ? (it.envValue != null ? "env" : "default") : it.source;
+      const el = h("div", { className: "set", "data-key": it.key },
+        h("div", {}, h("div", { className: "lbl", text: it.label }),
+          h("div", { className: "meta" },
+            h("span", { className: `tag t-${src}`, text: SOURCES[src] }),
+            h("span", { className: `tag t-${it.applies}`, text: APPLIES[it.applies] || it.applies }),
+            h("code", { text: it.env, title: "environment variable (.env / docker-compose)" }))),
+        h("div", {}, h("div", { className: "ctl" }, control, it.source === "saved" || edits.has(it.key) ? resetBtn : ""), err),
+        h("div", { className: "help" }, it.help, h("div", { className: "meta", text: `default: ${fallbackText}${it.min != null ? ` · range ${it.min}–${it.max}` : ""}` })));
+      const e = edits.has(it.key) ? validate(it, edits.get(it.key)) : null;
+      err.textContent = e || "";
+      el.classList.toggle("bad", Boolean(e));
+      el.classList.toggle("changed", !e && isChanged(it));
+      return el;
+    }
+    function refreshRow(keepFocus) {
+      if (!keepFocus) { render(); return; }
+      // re-evaluate highlight + error without rebuilding the focused input
+      for (const el of document.querySelectorAll(".set")) {
+        const it = itemByKey(el.dataset.key);
+        const e = edits.has(it.key) ? validate(it, edits.get(it.key)) : null;
+        el.querySelector(".err").textContent = e || "";
+        el.classList.toggle("bad", Boolean(e));
+        el.classList.toggle("changed", !e && isChanged(it));
+      }
+      updateBar();
+    }
+    function render() {
+      $("groups").replaceChildren(...model.groups.map((g) =>
+        h("section", { className: "card" }, h("h2", { text: g.title }), h("p", { className: "gdesc", text: g.description }),
+          ...g.items.map(row))));
+      $("path").textContent = model.path;
+      if (!model.engineView) setBanner("warn", "Engine not reachable: engine values show the saved / default values; " +
+        "the engine's own .env overrides (if any) cannot be read until it runs.");
+      updateBar();
+    }
+    async function load(first) {
+      if (first) overlay(true, "loading settings…");
+      try {
+        model = await api("/api/settings");
+        if (first) setBanner("", "");
+        render();
+      } catch (err) {
+        setBanner("err", `✗ could not load the settings: ${err.message} — retrying…`);
+        setTimeout(() => load(first), 4000);
+        return;
+      } finally { overlay(false); }
+    }
+    async function save(body, label) {
+      busy = true; updateBar();
+      const t0 = Date.now();
+      const tick = setInterval(() => overlay(true, `${label}… ${fmtSecs((Date.now() - t0) / 1000)}`), 500);
+      overlay(true, `${label}…`);
+      try {
+        model = await api("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        edits.clear(); resets.clear();
+        render();
+        const restart = (body.keys || []).some((k) => (itemByKey(k) || {}).applies === "restart");
+        setBanner(restart ? "warn" : "ok",
+          `✓ saved ${body.count} setting${body.count === 1 ? "" : "s"} at ${new Date().toLocaleTimeString()}.` +
+          (engineJob ? `\nThe running build (${engineJob.name}) keeps its settings; the next build uses the new ones.` : "") +
+          (restart ? "\nSome changes apply after an engine restart (Run.bat restart engine)." : ""));
+      } catch (err) {
+        setBanner("err", `✗ not saved: ${err.message}`);
+      } finally {
+        clearInterval(tick); overlay(false); busy = false; updateBar();
+      }
+    }
+    $("save").addEventListener("click", () => {
+      const keys = changedKeys();
+      const values = {}; const reset = [];
+      for (const key of keys) {
+        if (resets.has(key)) { reset.push(key); continue; }
+        const it = itemByKey(key);
+        values[key] = it.type === "bool" ? edits.get(key) : Number(edits.get(key));
+      }
+      const body = { values, reset }; Object.defineProperty(body, "keys", { value: keys }); Object.defineProperty(body, "count", { value: keys.length });
+      save(body, "saving");
+    });
+    $("discard").addEventListener("click", () => { edits.clear(); resets.clear(); render(); setBanner("info", "changes discarded"); });
+    $("resetall").addEventListener("click", () => {
+      const saved = []; for (const g of model.groups) for (const it of g.items) if (it.source === "saved") saved.push(it.key);
+      if (!saved.length) { setBanner("info", "nothing saved here — every setting already uses .env / default"); return; }
+      if (!confirm(`Reset ${saved.length} saved setting(s) to their .env / default values?`)) return;
+      const body = { values: {}, reset: saved }; Object.defineProperty(body, "keys", { value: saved }); Object.defineProperty(body, "count", { value: saved.length });
+      save(body, "resetting");
+    });
+    window.addEventListener("beforeunload", (e) => { if (model && changedKeys().length) { e.preventDefault(); e.returnValue = ""; } });
+    load(true);
+    loadRuntime();
+  </script>
+</body>
+</html>
